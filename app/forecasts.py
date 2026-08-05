@@ -299,7 +299,7 @@ class CalendarFeatureBuilder:
         feats = self._calendar_dummies(dates)
         # columnas de drivers (excluir ids de negocio)
         _exclude = {
-            "ds", "y", "unique_id", "price", "conteo_sku",
+            "ds", "y", "unique_id", "value", "valuehat", "conteo_sku",
             "sku_desc", "store_name", "seccion", "intercept",
             "asp", "edp", "discount",
         }
@@ -343,7 +343,7 @@ class DataAggregator:
         rename_map = {
             self._date_col: "ds",
             self._qty_col: "y",
-            self._prc_col: "price",
+            self._prc_col: "value",
         }
         df = df.rename({k: v for k, v in rename_map.items() if k in df.columns})
         df = df.filter(pl.col("y") >= 0)
@@ -377,7 +377,7 @@ class DataAggregator:
             id_expr = pl.concat_str([pl.col(k) for k in keys], separator="||")
             agg_exprs = [
                 pl.col("y").sum(),
-                pl.col("price").sum(),
+                pl.col("value").sum(),
                 pl.count("y").alias("conteo_sku"),
             ]
             sum_df = (
@@ -457,7 +457,7 @@ class DataAggregator:
                     "unique_id",
                     "ds",
                     "y",
-                    "price",
+                    "value",
                     "intercept",
                     "conteo_sku",
                     "seccion",
@@ -545,7 +545,7 @@ class RLSForecastRunner:
             .to_numpy()
             .astype(np.float64, order="C")
         )
-        price = train_g["price"].to_numpy()
+        price = train_g["value"].to_numpy()
         log_price = np.log1p(np.clip(price, 0.0, None))
 
         model_p = RecursiveLeastSquaresRegression(
@@ -572,16 +572,16 @@ class RLSForecastRunner:
         # y real: 0/null en zona solo-forecast
         y_real = test_g["y"].to_numpy() if "y" in test_g.columns else np.zeros(len(yhat_test))
         price_real = (
-            test_g["price"].to_numpy()
-            if "price" in test_g.columns
+            test_g["value"].to_numpy()
+            if "value" in test_g.columns
             else np.zeros(len(pricehat))
         )
 
         result = {
             "unique_id": unique_id,
             "ds": test_g["ds"],
-            "price": price_real,
-            "pricehat": pricehat,
+            "value": price_real,
+            "valuehat": pricehat,
             "y": y_real,
             "yhat": yhat_test,
         }
@@ -786,7 +786,7 @@ class RLSForecastPipeline:
         grid = ids_df.join(pl.DataFrame({"ds": dates}), how="cross")
         grid = grid.join(meta, on="unique_id", how="left").with_columns(
             pl.lit(0.0).alias("y"),
-            pl.lit(0.0).alias("price"),
+            pl.lit(0.0).alias("value"),
             pl.lit(1).alias("intercept"),
             pl.lit(0).alias("conteo_sku"),
         )
@@ -798,7 +798,7 @@ class RLSForecastPipeline:
         if df.height == 0:
             return df
         n_series = df["unique_id"].n_unique()
-        # Fallback rápido: asp = price/max(y,eps); edp≈asp; discount=0
+        # Fallback rápido: asp = value/max(y,eps); edp≈asp; discount=0
         # Evita congelar con decenas de miles de series en loop Python.
         use_fast = decompose_price is None or n_series > 5000
         if use_fast:
@@ -808,10 +808,10 @@ class RLSForecastPipeline:
                     n_series,
                 )
             return df.with_columns(
-                (pl.col("price") / pl.col("y").clip(lower_bound=1e-8))
+                (pl.col("value") / pl.col("y").clip(lower_bound=1e-8))
                 .fill_nan(0.0)
                 .alias("asp"),
-                (pl.col("price") / pl.col("y").clip(lower_bound=1e-8))
+                (pl.col("value") / pl.col("y").clip(lower_bound=1e-8))
                 .fill_nan(0.0)
                 .alias("edp"),
                 pl.lit(0.0).alias("discount"),
@@ -825,7 +825,7 @@ class RLSForecastPipeline:
         for part in tqdm(groups, desc="EDP", unit="serie"):
             uid = part["unique_id"][0]
             asp, edp, discount = decompose_price(
-                sales_dollars=part["price"].to_numpy(),
+                sales_dollars=part["value"].to_numpy(),
                 sales_units=part["y"].to_numpy(),
             )
             computed = {
@@ -912,7 +912,8 @@ class RLSForecastPipeline:
                 not in (
                     "ds",
                     "y",
-                    "price",
+                    "value",
+                    "valuehat",
                     "unique_id",
                     "conteo_sku",
                     "sku_desc",
@@ -1010,7 +1011,7 @@ class RLSForecastPipeline:
                 res_f = res_f.with_columns(
                     pl.lit("forecast_only").alias("period_type"),
                     pl.lit(0.0).alias("y"),
-                    pl.lit(0.0).alias("price"),
+                    pl.lit(0.0).alias("value"),
                 )
                 res_frames.append(res_f)
 
