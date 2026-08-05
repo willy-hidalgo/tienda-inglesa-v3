@@ -19,3 +19,8 @@ dependencies = [
     "tqdm>=4.70.0",
     "xlsxwriter>=3.2.9",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
