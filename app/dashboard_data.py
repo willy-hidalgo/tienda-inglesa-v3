@@ -100,7 +100,7 @@ def prepare_dashboard_state(
         has_period,
     )
 
-    detail = backend.detail_view(df_view)
+    detail = backend.format_detail_display(backend.detail_view(df_view))
     label = label_map.get(selected_id, settings.display_label(selected_id))
 
     return DashboardView(

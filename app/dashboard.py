@@ -315,16 +315,9 @@ st.plotly_chart(fig, width="stretch")
 # ─────────────────────────────────────────────────────────────────────────────
 with st.expander("Ver datos detallados"):
     st.caption(f"Agregación **{view.freq}** · Unidad **{view.unidad}**")
-    _num_fmt = st.column_config.NumberColumn(format="#,##0.###")
-    _detail_cfg = {
-        c: _num_fmt
-        for c in ("y", "yhat", "value", "valuehat", "abs_error", "price", "pricehat")
-        if c in view.detail.columns
-    }
     st.dataframe(
         view.detail,
         width="stretch",
         hide_index=True,
         height=_RANK_HEIGHT,
-        column_config=_detail_cfg,
     )

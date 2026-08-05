@@ -133,3 +133,23 @@ def test_prepare_dashboard_state():
     assert view.detail.height > 0
     assert "train_end" not in view.detail.columns
     assert view.chart["hist_ds"] is not None
+
+
+def test_format_detail_display():
+    df = pl.DataFrame(
+        {
+            "unique_id": ["1"],
+            "ds": [dt.date(2024, 1, 1)],
+            "y": [12345.2],
+            "yhat": [1000.9],
+            "value": [999999.4],
+            "valuehat": [0.4],
+            "abs_error": [234.6],
+        }
+    )
+    out = backend.format_detail_display(df)
+    assert out["y"][0] == "12,345"
+    assert out["yhat"][0] == "1,001"
+    assert out["value"][0] == "999,999"
+    assert out["valuehat"][0] == "0"
+    assert out["abs_error"][0] == "235"
