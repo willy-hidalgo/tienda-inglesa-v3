@@ -18,8 +18,10 @@ DETAIL_COLUMNS = [
     "ds",
     "y",
     "yhat",
+    "yhat28",
     "value",
     "valuehat",
+    "valuehat28",
     "period_type",
     "sku_desc",
     "store_name",
@@ -67,10 +69,13 @@ def load_forecast_bytes(data: bytes, name: str) -> pl.DataFrame:
 def prepare_unit_df(df: pl.DataFrame, unidad: str, has_value: bool) -> pl.DataFrame:
     if unidad == "Unidades" or not has_value:
         return df
-    return df.with_columns(
+    exprs = [
         pl.col("value").alias("y"),
         pl.col("valuehat").alias("yhat"),
-    )
+    ]
+    if "valuehat28" in df.columns:
+        exprs.append(pl.col("valuehat28").alias("yhat28"))
+    return df.with_columns(exprs)
 
 
 def aggregate_temporal(df: pl.DataFrame, freq: str) -> pl.DataFrame:
@@ -87,6 +92,10 @@ def aggregate_temporal(df: pl.DataFrame, freq: str) -> pl.DataFrame:
         return out
     period = "1w" if freq == "Semanal" else "1mo"
     aggs: list = [pl.col("y").sum(), pl.col("yhat").sum()]
+    if "yhat28" in df.columns:
+        aggs.append(pl.col("yhat28").sum())
+    if "valuehat28" in df.columns:
+        aggs.append(pl.col("valuehat28").sum())
     if "value" in df.columns:
         aggs.append(pl.col("value").sum())
     if "valuehat" in df.columns:
@@ -363,12 +372,19 @@ def build_chart_series(
     hist, fcst = split_hist_forecast(
         df_view, test_end, forecast_start, forecast_end, has_period
     )
+    def _col(df, name):
+        if name in df.columns and df.height:
+            return df[name].to_list()
+        return []
+
     return {
         "hist_ds": hist["ds"].to_list() if hist.height else [],
         "hist_y": hist["y"].to_list() if hist.height else [],
         "hist_yhat": hist["yhat"].to_list() if hist.height else [],
+        "hist_yhat28": _col(hist, "yhat28"),
         "fcst_ds": fcst["ds"].to_list() if fcst.height else [],
         "fcst_yhat": fcst["yhat"].to_list() if fcst.height else [],
+        "fcst_yhat28": _col(fcst, "yhat28"),
         "cutoff": cutoff,
         "test_end": test_end,
     }
@@ -406,7 +422,7 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
         return df
     num_cols = [
         c
-        for c in ("y", "yhat", "value", "valuehat", "abs_error")
+        for c in ("y", "yhat", "yhat28", "value", "valuehat", "valuehat28", "abs_error")
         if c in df.columns
     ]
     if not num_cols:
@@ -429,3 +445,22 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
         for c in num_cols
     ]
     return df.with_columns(exprs)
+
+
+def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:
+    """WMAPE/BIAS de yhat28 vs y sobre el df agregado visible."""
+    if df_view.height == 0 or "yhat28" not in df_view.columns:
+        return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
+    scored = df_view.filter(
+        pl.col("y").is_not_null()
+        & (pl.col("y") != 0)
+        & pl.col("yhat28").is_not_null()
+    )
+    if scored.height == 0:
+        return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
+    sum_y = float(scored["y"].sum())
+    if sum_y == 0:
+        return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
+    ae = float((scored["y"] - scored["yhat28"]).abs().sum())
+    bias = float((scored["yhat28"] - scored["y"]).sum()) / sum_y
+    return {"wmape_28": ae / abs(sum_y), "bias_28": bias, "n": scored.height}

@@ -80,6 +80,24 @@ freq = st.sidebar.radio(
     key="freq",
 )
 
+# Etiquetas según unidad (mapeo interno siempre yhat / yhat28)
+_is_valor = unidad.startswith("Valor")
+_opt_yhat = "valuehat" if _is_valor else "yhat"
+_opt_yhat28 = "valuehat28" if _is_valor else "yhat28"
+_forecast_opts = [_opt_yhat, _opt_yhat28]
+series_forecast = st.sidebar.multiselect(
+    "Series de forecast visibles",
+    options=_forecast_opts,
+    default=_forecast_opts,
+    key="series_forecast",
+    help="Al menos una serie debe permanecer visible.",
+)
+if not series_forecast:
+    series_forecast = [_opt_yhat]
+    st.sidebar.warning(f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}».")
+show_yhat = _opt_yhat in series_forecast
+show_yhat28 = _opt_yhat28 in series_forecast
+
 all_ids = sorted(res_df["unique_id"].unique().to_list())
 label_map, desc_map = backend.build_label_maps(res_df)
 NOMBRES = settings.NOMBRES_NIVELES
@@ -239,6 +257,20 @@ for col, title, key in (
         st.metric("BIAS", f"{m['bias']:+.2%}")
         st.caption(f"{m['n']} períodos")
 
+st.markdown("#### Métricas Rolling 28d (`yhat28`)")
+st.caption(
+    "Walk-forward por bloques de 28 días. Priors = modelo final (opción B). "
+    "WMAPE₂₈ = Σ|y−ŷ₂₈|/Σ|y| (excl. y=0)."
+)
+m28 = view.metrics_28
+c28a, c28b, c28c = st.columns(3)
+with c28a:
+    st.metric("wMAPE 28", f"{m28['wmape_28']:.2%}")
+with c28b:
+    st.metric("BIAS 28", f"{m28['bias_28']:+.2%}")
+with c28c:
+    st.metric("N períodos", f"{m28['n']}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gráfico (solo mapeo de series ya calculadas)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,25 +291,46 @@ if ch["hist_ds"]:
             fillcolor="rgba(31, 119, 180, 0.25)",
         )
     )
-    fig.add_trace(
-        go.Scatter(
-            x=ch["hist_ds"],
-            y=ch["hist_yhat"],
-            name="yhat (predicción)",
-            fill="tozeroy",
-            mode="lines",
-            line=dict(color="rgba(255, 127, 14, 1)"),
-            fillcolor="rgba(255, 127, 14, 0.25)",
+    if show_yhat:
+        fig.add_trace(
+            go.Scatter(
+                x=ch["hist_ds"],
+                y=ch["hist_yhat"],
+                name=f"{_opt_yhat} (predicción)",
+                fill="tozeroy",
+                mode="lines",
+                line=dict(color="rgba(255, 127, 14, 1)"),
+                fillcolor="rgba(255, 127, 14, 0.25)",
+            )
         )
-    )
-if ch["fcst_ds"]:
+if ch["fcst_ds"] and show_yhat:
     fig.add_trace(
         go.Scatter(
             x=ch["fcst_ds"],
             y=ch["fcst_yhat"],
-            name="yhat (solo forecast)",
+            name=f"{_opt_yhat} (solo forecast)",
             mode="lines",
             line=dict(color="rgba(255, 127, 14, 1)", dash="dot", width=2),
+        )
+    )
+if show_yhat28 and ch.get("hist_yhat28"):
+    fig.add_trace(
+        go.Scatter(
+            x=ch["hist_ds"],
+            y=ch["hist_yhat28"],
+            name=f"{_opt_yhat28} (rolling 28d)",
+            mode="lines",
+            line=dict(color="rgba(44, 160, 44, 1)", dash="dash", width=2),
+        )
+    )
+if show_yhat28 and ch.get("fcst_yhat28"):
+    fig.add_trace(
+        go.Scatter(
+            x=ch["fcst_ds"],
+            y=ch["fcst_yhat28"],
+            name=f"{_opt_yhat28} (forecast)",
+            mode="lines",
+            line=dict(color="rgba(44, 160, 44, 0.8)", dash="dot", width=2),
         )
     )
 
@@ -308,6 +361,7 @@ fig.update_layout(
     hovermode="x unified",
     margin=dict(l=40, r=40, t=50, b=40),
 )
+st.caption("Mostrando forecast: **" + ", ".join(series_forecast) + "**")
 st.plotly_chart(fig, width="stretch")
 
 # ─────────────────────────────────────────────────────────────────────────────

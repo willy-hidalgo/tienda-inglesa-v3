@@ -32,6 +32,7 @@ class DashboardView:
     ranking_rotacion: pl.DataFrame
     ranking_n_series: int
     metrics: dict[str, dict[str, float | int]]
+    metrics_28: dict[str, float | int]
     chart: dict[str, Any]
     detail: pl.DataFrame
     ds_min: dt.date | None
@@ -90,6 +91,7 @@ def prepare_dashboard_state(
     metrics = backend.metrics_in_out_total(
         df_view, cutoff, test_end or cutoff
     )
+    metrics_28 = backend.metrics_rolling28(df_view)
 
     chart = backend.build_chart_series(
         df_view,
@@ -114,6 +116,7 @@ def prepare_dashboard_state(
         ranking_rotacion=ranking_rot,
         ranking_n_series=tabla_base.height,
         metrics=metrics,
+        metrics_28=metrics_28,
         chart=chart,
         detail=detail,
         ds_min=ds_min,

@@ -4,6 +4,7 @@ Selección de datos de demanda por sección (1 y 23)
 Pipeline lazy de Polars: predicados push-down, columnas mínimas,
 filtro de locales por sección en un solo join.
 """
+
 from __future__ import annotations
 
 import datetime as dt

@@ -620,6 +620,359 @@ class RLSForecastRunner:
     def _normalize_partition_dict(d: dict) -> dict:
         return {(k[0] if isinstance(k, tuple) else k): v for k, v in d.items()}
 
+
+    # ── Rolling 28d (yhat28 / valuehat28) ───────────────────────────────────
+    def _default_priors(self, n_features: int):
+        return [
+            RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
+        ] + [
+            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
+            for _ in range(max(0, n_features - 1))
+        ]
+
+    def _extract_priors(self, model, n_features: int):
+        """Opción B: coeficientes del modelo final → priors RLS."""
+        coefs = None
+        for attr in ("coef_", "coefficients", "coefs", "beta", "theta"):
+            if hasattr(model, attr):
+                val = getattr(model, attr)
+                if val is not None:
+                    coefs = np.asarray(val, dtype=np.float64).ravel()
+                    break
+        if coefs is None or coefs.size == 0:
+            return self._default_priors(n_features)
+        # Ajustar longitud
+        if coefs.size < n_features:
+            coefs = np.pad(coefs, (0, n_features - coefs.size))
+        elif coefs.size > n_features:
+            coefs = coefs[:n_features]
+        priors = [
+            RLSPrior(
+                coefficient=float(coefs[0]),
+                standard_error=0.5,
+                rmse_error=self._rmse_error,
+            )
+        ]
+        # Prefer ConstantPrior for intercept if constructor fails on coefficient
+        try:
+            priors[0] = RLSConstantPrior(
+                standard_error=0.5, rmse_error=self._rmse_error
+            )
+            # Keep coefficient via RLSPrior for intercept when supported
+            priors[0] = RLSPrior(
+                coefficient=float(coefs[0]),
+                standard_error=0.5,
+                rmse_error=self._rmse_error,
+            )
+        except Exception:
+            priors[0] = RLSConstantPrior(
+                standard_error=0.5, rmse_error=self._rmse_error
+            )
+        for i in range(1, n_features):
+            priors.append(
+                RLSPrior(
+                    coefficient=float(coefs[i]),
+                    standard_error=0.5,
+                    rmse_error=self._rmse_error,
+                )
+            )
+        return priors
+
+    def _new_rls(self, min_y: float):
+        return RecursiveLeastSquaresRegression(
+            forgetting_factor=self._forgetting_factor,
+            min_y_to_update=min_y,
+            return_all_coefs=False,
+        )
+
+    def _fit_rls(self, X, y_log, priors, min_y: float):
+        model = self._new_rls(min_y)
+        if X.shape[0] == 0:
+            return model, priors
+        model.fit(x=X, y=y_log, priors=priors)
+        return model, self._extract_priors(model, X.shape[1])
+
+    def _predict_rls(self, model, X, use_corr: bool) -> np.ndarray:
+        if X.shape[0] == 0:
+            return np.array([])
+        log_hat = model.predict(X)
+        if use_corr and hasattr(model, "errors") and model.errors is not None:
+            try:
+                corr = self._correction_factor(np.asarray(model.errors))
+                return np.round(np.exp(log_hat) * corr).ravel()
+            except Exception:
+                pass
+        return np.round(np.expm1(log_hat)).ravel()
+
+    @staticmethod
+    def _first_monday_on_or_after(d: dt.date) -> dt.date:
+        # weekday: Mon=0 … Sun=6
+        return d + dt.timedelta(days=(7 - d.weekday()) % 7)
+
+    def _rolling_28_one(self, unique_id: str, g: pl.DataFrame) -> pl.DataFrame | None:
+        """
+        Walk-forward 28d sobre toda la historia de la serie.
+        Priors iniciales = modelo ajustado con todos los actuals (opción B).
+        """
+        if RecursiveLeastSquaresRegression is None or g.height == 0:
+            return None
+        g = g.sort("ds")
+        # a partir del primer lunes ≥ primera fecha
+        first_ds = g["ds"][0]
+        if isinstance(first_ds, dt.datetime):
+            first_ds = first_ds.date()
+        start_mon = self._first_monday_on_or_after(first_ds)
+        g = g.filter(pl.col("ds").cast(pl.Date) >= start_mon)
+        if g.height == 0:
+            return None
+
+        dcols = [c for c in self._driver_cols if c in g.columns]
+        pdcols = [c for c in self._driver_cols_price if c in g.columns]
+        if not dcols:
+            return None
+
+        X_all = g.select(dcols).to_numpy().astype(np.float64, order="C")
+        y_all = g["y"].to_numpy().astype(np.float64)
+        has_value = "value" in g.columns
+        if has_value:
+            Xp_all = g.select(pdcols).to_numpy().astype(np.float64, order="C") if pdcols else X_all
+            v_all = g["value"].to_numpy().astype(np.float64)
+        else:
+            Xp_all = X_all
+            v_all = np.zeros_like(y_all)
+
+        n = g.height
+        H = int(getattr(settings, "ROLLING_HORIZON_DAYS", 28))
+
+        # Máscara de actuals utilizables
+        actual_mask = np.isfinite(y_all) & (y_all != 0)
+        if has_value:
+            actual_v = np.isfinite(v_all) & (v_all != 0)
+        else:
+            actual_v = actual_mask
+
+        yhat28 = np.full(n, np.nan)
+        valuehat28 = np.full(n, np.nan)
+
+        # ── Opción B: modelo final con todos los actuals → priors ──
+        idx_act = np.where(actual_mask)[0]
+        if idx_act.size < 2:
+            return None
+        priors_y = self._default_priors(X_all.shape[1])
+        priors_p = self._default_priors(Xp_all.shape[1])
+        try:
+            model_y_final, priors_y = self._fit_rls(
+                X_all[idx_act],
+                np.log1p(y_all[idx_act]),
+                priors_y,
+                self._min_y_to_update,
+            )
+        except Exception as exc:
+            logger.warning("rolling28 %s: fit final y falló: %s", unique_id, exc)
+            return None
+        if has_value and np.any(actual_v):
+            try:
+                idx_v = np.where(actual_v)[0]
+                model_p_final, priors_p = self._fit_rls(
+                    Xp_all[idx_v],
+                    np.log1p(np.clip(v_all[idx_v], 0.0, None)),
+                    priors_p,
+                    1e-8,
+                )
+            except Exception:
+                model_p_final = None
+        else:
+            model_p_final = None
+
+        # ── Walk por bloques de H días ──
+        pos = 0
+        cur_priors_y = priors_y
+        cur_priors_p = priors_p
+        while pos < n:
+            end = min(pos + H, n)
+            X_block = X_all[pos:end]
+            Xp_block = Xp_all[pos:end]
+
+            # Modelo para predecir el bloque: fit con data [0, pos) + priors actuales
+            if pos == 0:
+                # Primer bloque: usar modelo final (priors B ya embebidos)
+                model_y = model_y_final
+                model_p = model_p_final
+            else:
+                prev = np.arange(0, pos)
+                prev_act = prev[actual_mask[prev]] if prev.size else prev
+                if prev_act.size >= 1:
+                    try:
+                        model_y, cur_priors_y = self._fit_rls(
+                            X_all[prev_act],
+                            np.log1p(y_all[prev_act]),
+                            cur_priors_y,
+                            self._min_y_to_update,
+                        )
+                    except Exception:
+                        model_y = model_y_final
+                else:
+                    model_y = model_y_final
+                if has_value:
+                    prev_v = prev[actual_v[prev]] if prev.size else prev
+                    if prev_v.size >= 1:
+                        try:
+                            model_p, cur_priors_p = self._fit_rls(
+                                Xp_all[prev_v],
+                                np.log1p(np.clip(v_all[prev_v], 0.0, None)),
+                                cur_priors_p,
+                                1e-8,
+                            )
+                        except Exception:
+                            model_p = model_p_final
+                    else:
+                        model_p = model_p_final
+                else:
+                    model_p = None
+
+            try:
+                yhat28[pos:end] = self._predict_rls(
+                    model_y, X_block, self._use_correction_factor
+                )
+            except Exception as exc:
+                logger.debug("rolling28 predict y %s: %s", unique_id, exc)
+            if model_p is not None:
+                try:
+                    valuehat28[pos:end] = self._predict_rls(
+                        model_p, Xp_block, self._use_correction_factor
+                    )
+                except Exception:
+                    pass
+
+            # Actualizar priors con actuals del bloque (si existen)
+            block_idx = np.arange(pos, end)
+            block_act = block_idx[actual_mask[block_idx]]
+            if block_act.size:
+                # re-fit hasta end del bloque con actuals
+                up_to = np.arange(0, end)
+                up_act = up_to[actual_mask[up_to]]
+                if up_act.size >= 1:
+                    try:
+                        _, cur_priors_y = self._fit_rls(
+                            X_all[up_act],
+                            np.log1p(y_all[up_act]),
+                            cur_priors_y,
+                            self._min_y_to_update,
+                        )
+                    except Exception:
+                        pass
+                if has_value:
+                    up_v = up_to[actual_v[up_to]]
+                    if up_v.size >= 1:
+                        try:
+                            _, cur_priors_p = self._fit_rls(
+                                Xp_all[up_v],
+                                np.log1p(np.clip(v_all[up_v], 0.0, None)),
+                                cur_priors_p,
+                                1e-8,
+                            )
+                        except Exception:
+                            pass
+
+            pos = end
+
+        out = {
+            "unique_id": unique_id,
+            "ds": g["ds"],
+            "yhat28": yhat28,
+            "valuehat28": valuehat28,
+        }
+        return pl.DataFrame(out)
+
+    def run_rolling_28(
+        self,
+        panel: pl.DataFrame,
+        forecast_levels: list[str],
+        desc: str = "Rolling 28d",
+    ) -> pl.DataFrame:
+        """Genera yhat28/valuehat28 para todas las series del panel."""
+        if panel.height == 0 or RecursiveLeastSquaresRegression is None:
+            return pl.DataFrame(
+                schema={
+                    "unique_id": pl.Utf8,
+                    "ds": pl.Date,
+                    "yhat28": pl.Float64,
+                    "valuehat28": pl.Float64,
+                }
+            )
+        unique_ids = self._build_tasks(panel, forecast_levels, min_obs=2)
+        parts = self._normalize_partition_dict(
+            panel.filter(pl.col("unique_id").is_in(unique_ids)).partition_by(
+                "unique_id", as_dict=True
+            )
+        )
+        frames = []
+        iterator = unique_ids
+        try:
+            iterator = tqdm(unique_ids, desc=desc, leave=False)
+        except Exception:
+            pass
+        for uid in iterator:
+            if uid not in parts:
+                continue
+            one = self._rolling_28_one(uid, parts[uid])
+            if one is not None and one.height:
+                frames.append(one)
+        if not frames:
+            return pl.DataFrame(
+                schema={
+                    "unique_id": pl.Utf8,
+                    "ds": pl.Date,
+                    "yhat28": pl.Float64,
+                    "valuehat28": pl.Float64,
+                }
+            )
+        return pl.concat(frames, how="diagonal_relaxed")
+
+    @staticmethod
+    def compute_wmape28(panel: pl.DataFrame) -> pl.DataFrame:
+        """WMAPE/BIAS de yhat28 vs y (excluye y==0 y nulos)."""
+        if panel.height == 0 or "yhat28" not in panel.columns:
+            return pl.DataFrame(
+                schema={
+                    "unique_id": pl.Utf8,
+                    "wmape_28": pl.Float64,
+                    "bias_28": pl.Float64,
+                    "n_points_28": pl.UInt32,
+                }
+            )
+        scored = panel.filter(
+            pl.col("y").is_not_null()
+            & (pl.col("y") != 0)
+            & pl.col("yhat28").is_not_null()
+        )
+        if scored.height == 0:
+            return pl.DataFrame(
+                schema={
+                    "unique_id": pl.Utf8,
+                    "wmape_28": pl.Float64,
+                    "bias_28": pl.Float64,
+                    "n_points_28": pl.UInt32,
+                }
+            )
+        return (
+            scored.group_by("unique_id")
+            .agg(
+                (pl.col("y") - pl.col("yhat28")).abs().sum().alias("_ae"),
+                pl.col("y").abs().sum().alias("_ay"),
+                pl.col("y").sum().alias("_sy"),
+                pl.col("yhat28").sum().alias("_sh"),
+                pl.len().alias("n_points_28"),
+            )
+            .filter(pl.col("_ay") != 0)
+            .with_columns(
+                (pl.col("_ae") / pl.col("_ay")).alias("wmape_28"),
+                ((pl.col("_sh") - pl.col("_sy")) / pl.col("_sy")).alias("bias_28"),
+            )
+            .select(["unique_id", "wmape_28", "bias_28", "n_points_28"])
+        )
+
+
     def run(
         self,
         train: pl.DataFrame,
@@ -1024,6 +1377,54 @@ class RLSForecastPipeline:
             if wmape_frames
             else pl.DataFrame()
         )
+
+        # ── Rolling 28d sobre toda la historia (train+OOS+forecast panel) ──
+        panel_parts = [df_train]
+        if df_oos.height:
+            panel_parts.append(df_oos)
+        if df_fcst.height:
+            panel_parts.append(df_fcst)
+        panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(
+            ["unique_id", "ds"]
+        )
+        logger.info(
+            "Sección %s: rolling 28d sobre panel shape=%s…", seccion, panel.shape
+        )
+        roll = runner.run_rolling_28(
+            panel, self._cfg.forecast_levels, desc=f"{seccion} rolling28"
+        )
+        if roll.height and res_df.height:
+            # alinear tipos de ds
+            if res_df["ds"].dtype != roll["ds"].dtype:
+                roll = roll.with_columns(pl.col("ds").cast(res_df["ds"].dtype))
+            res_df = res_df.join(
+                roll.select(["unique_id", "ds", "yhat28", "valuehat28"]),
+                on=["unique_id", "ds"],
+                how="left",
+            )
+            wm28 = RLSForecastRunner.compute_wmape28(
+                res_df.filter(
+                    pl.col("y").is_not_null()
+                    & pl.col("yhat28").is_not_null()
+                )
+            )
+            if wm28.height:
+                if "wmape" in wmapes_df.columns and "unique_id" in wmapes_df.columns:
+                    wmapes_df = wmapes_df.join(wm28, on="unique_id", how="left")
+                else:
+                    wmapes_df = wm28
+            logger.info(
+                "Sección %s: yhat28 unido (%d filas roll, %d series wm28)",
+                seccion,
+                roll.height,
+                wm28.height if wm28.height else 0,
+            )
+        elif res_df.height:
+            res_df = res_df.with_columns(
+                pl.lit(None).cast(pl.Float64).alias("yhat28"),
+                pl.lit(None).cast(pl.Float64).alias("valuehat28"),
+            )
+
         return res_df, wmapes_df, driver_cols
 
     def run(self) -> tuple[pl.DataFrame, pl.DataFrame]:

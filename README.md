@@ -120,3 +120,27 @@ Tras el pipeline, en `data/output/`:
 - `forecast_seccion_23.xlsx`
 
 Columnas: **SKU**, **Local**, **Forecast sumarizado** (suma de $\hat{y}$ en `[forecast_start, forecast_end]`).
+
+## Tests (uv)
+
+```bash
+# Instalar pytest en el entorno del proyecto
+uv add --dev pytest
+
+# Ejecutar
+uv run pytest
+uv run pytest tests/ -q
+```
+
+Si aparece `program not found`, falta el paquete en el entorno:
+`uv add --dev pytest` y volver a intentar.
+
+## Rolling 28d (`yhat28` / `valuehat28`)
+
+Walk-forward por bloques de 28 días sobre **toda la historia** (desde el primer lunes ≥ primera fecha de la serie):
+
+1. Se ajusta el modelo RLS con todos los actuals disponibles → **priors opción B**.
+2. En cada bloque de 28 días se genera `yhat28` / `valuehat28`.
+3. Se actualiza el modelo con los actuals del bloque y se avanza.
+
+No modifica `yhat` / `valuehat`. Métricas `WMAPE₂₈` / `BIAS₂₈` en sección aparte del dashboard.

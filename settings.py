@@ -38,6 +38,7 @@ SOURCE_ENCODING = "cp1252"
 TEST_START = dt.date(2025, 11, 1)
 TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
+ROLLING_HORIZON_DAYS = 28  # yhat28 / valuehat28 walk-forward
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
 FECHAS_TEST = (TEST_START, TEST_END)

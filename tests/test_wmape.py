@@ -6,21 +6,19 @@ WMAPE según fórmula del cliente (ejemplo.xlsx):
 Se excluyen filas con y = 0.
 Equivale a Σ_i (|err_i|/y_i) · (y_i / Σ y).
 """
+
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-import numpy as np
-import pytest
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-import settings
 from forecasts import RLSForecastRunner
 
+import settings
 
 # Datos del ejemplo (hoja "datos"), excluyendo ventas=0
 # local 1: sku 11,22,33  (44 tiene ventas=0 → excluido)
