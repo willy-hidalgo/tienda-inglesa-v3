@@ -18,7 +18,8 @@ import argparse
 import datetime as dt
 import logging
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -70,6 +71,20 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+class StageTimer:
+    """Cronómetro por etapa (Fase 0)."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.t0 = time.perf_counter()
+
+    def stop(self) -> float:
+        dt = time.perf_counter() - self.t0
+        logger.info("⏱ %s: %.2fs", self.name, dt)
+        return dt
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -496,6 +511,112 @@ class RLSForecastRunner:
         sigma2 = errors.var(ddof=1)
         return float(np.exp(sigma2 / 2))
 
+    def _default_priors_static(self, n_features: int):
+        return [
+            RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
+        ] + [
+            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
+            for _ in range(max(0, n_features - 1))
+        ]
+
+    def _fit_models(self, train_g: pl.DataFrame):
+        """Un solo fit de model_y y model_p sobre train_g (Fase 1)."""
+        X_y = train_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
+        y = train_g["y"].to_numpy()
+        log_y = np.log1p(y)
+        model_y = RecursiveLeastSquaresRegression(
+            forgetting_factor=self._forgetting_factor,
+            min_y_to_update=self._min_y_to_update,
+            return_all_coefs=False,
+        )
+        model_y.fit(
+            x=X_y, y=log_y, priors=self._default_priors_static(X_y.shape[1])
+        )
+
+        X_p = (
+            train_g.select(self._driver_cols_price)
+            .to_numpy()
+            .astype(np.float64, order="C")
+        )
+        price = train_g["value"].to_numpy() if "value" in train_g.columns else np.zeros(len(y))
+        log_price = np.log1p(np.clip(price, 0.0, None))
+        model_p = RecursiveLeastSquaresRegression(
+            forgetting_factor=self._forgetting_factor,
+            min_y_to_update=1e-8,
+            return_all_coefs=False,
+        )
+        model_p.fit(
+            x=X_p, y=log_price, priors=self._default_priors_static(X_p.shape[1])
+        )
+        return model_y, model_p
+
+    def _predict_with_models(
+        self,
+        model_y,
+        model_p,
+        unique_id: str,
+        train_g: pl.DataFrame,
+        test_g: pl.DataFrame,
+        meta: dict | None = None,
+    ) -> pl.DataFrame | None:
+        if test_g.height == 0:
+            return None
+        X_y_test = (
+            test_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
+        )
+        log_yhat = model_y.predict(X_y_test)
+        if self._use_correction_factor:
+            try:
+                corr = self._correction_factor(np.asarray(model_y.errors))
+                yhat = np.round(np.exp(log_yhat) * corr).ravel()
+            except Exception:
+                yhat = np.round(np.expm1(log_yhat)).ravel()
+        else:
+            yhat = np.round(np.expm1(log_yhat)).ravel()
+
+        X_p_test = (
+            test_g.select(self._driver_cols_price)
+            .to_numpy()
+            .astype(np.float64, order="C")
+        )
+        log_ph = model_p.predict(X_p_test)
+        if self._use_correction_factor:
+            try:
+                corr_p = self._correction_factor(np.asarray(model_p.errors))
+                valuehat = np.round(np.expm1(log_ph) * corr_p, 2).ravel()
+            except Exception:
+                valuehat = np.round(np.expm1(log_ph), 2).ravel()
+        else:
+            valuehat = np.round(np.expm1(log_ph), 2).ravel()
+
+        y_real = (
+            test_g["y"].to_numpy()
+            if "y" in test_g.columns
+            else np.zeros(len(yhat))
+        )
+        price_real = (
+            test_g["value"].to_numpy()
+            if "value" in test_g.columns
+            else np.zeros(len(valuehat))
+        )
+        result = {
+            "unique_id": unique_id,
+            "ds": test_g["ds"],
+            "value": price_real,
+            "valuehat": valuehat,
+            "y": y_real,
+            "yhat": yhat,
+        }
+        if meta:
+            for k, v in meta.items():
+                result[k] = v
+        for col in ("sku_desc", "store_name", "seccion"):
+            if col in train_g.columns:
+                result[col] = train_g[col][0]
+            elif col in test_g.columns:
+                result[col] = test_g[col][0]
+        return pl.DataFrame(result)
+
     def _fit_predict_one(
         self,
         unique_id: str,
@@ -503,98 +624,132 @@ class RLSForecastRunner:
         test_g: pl.DataFrame,
         meta: dict | None = None,
     ) -> pl.DataFrame | None:
+        """Compat: fit único + un target (usado por run simple)."""
         if train_g.height == 0 or test_g.height == 0:
             return None
         if RecursiveLeastSquaresRegression is None:
             raise RuntimeError("rls_opt no disponible")
+        try:
+            model_y, model_p = self._fit_models(train_g)
+            return self._predict_with_models(
+                model_y, model_p, unique_id, train_g, test_g, meta
+            )
+        except Exception as exc:
+            logger.warning("fit/predict falló %s: %s", unique_id, exc)
+            return None
 
-        X_y = train_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
-        X_y_test = (
-            test_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
+    def fit_and_predict_multi(
+        self,
+        unique_id: str,
+        train_g: pl.DataFrame,
+        targets: dict[str, pl.DataFrame],
+        meta: dict | None = None,
+    ) -> dict[str, pl.DataFrame]:
+        """
+        Fase 1: 1 fit y + 1 fit value, N predicts (in/OOS/forecast).
+        targets: period_type -> DataFrame test.
+        """
+        out: dict[str, pl.DataFrame] = {}
+        if train_g.height == 0 or RecursiveLeastSquaresRegression is None:
+            return out
+        try:
+            model_y, model_p = self._fit_models(train_g)
+        except Exception as exc:
+            logger.warning("fit multi %s: %s", unique_id, exc)
+            return out
+        for name, tg in targets.items():
+            if tg is None or tg.height == 0:
+                continue
+            try:
+                pred = self._predict_with_models(
+                    model_y, model_p, unique_id, train_g, tg, meta
+                )
+                if pred is not None:
+                    out[name] = pred
+            except Exception as exc:
+                logger.warning("predict %s/%s: %s", unique_id, name, exc)
+        return out
+
+    def run_multi(
+        self,
+        train: pl.DataFrame,
+        targets: dict[str, pl.DataFrame],
+        forecast_levels: list[str],
+        desc: str = "RLS multi-target",
+        meta: dict | None = None,
+        limit_series: int | None = None,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """Fit una vez por serie; predice todos los targets (Fase 1)."""
+        unique_ids = self._build_tasks(train, forecast_levels)
+        if limit_series and limit_series > 0:
+            unique_ids = unique_ids[:limit_series]
+            logger.info("%s: limit_series=%d", desc, limit_series)
+        logger.info("%s: %d series", desc, len(unique_ids))
+        needed = set(unique_ids)
+        train_parts = self._normalize_partition_dict(
+            train.filter(pl.col("unique_id").is_in(list(needed))).partition_by(
+                "unique_id", as_dict=True
+            )
         )
-        y = train_g["y"].to_numpy()
-        log_y = np.log1p(y)
+        target_parts: dict[str, dict] = {}
+        for name, tdf in targets.items():
+            if tdf is None or tdf.height == 0:
+                target_parts[name] = {}
+                continue
+            target_parts[name] = self._normalize_partition_dict(
+                tdf.filter(pl.col("unique_id").is_in(list(needed))).partition_by(
+                    "unique_id", as_dict=True
+                )
+            )
 
-        model_y = RecursiveLeastSquaresRegression(
-            forgetting_factor=self._forgetting_factor,
-            min_y_to_update=self._min_y_to_update,
-            return_all_coefs=False,
-        )
-        priors_y = [
-            RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
-        ] + [
-            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
-            for _ in range(len(self._driver_cols) - 1)
-        ]
-        model_y.fit(x=X_y, y=log_y, priors=priors_y)
+        def _one(uid: str) -> dict[str, pl.DataFrame]:
+            if uid not in train_parts:
+                return {}
+            tg = {
+                name: parts[uid]
+                for name, parts in target_parts.items()
+                if uid in parts
+            }
+            if not tg:
+                return {}
+            return self.fit_and_predict_multi(uid, train_parts[uid], tg, meta)
 
-        log_yhat_test = model_y.predict(X_y_test)
-        if self._use_correction_factor:
-            corr = self._correction_factor(np.asarray(model_y.errors))
-            yhat_test = np.round(np.exp(log_yhat_test) * corr).ravel()
+        results_by_period: dict[str, list[pl.DataFrame]] = {k: [] for k in targets}
+        if self._n_jobs and self._n_jobs > 1:
+            with ThreadPoolExecutor(max_workers=self._n_jobs) as ex:
+                futs = {ex.submit(_one, uid): uid for uid in unique_ids}
+                for fut in tqdm(
+                    as_completed(futs), total=len(futs), desc=desc, unit="serie"
+                ):
+                    try:
+                        got = fut.result()
+                    except Exception as exc:
+                        logger.warning("serie falló: %s", exc)
+                        continue
+                    for name, df in got.items():
+                        results_by_period.setdefault(name, []).append(df)
         else:
-            yhat_test = np.round(np.expm1(log_yhat_test)).ravel()
+            for uid in tqdm(unique_ids, desc=desc, unit="serie"):
+                got = _one(uid)
+                for name, df in got.items():
+                    results_by_period.setdefault(name, []).append(df)
 
-        X_p = (
-            train_g.select(self._driver_cols_price)
-            .to_numpy()
-            .astype(np.float64, order="C")
+        frames = []
+        for name, lst in results_by_period.items():
+            if not lst:
+                continue
+            part = pl.concat(lst, how="diagonal_relaxed").with_columns(
+                pl.lit(name).alias("period_type")
+            )
+            frames.append(part)
+        res_df = (
+            pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
         )
-        X_p_test = (
-            test_g.select(self._driver_cols_price)
-            .to_numpy()
-            .astype(np.float64, order="C")
-        )
-        price = train_g["value"].to_numpy()
-        log_price = np.log1p(np.clip(price, 0.0, None))
-
-        model_p = RecursiveLeastSquaresRegression(
-            forgetting_factor=self._forgetting_factor,
-            min_y_to_update=1e-8,
-            return_all_coefs=False,
-        )
-        priors_p = [
-            RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
-        ] + [
-            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
-            for _ in range(len(self._driver_cols_price) - 1)
-        ]
-        model_p.fit(x=X_p, y=log_price, priors=priors_p)
-
-        log_pricehat = model_p.predict(X_p_test)
-        if self._use_correction_factor:
-            corr_p = self._correction_factor(np.asarray(model_p.errors))
-            pricehat = np.expm1(log_pricehat) * corr_p
-        else:
-            pricehat = np.expm1(log_pricehat)
-        pricehat = np.round(pricehat, 2).ravel()
-
-        # y real: 0/null en zona solo-forecast
-        y_real = test_g["y"].to_numpy() if "y" in test_g.columns else np.zeros(len(yhat_test))
-        price_real = (
-            test_g["value"].to_numpy()
-            if "value" in test_g.columns
-            else np.zeros(len(pricehat))
-        )
-
-        result = {
-            "unique_id": unique_id,
-            "ds": test_g["ds"],
-            "value": price_real,
-            "valuehat": pricehat,
-            "y": y_real,
-            "yhat": yhat_test,
-        }
-        if meta:
-            for k, v in meta.items():
-                result[k] = v
-        # copiar descripciones si existen en train
-        for col in ("sku_desc", "store_name", "seccion"):
-            if col in train_g.columns:
-                result[col] = train_g[col][0]
-        return pl.DataFrame(result)
+        wmapes_df = self._compute_wmape(res_df) if res_df.height else pl.DataFrame()
+        return res_df, wmapes_df
 
     def _build_tasks(
+
         self, train: pl.DataFrame, forecast_levels: list[str], min_obs: int = 28
     ) -> list[str]:
         """Series con al menos min_obs observaciones en train (evita series vacías/ruido)."""
@@ -711,13 +866,14 @@ class RLSForecastRunner:
 
     def _rolling_28_one(self, unique_id: str, g: pl.DataFrame) -> pl.DataFrame | None:
         """
-        Walk-forward 28d sobre toda la historia de la serie.
-        Priors iniciales = modelo ajustado con todos los actuals (opción B).
+        Rolling 28d O(n): un fit sobre actuals (opción B = modelo final).
+        Predicción con model.predict (misma vía que yhat/valuehat) sobre todo el
+        panel — evita coeficientes manuales X@β que producían valuehat28≈0 cuando
+        return_all_coefs no expone trayectoria usable.
         """
         if RecursiveLeastSquaresRegression is None or g.height == 0:
             return None
         g = g.sort("ds")
-        # a partir del primer lunes ≥ primera fecha
         first_ds = g["ds"][0]
         if isinstance(first_ds, dt.datetime):
             first_ds = first_ds.date()
@@ -734,157 +890,89 @@ class RLSForecastRunner:
         X_all = g.select(dcols).to_numpy().astype(np.float64, order="C")
         y_all = g["y"].to_numpy().astype(np.float64)
         has_value = "value" in g.columns
-        if has_value:
-            Xp_all = g.select(pdcols).to_numpy().astype(np.float64, order="C") if pdcols else X_all
-            v_all = g["value"].to_numpy().astype(np.float64)
+        if has_value and pdcols:
+            Xp_all = g.select(pdcols).to_numpy().astype(np.float64, order="C")
+            v_all = np.clip(g["value"].to_numpy().astype(np.float64), 0.0, None)
         else:
             Xp_all = X_all
             v_all = np.zeros_like(y_all)
 
-        n = g.height
-        H = int(getattr(settings, "ROLLING_HORIZON_DAYS", 28))
-
-        # Máscara de actuals utilizables
+        n = len(y_all)
         actual_mask = np.isfinite(y_all) & (y_all != 0)
-        if has_value:
-            actual_v = np.isfinite(v_all) & (v_all != 0)
-        else:
-            actual_v = actual_mask
+        idx_act = np.where(actual_mask)[0]
+        if idx_act.size < 2:
+            return None
 
         yhat28 = np.full(n, np.nan)
         valuehat28 = np.full(n, np.nan)
 
-        # ── Opción B: modelo final con todos los actuals → priors ──
-        idx_act = np.where(actual_mask)[0]
-        if idx_act.size < 2:
-            return None
-        priors_y = self._default_priors(X_all.shape[1])
-        priors_p = self._default_priors(Xp_all.shape[1])
         try:
-            model_y_final, priors_y = self._fit_rls(
-                X_all[idx_act],
-                np.log1p(y_all[idx_act]),
-                priors_y,
-                self._min_y_to_update,
+            model_y = RecursiveLeastSquaresRegression(
+                forgetting_factor=self._forgetting_factor,
+                min_y_to_update=self._min_y_to_update,
+                return_all_coefs=False,
             )
-        except Exception as exc:
-            logger.warning("rolling28 %s: fit final y falló: %s", unique_id, exc)
-            return None
-        if has_value and np.any(actual_v):
-            try:
-                idx_v = np.where(actual_v)[0]
-                model_p_final, priors_p = self._fit_rls(
-                    Xp_all[idx_v],
-                    np.log1p(np.clip(v_all[idx_v], 0.0, None)),
-                    priors_p,
-                    1e-8,
-                )
-            except Exception:
-                model_p_final = None
-        else:
-            model_p_final = None
-
-        # ── Walk por bloques de H días ──
-        pos = 0
-        cur_priors_y = priors_y
-        cur_priors_p = priors_p
-        while pos < n:
-            end = min(pos + H, n)
-            X_block = X_all[pos:end]
-            Xp_block = Xp_all[pos:end]
-
-            # Modelo para predecir el bloque: fit con data [0, pos) + priors actuales
-            if pos == 0:
-                # Primer bloque: usar modelo final (priors B ya embebidos)
-                model_y = model_y_final
-                model_p = model_p_final
-            else:
-                prev = np.arange(0, pos)
-                prev_act = prev[actual_mask[prev]] if prev.size else prev
-                if prev_act.size >= 1:
-                    try:
-                        model_y, cur_priors_y = self._fit_rls(
-                            X_all[prev_act],
-                            np.log1p(y_all[prev_act]),
-                            cur_priors_y,
-                            self._min_y_to_update,
-                        )
-                    except Exception:
-                        model_y = model_y_final
-                else:
-                    model_y = model_y_final
-                if has_value:
-                    prev_v = prev[actual_v[prev]] if prev.size else prev
-                    if prev_v.size >= 1:
-                        try:
-                            model_p, cur_priors_p = self._fit_rls(
-                                Xp_all[prev_v],
-                                np.log1p(np.clip(v_all[prev_v], 0.0, None)),
-                                cur_priors_p,
-                                1e-8,
-                            )
-                        except Exception:
-                            model_p = model_p_final
-                    else:
-                        model_p = model_p_final
-                else:
-                    model_p = None
-
-            try:
-                yhat28[pos:end] = self._predict_rls(
-                    model_y, X_block, self._use_correction_factor
-                )
-            except Exception as exc:
-                logger.debug("rolling28 predict y %s: %s", unique_id, exc)
-            if model_p is not None:
+            model_y.fit(
+                x=X_all[idx_act],
+                y=np.log1p(y_all[idx_act]),
+                priors=self._default_priors(X_all.shape[1]),
+            )
+            log_yhat = np.asarray(model_y.predict(X_all), dtype=np.float64).ravel()
+            if self._use_correction_factor:
                 try:
-                    valuehat28[pos:end] = self._predict_rls(
-                        model_p, Xp_block, self._use_correction_factor
-                    )
+                    corr = self._correction_factor(np.asarray(model_y.errors))
+                    yhat28 = np.round(np.exp(log_yhat) * corr).ravel()
                 except Exception:
-                    pass
+                    yhat28 = np.round(np.expm1(log_yhat)).ravel()
+            else:
+                yhat28 = np.round(np.expm1(log_yhat)).ravel()
+        except Exception as exc:
+            logger.warning("rolling28 y %s: %s", unique_id, exc)
+            return None
 
-            # Actualizar priors con actuals del bloque (si existen)
-            block_idx = np.arange(pos, end)
-            block_act = block_idx[actual_mask[block_idx]]
-            if block_act.size:
-                # re-fit hasta end del bloque con actuals
-                up_to = np.arange(0, end)
-                up_act = up_to[actual_mask[up_to]]
-                if up_act.size >= 1:
-                    try:
-                        _, cur_priors_y = self._fit_rls(
-                            X_all[up_act],
-                            np.log1p(y_all[up_act]),
-                            cur_priors_y,
-                            self._min_y_to_update,
-                        )
-                    except Exception:
-                        pass
-                if has_value:
-                    up_v = up_to[actual_v[up_to]]
-                    if up_v.size >= 1:
+        if has_value:
+            actual_v = np.isfinite(v_all) & (v_all != 0)
+            idx_v = np.where(actual_v)[0]
+            if idx_v.size >= 2:
+                try:
+                    model_p = RecursiveLeastSquaresRegression(
+                        forgetting_factor=self._forgetting_factor,
+                        min_y_to_update=1e-8,
+                        return_all_coefs=False,
+                    )
+                    model_p.fit(
+                        x=Xp_all[idx_v],
+                        y=np.log1p(v_all[idx_v]),
+                        priors=self._default_priors(Xp_all.shape[1]),
+                    )
+                    log_vhat = np.asarray(
+                        model_p.predict(Xp_all), dtype=np.float64
+                    ).ravel()
+                    if self._use_correction_factor:
                         try:
-                            _, cur_priors_p = self._fit_rls(
-                                Xp_all[up_v],
-                                np.log1p(np.clip(v_all[up_v], 0.0, None)),
-                                cur_priors_p,
-                                1e-8,
+                            corr_p = self._correction_factor(
+                                np.asarray(model_p.errors)
                             )
+                            valuehat28 = np.round(np.expm1(log_vhat) * corr_p, 2).ravel()
                         except Exception:
-                            pass
+                            valuehat28 = np.round(np.expm1(log_vhat), 2).ravel()
+                    else:
+                        valuehat28 = np.round(np.expm1(log_vhat), 2).ravel()
+                except Exception as exc:
+                    logger.warning("rolling28 value %s: %s", unique_id, exc)
 
-            pos = end
-
-        out = {
-            "unique_id": unique_id,
-            "ds": g["ds"],
-            "yhat28": yhat28,
-            "valuehat28": valuehat28,
-        }
-        return pl.DataFrame(out)
+        return pl.DataFrame(
+            {
+                "unique_id": unique_id,
+                "ds": g["ds"],
+                "yhat28": yhat28,
+                "valuehat28": valuehat28,
+            }
+        )
 
     def run_rolling_28(
+
+
         self,
         panel: pl.DataFrame,
         forecast_levels: list[str],
@@ -900,24 +988,36 @@ class RLSForecastRunner:
                     "valuehat28": pl.Float64,
                 }
             )
-        unique_ids = self._build_tasks(panel, forecast_levels, min_obs=2)
+        unique_ids = self._build_tasks(panel, forecast_levels, min_obs=28)
         parts = self._normalize_partition_dict(
             panel.filter(pl.col("unique_id").is_in(unique_ids)).partition_by(
                 "unique_id", as_dict=True
             )
         )
         frames = []
-        iterator = unique_ids
-        try:
-            iterator = tqdm(unique_ids, desc=desc, leave=False)
-        except Exception:
-            pass
-        for uid in iterator:
-            if uid not in parts:
-                continue
-            one = self._rolling_28_one(uid, parts[uid])
-            if one is not None and one.height:
-                frames.append(one)
+        uids_ok = [u for u in unique_ids if u in parts]
+
+        def _roll_one(uid: str):
+            try:
+                return self._rolling_28_one(uid, parts[uid])
+            except Exception as exc:
+                logger.warning("rolling28 %s: %s", uid, exc)
+                return None
+
+        if self._n_jobs and self._n_jobs > 1 and len(uids_ok) > 1:
+            with ThreadPoolExecutor(max_workers=self._n_jobs) as ex:
+                futs = [ex.submit(_roll_one, u) for u in uids_ok]
+                for fut in tqdm(
+                    as_completed(futs), total=len(futs), desc=desc, unit="serie"
+                ):
+                    one = fut.result()
+                    if one is not None and one.height:
+                        frames.append(one)
+        else:
+            for uid in tqdm(uids_ok, desc=desc, leave=False):
+                one = _roll_one(uid)
+                if one is not None and one.height:
+                    frames.append(one)
         if not frames:
             return pl.DataFrame(
                 schema={
@@ -1004,7 +1104,7 @@ class RLSForecastRunner:
 
         results: list[pl.DataFrame] = []
         if self._n_jobs and self._n_jobs > 1:
-            with ProcessPoolExecutor(max_workers=self._n_jobs) as executor:
+            with ThreadPoolExecutor(max_workers=self._n_jobs) as executor:
                 futures = [
                     executor.submit(self._fit_predict_one, *task, meta)
                     for task in tasks
@@ -1157,9 +1257,15 @@ def densify_section_panel(
 
 
 class RLSForecastPipeline:
-    def __init__(self, config: ForecastConfig, n_jobs: int | None = None):
+    def __init__(
+        self,
+        config: ForecastConfig,
+        n_jobs: int | None = None,
+        limit_series: int | None = None,
+    ):
         self._cfg = config
         self._n_jobs = n_jobs
+        self._limit_series = limit_series
         self._calendar: HolidayCalendar | None = None
         self._feature_builder: CalendarFeatureBuilder | None = None
         self._aggregator = DataAggregator(
@@ -1231,61 +1337,77 @@ class RLSForecastPipeline:
 
     @staticmethod
     def _calculate_edp(df: pl.DataFrame) -> pl.DataFrame:
-        """ASP/EDP/discount. Fallback vectorizado si no hay rls_opt o hay demasiadas series."""
+        """
+        ASP / EDP / discount.
+
+        `decompose_price(..., indexors=...)` falla en nopython (tipos de slice
+        incompatibles en rls_opt actual). Estrategia:
+          1) Fórmula vectorizada Polars (rápida, estable) — default.
+          2) Opcional: decompose_price por serie SOLO si EDP_USE_LOOP=1 y
+             n_series es bajo (< 500).
+        """
         if df.height == 0:
             return df
-        n_series = df["unique_id"].n_unique()
-        # Fallback rápido: asp = value/max(y,eps); edp≈asp; discount=0
-        # Evita congelar con decenas de miles de series en loop Python.
-        use_fast = decompose_price is None or n_series > 5000
-        if use_fast:
-            if decompose_price is not None and n_series > 5000:
-                logger.warning(
-                    "EDP: %d series → modo rápido vectorizado (umbral 5000)",
-                    n_series,
-                )
-            return df.with_columns(
+
+        def _vectorized(frame: pl.DataFrame) -> pl.DataFrame:
+            return frame.with_columns(
                 (pl.col("value") / pl.col("y").clip(lower_bound=1e-8))
                 .fill_nan(0.0)
+                .fill_null(0.0)
                 .alias("asp"),
                 (pl.col("value") / pl.col("y").clip(lower_bound=1e-8))
                 .fill_nan(0.0)
+                .fill_null(0.0)
                 .alias("edp"),
                 pl.lit(0.0).alias("discount"),
             )
 
-        logger.info("EDP: decompose_price sobre %d series…", n_series)
-        parts = []
-        groups = df.sort(["unique_id", "ds"]).partition_by(
-            "unique_id", maintain_order=True
-        )
-        for part in tqdm(groups, desc="EDP", unit="serie"):
-            uid = part["unique_id"][0]
-            asp, edp, discount = decompose_price(
-                sales_dollars=part["value"].to_numpy(),
-                sales_units=part["y"].to_numpy(),
-            )
-            computed = {
-                "asp": np.asarray(asp, dtype=np.float64).ravel(),
-                "edp": np.asarray(edp, dtype=np.float64).ravel(),
-                "discount": np.asarray(discount, dtype=np.float64).ravel(),
-            }
-            for name, arr in computed.items():
-                if arr.shape[0] != part.height:
-                    raise ValueError(
-                        f"decompose_price '{name}' len={arr.shape[0]} "
-                        f"vs unique_id={uid} height={part.height}"
-                    )
-            parts.append(
-                part.with_columns(
-                    pl.Series("asp", computed["asp"]),
-                    pl.Series("edp", computed["edp"]),
-                    pl.Series("discount", computed["discount"]),
+        if decompose_price is None:
+            return _vectorized(df)
+
+        import os
+
+        use_loop = os.environ.get("EDP_USE_LOOP", "0") == "1"
+        n_series = df["unique_id"].n_unique()
+        if not use_loop or n_series > 500:
+            if n_series > 500 and use_loop:
+                logger.info(
+                    "EDP: %d series → vectorizado (loop desactivado por tamaño)",
+                    n_series,
                 )
-            )
+            return _vectorized(df)
+
+        # Loop controlado (solo debug / series pocas)
+        logger.info("EDP: loop decompose_price sobre %d series…", n_series)
+        ordered = df.sort(["unique_id", "ds"])
+        parts: list[pl.DataFrame] = []
+        for part in ordered.partition_by("unique_id", maintain_order=True):
+            try:
+                a, e, d = decompose_price(
+                    sales_dollars=part["value"].to_numpy().astype(np.float64),
+                    sales_units=part["y"].to_numpy().astype(np.float64),
+                )
+                parts.append(
+                    part.with_columns(
+                        pl.Series("asp", np.asarray(a, dtype=np.float64).ravel()),
+                        pl.Series("edp", np.asarray(e, dtype=np.float64).ravel()),
+                        pl.Series(
+                            "discount", np.asarray(d, dtype=np.float64).ravel()
+                        ),
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "EDP serie %s falló (%s); vectorizado local",
+                    part["unique_id"][0],
+                    exc,
+                )
+                parts.append(_vectorized(part))
         return pl.concat(parts, how="vertical")
 
     def _run_section(
+
+
         self,
         selected: pl.DataFrame,
         seccion: str,
@@ -1323,8 +1445,10 @@ class RLSForecastPipeline:
             raw_oos.height,
         )
 
+        t_agg = StageTimer(f"{seccion} aggregate train")
         logger.info("Sección %s: agregando train…", seccion)
         df_train = self._aggregator.aggregate(raw_train)
+        t_agg.stop()
         logger.info(
             "Sección %s: train agregado shape=%s | series=%d",
             seccion,
@@ -1346,8 +1470,10 @@ class RLSForecastPipeline:
             hz["train_end"],
         )
 
+        t_edp = StageTimer(f"{seccion} EDP")
         logger.info("Sección %s: EDP…", seccion)
         df_train = self._calculate_edp(df_train)
+        t_edp.stop()
 
         logger.info("Sección %s: features train…", seccion)
         df_train = self._feature_builder.extract_drivers(
@@ -1458,58 +1584,37 @@ class RLSForecastPipeline:
             "forecast_end": hz["forecast_end"],
         }
 
-        res_frames = []
-        wmape_frames = []
-
-        # In-sample
-        res_in, wm_in = runner.run(
-            df_train, df_train, self._cfg.forecast_levels, desc=f"{seccion} in-sample", meta=meta
-        )
-        if res_in.height:
-            res_in = res_in.with_columns(pl.lit("in_sample").alias("period_type"))
-            res_frames.append(res_in)
-            wmape_frames.append(wm_in)
-
-        # Out-of-sample
+        # Fase 1: un fit por serie → predicción in / OOS / forecast
+        targets: dict[str, pl.DataFrame] = {"in_sample": df_train}
         if df_oos.height:
-            res_out, wm_out = runner.run(
-                df_train,
-                df_oos,
-                self._cfg.forecast_levels,
-                desc=f"{seccion} OOS",
-                meta=meta,
-            )
-            if res_out.height:
-                res_out = res_out.with_columns(pl.lit("out_sample").alias("period_type"))
-                res_frames.append(res_out)
-                wmape_frames.append(wm_out)
-
-        # Solo forecast
+            targets["out_sample"] = df_oos
         if df_fcst.height:
-            res_f, _ = runner.run(
-                df_train,
-                df_fcst,
-                self._cfg.forecast_levels,
-                desc=f"{seccion} forecast-only",
-                meta=meta,
-            )
-            if res_f.height:
-                res_f = res_f.with_columns(
-                    pl.lit("forecast_only").alias("period_type"),
-                    pl.lit(0.0).alias("y"),
-                    pl.lit(0.0).alias("value"),
-                )
-                res_frames.append(res_f)
+            targets["forecast_only"] = df_fcst
 
-        if not res_frames:
-            return pl.DataFrame(), pl.DataFrame(), driver_cols
-
-        res_df = pl.concat(res_frames, how="diagonal_relaxed")
-        wmapes_df = (
-            pl.concat(wmape_frames, how="diagonal_relaxed")
-            if wmape_frames
-            else pl.DataFrame()
+        t_fit = StageTimer(f"{seccion} RLS multi-target")
+        res_df, wmapes_df = runner.run_multi(
+            df_train,
+            targets,
+            self._cfg.forecast_levels,
+            desc=f"{seccion} RLS",
+            meta=meta,
+            limit_series=getattr(self, "_limit_series", None),
         )
+        t_fit.stop()
+        if res_df.height and "forecast_only" in targets:
+            # y/value del tramo solo-forecast no son actuals
+            res_df = res_df.with_columns(
+                pl.when(pl.col("period_type") == "forecast_only")
+                .then(pl.lit(0.0))
+                .otherwise(pl.col("y"))
+                .alias("y"),
+                pl.when(pl.col("period_type") == "forecast_only")
+                .then(pl.lit(0.0))
+                .otherwise(pl.col("value"))
+                .alias("value"),
+            )
+        if not res_df.height:
+            return pl.DataFrame(), pl.DataFrame(), driver_cols
 
         # ── Rolling 28d sobre toda la historia (train+OOS+forecast panel) ──
         panel_parts = [df_train]
@@ -1523,9 +1628,11 @@ class RLSForecastPipeline:
         logger.info(
             "Sección %s: rolling 28d sobre panel shape=%s…", seccion, panel.shape
         )
+        t_roll = StageTimer(f"{seccion} rolling28")
         roll = runner.run_rolling_28(
             panel, self._cfg.forecast_levels, desc=f"{seccion} rolling28"
         )
+        t_roll.stop()
         if roll.height and res_df.height:
             # alinear tipos de ds
             if res_df["ds"].dtype != roll["ds"].dtype:
@@ -1585,11 +1692,18 @@ class RLSForecastPipeline:
             if seccion not in first_by_sec:
                 logger.warning("Sin datos para sección %s; se omite.", seccion)
                 continue
+            t_sec = StageTimer(f"sección {seccion} total")
             res, wm, driver_cols = self._run_section(
                 selected, seccion, first_by_sec[seccion], driver_cols
             )
+            t_sec.stop()
             if res.height:
                 all_res.append(res)
+                # Checkpoint parcial (Fase 5)
+                ck = self._cfg.out_dir / f"forecast_seccion_{seccion}.parquet"
+                self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
+                res.write_parquet(ck, compression="zstd", compression_level=3)
+                logger.info("✓ checkpoint %s (%d filas)", ck.name, res.height)
             if wm.height:
                 all_wm.append(wm)
         _advance("forecast por sección listo")
@@ -1681,12 +1795,18 @@ class RLSForecastPipeline:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pipeline RLS sección→SKU→local")
+    parser = argparse.ArgumentParser(description="Pipeline RLS sección→tienda→SKU")
     parser.add_argument(
         "--n-jobs",
         type=int,
         default=None,
-        help="Procesos paralelos por unique_id. Default: secuencial.",
+        help="Workers (threads) por unique_id. Default: secuencial.",
+    )
+    parser.add_argument(
+        "--limit-series",
+        type=int,
+        default=None,
+        help="Máx. series por sección (dev/debug). Default: todas.",
     )
     return parser.parse_args()
 
@@ -1694,7 +1814,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     config = ForecastConfig.from_settings()
-    pipeline = RLSForecastPipeline(config, n_jobs=args.n_jobs)
+    pipeline = RLSForecastPipeline(
+        config, n_jobs=args.n_jobs, limit_series=args.limit_series
+    )
     res_df, wmapes_df = pipeline.run()
     print(res_df.head())
     print(wmapes_df.head())

@@ -44,6 +44,41 @@ def _load_bytes(data: bytes, name: str):
     return backend.load_forecast_bytes(data, name)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_label_maps(path_str: str, mtime: float):
+    df = _load_parquet(path_str, mtime)
+    return backend.build_label_maps(df)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_prepare(
+    path_str: str,
+    mtime: float,
+    unidad: str,
+    freq: str,
+    selected_id: str,
+    cutoff_iso: str,
+    candidatos: tuple,
+    nombre_nivel: str,
+):
+    df = _load_parquet(path_str, mtime)
+    label_map, desc_map = _cached_label_maps(path_str, mtime)
+    import datetime as _dt
+
+    cutoff = _dt.date.fromisoformat(cutoff_iso)
+    return prepare_dashboard_state(
+        df,
+        unidad=unidad,
+        freq=freq,
+        selected_id=selected_id,
+        cutoff_date=cutoff,
+        candidatos=list(candidatos),
+        nombre_nivel=nombre_nivel,
+        label_map=label_map,
+        desc_map=desc_map,
+    )
+
+
 uploaded = st.sidebar.file_uploader(
     "Cargar forecasts (CSV o Parquet)", type=["csv", "parquet"]
 )
@@ -99,7 +134,14 @@ show_yhat = _opt_yhat in series_forecast
 show_yhat28 = _opt_yhat28 in series_forecast
 
 all_ids = sorted(res_df["unique_id"].unique().to_list())
-label_map, desc_map = backend.build_label_maps(res_df)
+# label maps: cache si venimos de parquet en disco
+_default_path = Path(settings.FORECAST_PATH)
+if uploaded is None and _default_path.exists():
+    label_map, desc_map = _cached_label_maps(
+        str(_default_path), _default_path.stat().st_mtime
+    )
+else:
+    label_map, desc_map = backend.build_label_maps(res_df)
 NOMBRES = settings.NOMBRES_NIVELES
 
 
@@ -174,17 +216,30 @@ cutoff_date = _hz.get("train_end") or backend.ds_range(_probe)[0] or dt.date.tod
 # ─────────────────────────────────────────────────────────────────────────────
 # ViewModel (todos los cálculos fuera de este módulo)
 # ─────────────────────────────────────────────────────────────────────────────
-view = prepare_dashboard_state(
-    res_df,
-    unidad=unidad,
-    freq=freq,
-    selected_id=selected_id,
-    cutoff_date=cutoff_date,
-    candidatos=candidatos,
-    nombre_nivel=nombre_nivel_actual,
-    label_map=label_map,
-    desc_map=desc_map,
-)
+if uploaded is None and Path(settings.FORECAST_PATH).exists():
+    _fp = Path(settings.FORECAST_PATH)
+    view = _cached_prepare(
+        str(_fp),
+        _fp.stat().st_mtime,
+        unidad,
+        freq,
+        selected_id,
+        cutoff_date.isoformat(),
+        tuple(candidatos),
+        nombre_nivel_actual,
+    )
+else:
+    view = prepare_dashboard_state(
+        res_df,
+        unidad=unidad,
+        freq=freq,
+        selected_id=selected_id,
+        cutoff_date=cutoff_date,
+        candidatos=candidatos,
+        nombre_nivel=nombre_nivel_actual,
+        label_map=label_map,
+        desc_map=desc_map,
+    )
 
 st.subheader(f"NIVEL: **{view.label}**")
 

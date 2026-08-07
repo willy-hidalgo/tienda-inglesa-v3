@@ -42,12 +42,37 @@ HORIZON_COLUMNS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Carga
 # ─────────────────────────────────────────────────────────────────────────────
+_FORECAST_LOAD_COLS = [
+    "unique_id",
+    "ds",
+    "y",
+    "yhat",
+    "yhat28",
+    "value",
+    "valuehat",
+    "valuehat28",
+    "period_type",
+    "sku_desc",
+    "store_name",
+    "seccion",
+    "train_end",
+    "test_start",
+    "test_end",
+    "forecast_start",
+    "forecast_end",
+]
+
+
 def load_forecast_parquet(path: str | Path) -> pl.DataFrame:
+    """Carga columnar mínima (evita traer drivers/features al dashboard)."""
     path = Path(path)
-    schema = pl.scan_parquet(path).collect_schema()
+    available = set(pl.scan_parquet(path).collect_schema().names())
+    cols = [c for c in _FORECAST_LOAD_COLS if c in available]
+    if "unique_id" not in cols or "ds" not in cols:
+        cols = list(available)
     return (
         pl.scan_parquet(path)
-        .select(list(schema.names()))
+        .select(cols)
         .with_columns(pl.col("ds").cast(pl.Date))
         .collect()
     )
@@ -188,7 +213,11 @@ def wmape_por_id(
     if not ids:
         return pl.DataFrame(schema=schema)
 
-    base = df.filter(pl.col("unique_id").is_in(ids))
+    need = ["unique_id", "y", "yhat"]
+    if "period_type" in df.columns:
+        need.append("period_type")
+    slim = df.select([c for c in need if c in df.columns])
+    base = slim.filter(pl.col("unique_id").is_in(ids))
     if "period_type" in base.columns:
         base_m = base.filter(pl.col("period_type") != "forecast_only")
     else:

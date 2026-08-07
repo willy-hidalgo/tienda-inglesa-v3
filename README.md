@@ -154,3 +154,22 @@ Por sección, el spine de fechas sale de `section_horizons` (settings):
 
 Cada `unique_id` tiene una fila por fecha del spine. Sin venta → `y=0`, `value=0`.
 El filtro `y=0` aplica **solo a métricas**, no elimina filas del parquet ni del gráfico.
+
+## Rendimiento
+
+Optimizaciones del pipeline RLS (`forecasts.py`):
+
+1. **Fit único** por serie para in-sample / OOS / forecast (antes 3×).
+2. **Rolling 28d O(n)** con trayectoria de coeficientes (`return_all_coefs`), no O(n²) por bloques.
+3. **EDP** por lotes con `indexors` cuando `rls_opt` lo soporta.
+4. **ThreadPoolExecutor** (`--n-jobs`) — numba libera el GIL; evita pickling de Polars.
+5. **Checkpoint** `forecast_seccion_{1|23}.parquet` al terminar cada sección.
+6. **`--limit-series N`** para debug rápido.
+
+```bash
+uv run python app/forecasts.py --n-jobs 4 --limit-series 50
+```
+
+El dashboard **solo lee** `forecast.parquet` / `wmape.parquet` precalculados; no ejecuta RLS.
+
+> `yhat28` / `wmape_28` pueden diferir levemente de la versión O(n²) por la trayectoria continua de covarianza del RLS (más correcta matemáticamente).

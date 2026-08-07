@@ -66,6 +66,10 @@ def prepare_dashboard_state(
     if label_map is None or desc_map is None:
         label_map, desc_map = backend.build_label_maps(unit_df)
 
+    # Subconjunto para ranking (solo candidatos) — evita escanear todo el panel
+    rank_ids = list(dict.fromkeys([selected_id] + list(candidatos)))
+    unit_rank = unit_df.filter(pl.col("unique_id").is_in(rank_ids))
+
     df_daily = backend.filter_series(unit_df, selected_id)
     seccion = selected_id.split("||")[0]
     horizons = backend.resolve_horizons(df_daily, seccion, cols)
@@ -91,7 +95,7 @@ def prepare_dashboard_state(
     if n_data > n_spine:
         n_spine = n_data
     tabla_base = backend.wmape_por_id(
-        candidatos, unit_df, n_fechas_spine=n_spine
+        candidatos, unit_rank, n_fechas_spine=n_spine
     )
     ranking_wmape = backend.ranking_wmape_table(tabla_base, selected_id, desc_map)
     ranking_rot = backend.ranking_rotacion_table(
