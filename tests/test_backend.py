@@ -79,7 +79,8 @@ def test_wmape_excluye_y_cero():
     w = backend.wmape_por_id(["1||a", "1||b"], df)
     r = w.filter(pl.col("unique_id") == "1||a")
     assert abs(r["wmape"][0] - 0.2) < 1e-9
-    assert r["n_points"][0] == 1
+    # n_with_sales = puntos y≠0; n_points = spine (si no se pasa, n_unique ds)
+    assert r["n_with_sales"][0] == 1
 
 
 def test_ranking_wmape_table_columns():

@@ -320,7 +320,7 @@ if show_yhat28 and ch.get("hist_yhat28"):
             y=ch["hist_yhat28"],
             name=f"{_opt_yhat28} (rolling 28d)",
             mode="lines",
-            line=dict(color="rgba(44, 160, 44, 1)", dash="dash", width=2),
+            line=dict(color="rgba(44, 160, 44, 1)", width=2),
         )
     )
 if show_yhat28 and ch.get("fcst_yhat28"):

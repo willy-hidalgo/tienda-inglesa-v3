@@ -82,7 +82,17 @@ def prepare_dashboard_state(
 
     df_view = backend.aggregate_temporal(df_daily, freq)
 
-    tabla_base = backend.wmape_por_id(candidatos, unit_df)
+    # N puntos ranking = longitud del spine de la sección (settings), igual para todos
+    seccion_for_spine = selected_id.split("||")[0]
+    hz_spine = settings.section_horizons(seccion_for_spine)
+    n_spine = (hz_spine["forecast_end"] - hz_spine["train_start"]).days + 1
+    # si el panel cargado tiene más/menos fechas, preferir max(n_unique ds de candidatos, settings)
+    n_data = backend.spine_n_fechas(unit_df, candidatos)
+    if n_data > n_spine:
+        n_spine = n_data
+    tabla_base = backend.wmape_por_id(
+        candidatos, unit_df, n_fechas_spine=n_spine
+    )
     ranking_wmape = backend.ranking_wmape_table(tabla_base, selected_id, desc_map)
     ranking_rot = backend.ranking_rotacion_table(
         tabla_base, selected_id, desc_map, unidad

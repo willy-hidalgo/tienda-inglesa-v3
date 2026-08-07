@@ -1072,6 +1072,90 @@ class RLSForecastRunner:
 # ─────────────────────────────────────────────────────────────────────────────
 # Orquestador – split por sección
 # ─────────────────────────────────────────────────────────────────────────────
+
+def densify_section_panel(
+    df: pl.DataFrame,
+    date_start: dt.date,
+    date_end: dt.date,
+    *,
+    fill_y: float = 0.0,
+    fill_value: float = 0.0,
+    extra_uids: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """
+    Panel denso: (unique_id × cada día en [date_start, date_end]).
+    Sin venta → y=0, value=0. Métricas excluyen ceros aparte.
+    """
+    if date_end < date_start:
+        return df
+    if df.height == 0 and (extra_uids is None or extra_uids.height == 0):
+        return df
+
+    spine = pl.DataFrame(
+        {"ds": pl.date_range(date_start, date_end, interval="1d", eager=True)}
+    )
+    n_days = spine.height
+
+    if df.height:
+        df = df.with_columns(pl.col("ds").cast(pl.Date))
+        uids = df.select("unique_id").unique()
+    else:
+        uids = pl.DataFrame({"unique_id": pl.Series([], dtype=pl.Utf8)})
+    if extra_uids is not None and extra_uids.height:
+        uids = pl.concat([uids, extra_uids.select("unique_id")], how="diagonal_relaxed").unique()
+
+    if uids.height == 0:
+        return df
+
+    grid = uids.join(spine, how="cross")
+
+    meta_cols = [
+        c
+        for c in ("sku_desc", "store_name", "seccion", "conteo_sku")
+        if df.height and c in df.columns
+    ]
+    if meta_cols:
+        meta = (
+            df.select(["unique_id"] + meta_cols)
+            .group_by("unique_id")
+            .agg([pl.col(c).drop_nulls().first().alias(c) for c in meta_cols])
+        )
+        grid = grid.join(meta, on="unique_id", how="left")
+
+    if df.height:
+        data_cols = [
+            c
+            for c in df.columns
+            if c not in ("unique_id", "ds") and c not in meta_cols
+        ]
+        join_df = df.select(["unique_id", "ds"] + data_cols)
+        out = grid.join(join_df, on=["unique_id", "ds"], how="left")
+    else:
+        out = grid
+
+    fills = []
+    if "y" in out.columns:
+        fills.append(pl.col("y").fill_null(fill_y))
+    elif df.height == 0 or "y" not in (df.columns if df.height else []):
+        fills.append(pl.lit(fill_y).alias("y"))
+    if "value" in out.columns:
+        fills.append(pl.col("value").fill_null(fill_value))
+    elif "value" not in out.columns:
+        fills.append(pl.lit(fill_value).alias("value"))
+    if "conteo_sku" in out.columns:
+        fills.append(pl.col("conteo_sku").fill_null(0))
+    if fills:
+        out = out.with_columns(fills)
+
+    logger.info(
+        "densify: %d series × %d días = %d filas",
+        uids.height,
+        n_days,
+        out.height,
+    )
+    return out.sort(["unique_id", "ds"])
+
+
 class RLSForecastPipeline:
     def __init__(self, config: ForecastConfig, n_jobs: int | None = None):
         self._cfg = config
@@ -1248,6 +1332,20 @@ class RLSForecastPipeline:
             df_train["unique_id"].n_unique() if df_train.height else 0,
         )
 
+        # Panel denso train: spine settings [train_start, train_end]
+        n_before = df_train.height
+        df_train = densify_section_panel(
+            df_train, hz["train_start"], hz["train_end"]
+        )
+        logger.info(
+            "Sección %s: train densificado %d → %d filas (spine %s→%s)",
+            seccion,
+            n_before,
+            df_train.height,
+            hz["train_start"],
+            hz["train_end"],
+        )
+
         logger.info("Sección %s: EDP…", seccion)
         df_train = self._calculate_edp(df_train)
 
@@ -1278,11 +1376,46 @@ class RLSForecastPipeline:
         logger.info("Sección %s: agregando OOS…", seccion)
         df_oos = self._aggregator.aggregate(raw_oos) if raw_oos.height else pl.DataFrame()
         if df_oos.height:
+            # Densificar OOS al spine de la sección [test_start, test_end]
+            # y alinear unique_ids con train (mismas series)
+            train_uids = df_train.select("unique_id").unique()
+            df_oos = densify_section_panel(
+                df_oos, hz["test_start"], hz["test_end"]
+            )
+            # asegurar todas las series de train también en OOS (ceros si no hubo venta)
+            oos_uids = df_oos.select("unique_id").unique()
+            missing = train_uids.join(oos_uids, on="unique_id", how="anti")
+            if missing.height:
+                spine_oos = pl.DataFrame(
+                    {
+                        "ds": pl.date_range(
+                            hz["test_start"], hz["test_end"], interval="1d", eager=True
+                        )
+                    }
+                )
+                extra = missing.join(spine_oos, how="cross").with_columns(
+                    pl.lit(0.0).alias("y"),
+                    pl.lit(0.0).alias("value"),
+                )
+                # copiar meta desde train
+                meta_cols = [
+                    c
+                    for c in ("sku_desc", "store_name", "seccion", "conteo_sku")
+                    if c in df_train.columns
+                ]
+                if meta_cols:
+                    meta = (
+                        df_train.select(["unique_id"] + meta_cols)
+                        .group_by("unique_id")
+                        .agg([pl.col(c).drop_nulls().first().alias(c) for c in meta_cols])
+                    )
+                    extra = extra.join(meta, on="unique_id", how="left")
+                df_oos = pl.concat([df_oos, extra], how="diagonal_relaxed")
             df_oos = self._calculate_edp(df_oos)
             df_oos = self._feature_builder.extract_drivers(
                 df_oos, req_columns=driver_cols
             ).sort("ds")
-            logger.info("Sección %s: OOS shape=%s", seccion, df_oos.shape)
+            logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
 
         # Frame de solo-forecast (calendario sintético)
         uids = df_train["unique_id"].unique().to_list()

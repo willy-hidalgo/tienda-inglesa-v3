@@ -144,3 +144,13 @@ Walk-forward por bloques de 28 días sobre **toda la historia** (desde el primer
 3. Se actualiza el modelo con los actuals del bloque y se avanza.
 
 No modifica `yhat` / `valuehat`. Métricas `WMAPE₂₈` / `BIAS₂₈` en sección aparte del dashboard.
+
+## Panel denso
+
+Por sección, el spine de fechas sale de `section_horizons` (settings):
+- train: `[train_start, train_end]`
+- OOS: `[test_start, test_end]`
+- forecast-only: `[forecast_start, forecast_end]`
+
+Cada `unique_id` tiene una fila por fecha del spine. Sin venta → `y=0`, `value=0`.
+El filtro `y=0` aplica **solo a métricas**, no elimina filas del parquet ni del gráfico.

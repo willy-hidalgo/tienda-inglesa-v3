@@ -155,33 +155,88 @@ def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Métricas / rankings
 # ─────────────────────────────────────────────────────────────────────────────
-def wmape_por_id(ids: list[str], df: pl.DataFrame) -> pl.DataFrame:
+def spine_n_fechas(df: pl.DataFrame, unique_ids: list[str] | None = None) -> int:
+    """Nº de fechas distintas del panel (spine denso)."""
+    if df.height == 0 or "ds" not in df.columns:
+        return 0
+    sub = df
+    if unique_ids:
+        sub = df.filter(pl.col("unique_id").is_in(unique_ids))
+        if sub.height == 0:
+            sub = df
+    return int(sub["ds"].n_unique())
+
+
+def wmape_por_id(
+    ids: list[str],
+    df: pl.DataFrame,
+    *,
+    n_fechas_spine: int | None = None,
+) -> pl.DataFrame:
+    """
+    WMAPE = Σ|y−ŷ|/Σ|y| (excluye y==0 y forecast_only del cálculo).
+    n_points = longitud del spine (igual para todos si el panel está denso).
+    n_with_sales = conteo y≠0 (informativo).
+    """
     schema = {
         "unique_id": pl.Utf8,
         "wmape": pl.Float64,
         "sum_y": pl.Float64,
         "n_points": pl.UInt32,
+        "n_with_sales": pl.UInt32,
     }
     if not ids:
         return pl.DataFrame(schema=schema)
-    scored = df.filter(pl.col("unique_id").is_in(ids))
-    if "period_type" in scored.columns:
-        scored = scored.filter(pl.col("period_type") != "forecast_only")
-    scored = scored.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+
+    base = df.filter(pl.col("unique_id").is_in(ids))
+    if "period_type" in base.columns:
+        base_m = base.filter(pl.col("period_type") != "forecast_only")
+    else:
+        base_m = base
+
+    if n_fechas_spine is None:
+        n_fechas_spine = spine_n_fechas(base_m if base_m.height else base, ids)
+    n_fechas_spine = int(n_fechas_spine or 0)
+
+    scored = base_m.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
     if scored.height == 0:
-        return pl.DataFrame(schema=schema)
-    return (
+        # devolver todos los ids con wmape null/0 y n_points = spine
+        return pl.DataFrame(
+            {
+                "unique_id": ids,
+                "wmape": [0.0] * len(ids),
+                "sum_y": [0.0] * len(ids),
+                "n_points": [n_fechas_spine] * len(ids),
+                "n_with_sales": [0] * len(ids),
+            }
+        ).filter(pl.col("unique_id").is_in(ids))
+
+    agg = (
         scored.group_by("unique_id")
         .agg(
             pl.col("y").sum().alias("sum_y"),
             (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
-            pl.len().alias("n_points"),
+            pl.len().alias("n_with_sales"),
         )
         .filter(pl.col("sum_y") != 0)
         .with_columns((pl.col("sum_abs_error") / pl.col("sum_y")).alias("wmape"))
-        .select(["unique_id", "wmape", "sum_y", "n_points"])
+        .with_columns(pl.lit(n_fechas_spine).cast(pl.UInt32).alias("n_points"))
+        .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
     )
-
+    # ids sin ventas: aún así n_points = spine
+    missing = [i for i in ids if i not in set(agg["unique_id"].to_list())]
+    if missing:
+        extra = pl.DataFrame(
+            {
+                "unique_id": missing,
+                "wmape": [0.0] * len(missing),
+                "sum_y": [0.0] * len(missing),
+                "n_points": [n_fechas_spine] * len(missing),
+                "n_with_sales": [0] * len(missing),
+            }
+        )
+        agg = pl.concat([agg, extra], how="diagonal_relaxed")
+    return agg
 
 def ranking_wmape_table(
     tabla_base: pl.DataFrame,
@@ -348,11 +403,8 @@ def split_hist_forecast(
         hist = df_view.filter(pl.col("period_type") != "forecast_only")
         fcst = df_view.filter(pl.col("period_type") == "forecast_only")
         return hist, fcst
-    hist = df_view.filter(
-        (pl.col("ds").cast(pl.Date) <= test_end)
-        & (pl.col("y").is_not_null())
-        & (pl.col("y") != 0)
-    )
+    # Incluir y=0 en el panel/gráfico; el filtro de ceros es solo para métricas
+    hist = df_view.filter(pl.col("ds").cast(pl.Date) <= test_end)
     fcst = df_view.filter(
         (pl.col("ds").cast(pl.Date) >= forecast_start)
         & (pl.col("ds").cast(pl.Date) <= forecast_end)
