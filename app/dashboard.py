@@ -1,16 +1,23 @@
 """
 Forecast Explorer – Streamlit (solo visualización)
-=================================================
-Cálculos: app.backend + app.dashboard_data
-Este módulo solo: controles st, dataframes y Plotly.
+==================================================
+Cálculos: app.backend. El pipeline precalcula los parquet una sola vez; el
+dashboard construye un contexto pre-agregado por (archivo, unidad) —
+`backend.build_dashboard_context` — que se reutiliza en cada interacción.
+Cualquier cambio de selección solo recorre subconjuntos (rankings = tabla
+pre-agregada; gráfico/métricas = serie elegida) → respuesta inmediata y
+correcta, sin re-procesar el panel completo.
 """
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import sys
 from pathlib import Path
 
 import plotly.graph_objects as go
+import polars as pl
 import streamlit as st
 
 st.set_page_config(page_title="Forecast Explorer", layout="wide")
@@ -24,43 +31,137 @@ import settings
 
 try:
     from app import backend
-    from app.dashboard_data import prepare_dashboard_state
 except ImportError:  # pragma: no cover
     import backend  # type: ignore
-    from dashboard_data import prepare_dashboard_state  # type: ignore
 
 _RANK_HEIGHT = 35 + 5 * 35  # ~5 filas visibles
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Carga (I/O de UI; parseo delegado al backend)
+# Carga / contexto (pre-agregado UNA vez por archivo + unidad + CACHE EN DISCO)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Cargando forecasts…", ttl=3600)
-def _load_parquet(path_str: str, mtime: float):
-    return backend.load_forecast_parquet(path_str)
+# El contexto completo se arma en el PRIMER render y se persiste a disco por
+# (origen, tamaño, mtime, unidad); los arranques siguientes lo leen de cache
+# en vez de re-parsear el parquet y re-escandear el panel (arranque rápido).
+# En sesión se mantiene en st.session_state con clave escalar para que cada
+# interacción sea O(subconjunto) sobre el contexto ya armado.
+_CACHE_DIR = Path(settings.ROOT) / "data" / ".dashcache"
 
 
-@st.cache_data(show_spinner=False)
-def _load_bytes(data: bytes, name: str):
-    return backend.load_forecast_bytes(data, name)
+def _cache_key(source: tuple) -> str:
+    raw = "|".join(str(x) for x in source)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _save_context(key: str, ctx: backend.DashboardContext) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ctx.unit_df.write_parquet(_CACHE_DIR / f"{key}.unit.parquet", compression="zstd")
+    ctx.per_id.write_parquet(_CACHE_DIR / f"{key}.per.parquet", compression="zstd")
+    pl.DataFrame(
+        {
+            "unique_id": list(ctx.label_map.keys()),
+            "label": list(ctx.label_map.values()),
+            "desc": [ctx.desc_map.get(u, "") for u in ctx.label_map],
+        }
+    ).write_parquet(_CACHE_DIR / f"{key}.labels.parquet", compression="zstd")
+    (_CACHE_DIR / f"{key}.meta.json").write_text(
+        json.dumps(
+            {
+                "all_ids": ctx.all_ids,
+                "has_rolling": ctx.has_rolling,
+                "has_value_cols": ctx.has_value_cols,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_cached(key: str) -> backend.DashboardContext | None:
+    try:
+        files = (
+            _CACHE_DIR / f"{key}.unit.parquet",
+            _CACHE_DIR / f"{key}.per.parquet",
+            _CACHE_DIR / f"{key}.labels.parquet",
+            _CACHE_DIR / f"{key}.meta.json",
+        )
+        if not all(p.exists() for p in files):
+            return None
+        unit_df = pl.read_parquet(files[0])
+        per_id = pl.read_parquet(files[1])
+        lbl = pl.read_parquet(files[2])
+        label_map = dict(zip(lbl["unique_id"].to_list(), lbl["label"].to_list()))
+        desc_map = dict(zip(lbl["unique_id"].to_list(), lbl["desc"].to_list()))
+        meta = json.loads(files[3].read_text(encoding="utf-8"))
+        return backend.DashboardContext(
+            unit_df=unit_df,
+            label_map=label_map,
+            desc_map=desc_map,
+            per_id=per_id,
+            all_ids=meta["all_ids"],
+            has_rolling=meta["has_rolling"],
+            has_value_cols=meta["has_value_cols"],
+        )
+    except Exception:
+        return None
+
+
+def _prune_cache(keep: int = 10) -> None:
+    """Mantiene acotado el dir de cache (descarta los keys más viejos)."""
+    try:
+        metas = sorted(
+            _CACHE_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime
+        )
+        for m in metas[:-keep]:
+            key = m.name[: -len(".meta.json")]
+            for suffix in (".meta.json", ".unit.parquet", ".per.parquet", ".labels.parquet"):
+                (_CACHE_DIR / f"{key}{suffix}").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _load_context(uploaded_file, default_path, unidad):
+    """Devuelve (ctx, source_key). Arma el contexto solo si no está cacheado
+    (en disco o en sesión) o si cambió el archivo / la unidad."""
+    ss = st.session_state
+    if uploaded_file is not None:
+        data = uploaded_file.getvalue()
+        source = ("upload", uploaded_file.name, len(data), unidad)
+    else:
+        source = ("file", str(default_path), default_path.stat().st_mtime, unidad)
+
+    if ss.get("ctx_key") != source:
+        key = _cache_key(source)
+        ctx = _load_cached(key)
+        if ctx is None:
+            with st.spinner("Preparando datos (primera vez)…"):
+                if source[0] == "upload":
+                    res_df = backend.load_forecast_bytes(
+                        uploaded_file.getvalue(), uploaded_file.name
+                    )
+                else:
+                    res_df = backend.load_forecast_parquet(default_path)
+                ctx = backend.build_dashboard_context(res_df, unidad)
+                _save_context(key, ctx)
+                _prune_cache()
+        ss["ctx"] = ctx
+        ss["ctx_key"] = source
+    return ss["ctx"], source
 
 
 uploaded = st.sidebar.file_uploader(
     "Cargar forecasts (CSV o Parquet)", type=["csv", "parquet"]
 )
+default_path = Path(settings.FORECAST_PATH)
 if uploaded is not None:
-    res_df = _load_bytes(uploaded.getvalue(), uploaded.name)
     st.sidebar.success(f"Cargado: {uploaded.name}")
+elif default_path.exists():
+    st.sidebar.success(f"Cargado: {default_path.name}")
 else:
-    default_path = Path(settings.FORECAST_PATH)
-    if default_path.exists():
-        res_df = _load_parquet(str(default_path), default_path.stat().st_mtime)
-        st.sidebar.success(f"Cargado: {default_path.name}")
-    else:
-        st.info(
-            "Sube un archivo CSV o Parquet, "
-            "o genera `data/output/forecast.parquet` con el pipeline."
-        )
-        st.stop()
+    st.info(
+        "Sube un archivo CSV o Parquet, "
+        "o genera `data/output/forecast.parquet` con el pipeline."
+    )
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Controles
@@ -80,26 +181,39 @@ freq = st.sidebar.radio(
     key="freq",
 )
 
+# Contexto pre-agregado (depende de archivo + unidad) — se cachea una sola vez.
+ctx, _source = _load_context(uploaded, default_path, unidad)
+has_rolling = ctx.has_rolling
+
 # Etiquetas según unidad (mapeo interno siempre yhat / yhat28)
 _is_valor = unidad.startswith("Valor")
 _opt_yhat = "valuehat" if _is_valor else "yhat"
 _opt_yhat28 = "valuehat28" if _is_valor else "yhat28"
-_forecast_opts = [_opt_yhat, _opt_yhat28]
-series_forecast = st.sidebar.multiselect(
-    "Series de forecast visibles",
-    options=_forecast_opts,
-    default=_forecast_opts,
-    key="series_forecast",
-    help="Al menos una serie debe permanecer visible.",
-)
-if not series_forecast:
-    series_forecast = [_opt_yhat]
-    st.sidebar.warning(f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}».")
-show_yhat = _opt_yhat in series_forecast
-show_yhat28 = _opt_yhat28 in series_forecast
 
-all_ids = sorted(res_df["unique_id"].unique().to_list())
-label_map, desc_map = backend.build_label_maps(res_df)
+# El selector de series de forecast SOLO existe si el rolling 28d fue
+# calculado (COMPUTE_ROLLING28=True en el pipeline). Si no, solo yhat.
+if has_rolling:
+    _forecast_opts = [_opt_yhat, _opt_yhat28]
+    series_forecast = st.sidebar.multiselect(
+        "Series de forecast visibles",
+        options=_forecast_opts,
+        default=_forecast_opts,
+        key="series_forecast",
+        help="Al menos una serie debe permanecer visible.",
+    )
+    if not series_forecast:
+        series_forecast = [_opt_yhat]
+        st.sidebar.warning(
+            f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}»."
+        )
+    show_yhat = _opt_yhat in series_forecast
+    show_yhat28 = _opt_yhat28 in series_forecast
+else:
+    series_forecast = [_opt_yhat]
+    show_yhat, show_yhat28 = True, False
+
+all_ids = ctx.all_ids
+label_map, desc_map = ctx.label_map, ctx.desc_map
 NOMBRES = settings.NOMBRES_NIVELES
 
 
@@ -157,36 +271,41 @@ while True:
 
 nombre_nivel_actual, candidatos = niveles_recorridos[-1]
 
-# Corte in/out = train_end de la sección (sin control en sidebar)
-_probe = backend.filter_series(
-    backend.prepare_unit_df(
-        res_df,
-        unidad,
-        "value" in res_df.columns and "valuehat" in res_df.columns,
-    ),
-    selected_id,
-)
-_hz = backend.resolve_horizons(
-    _probe, selected_id.split("||")[0], set(res_df.columns)
-)
-cutoff_date = _hz.get("train_end") or backend.ds_range(_probe)[0] or dt.date.today()
+# Corte in/out = train_end de la sección: lo resuelve backend dentro de
+# prepare_dashboard_state_from_context (sin duplicar filtros del sidebar).
+cutoff_date = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ViewModel (todos los cálculos fuera de este módulo)
+# ViewModel (solo subconjuntos sobre el contexto pre-agregado → rápido).
 # ─────────────────────────────────────────────────────────────────────────────
-view = prepare_dashboard_state(
-    res_df,
-    unidad=unidad,
-    freq=freq,
-    selected_id=selected_id,
-    cutoff_date=cutoff_date,
-    candidatos=candidatos,
-    nombre_nivel=nombre_nivel_actual,
-    label_map=label_map,
-    desc_map=desc_map,
+ss = st.session_state
+view_key = (
+    "view",
+    *_source,
+    freq,
+    selected_id,
+    tuple(candidatos or []),
+    nombre_nivel_actual,
 )
+if ss.get("view_key") != view_key:
+    ss["view"] = backend.prepare_dashboard_state_from_context(
+        ctx,
+        unidad=unidad,
+        freq=freq,
+        selected_id=selected_id,
+        cutoff_date=cutoff_date,
+        candidatos=candidatos,
+        nombre_nivel=nombre_nivel_actual,
+    )
+    ss["view_key"] = view_key
+view = ss["view"]
 
 st.subheader(f"NIVEL: **{view.label}**")
+if view.store_id:
+    store_lbl = (
+        f"{view.store_id} — {view.store_name}" if view.store_name else view.store_id
+    )
+    st.caption(f"🏬 Tienda: **{store_lbl}** · los SKUs listados pertenecen a esta tienda.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rankings
@@ -207,7 +326,10 @@ def _show_ranking(display, key: str) -> None:
         column_config={
             "Código": st.column_config.TextColumn("Código"),
             "Descripción": st.column_config.TextColumn("Descripción"),
-            "N puntos": st.column_config.NumberColumn("N puntos"),
+            "wMAPE (%)": st.column_config.TextColumn("wMAPE (%)"),
+            "Rotación": st.column_config.TextColumn("Rotación"),
+            "N puntos ≠0": st.column_config.NumberColumn("N puntos ≠0"),
+            "% ≠0": st.column_config.TextColumn("% ≠0"),
         },
     )
     if event and event.selection and event.selection.rows:
@@ -217,19 +339,25 @@ def _show_ranking(display, key: str) -> None:
         st.rerun()
 
 
-tab_wmape, tab_rot = st.tabs(["📉 Mejor wMAPE", "🔄 Mayor rotación"])
-with tab_wmape:
-    st.markdown("#### Ranking wMAPE Total")
-    st.caption(
-        f"Nivel: **{view.nombre_nivel}** · Unidad: **{view.unidad}** · "
-        f"{view.ranking_n_series} series (~5 filas visibles, scroll)."
-    )
-    _show_ranking(view.ranking_wmape, f"tabla_wmape_{view.selected_id}")
-
-with tab_rot:
-    st.markdown("#### Ranking por rotación")
-    st.caption(f"Nivel: **{view.nombre_nivel}** · Unidad: **{view.unidad}**")
-    _show_ranking(view.ranking_rotacion, f"tabla_rot_{view.selected_id}")
+st.markdown("#### Ranking wMAPE + Rotación")
+_seg = selected_id.split("||")
+_crumbs = [f"Sección {_seg[0]}"]
+_pref = _seg[0]
+for _i in range(1, len(_seg)):
+    _pref += f"||{_seg[_i]}"
+    _crumbs.append(label_map.get(_pref, _seg[_i]))
+st.caption(f"🧭 **Ruta:** " + " › ".join(_crumbs))
+st.caption(
+    f"Nivel actual: **{view.nombre_nivel}** · Unidad: **{view.unidad}** · "
+    f"Se muestran solo los **{view.ranking_n_series} hijos directos** del nivel "
+    f"seleccionado (sin series de otro nivel). ~5 filas visibles, scroll."
+)
+st.caption(
+    "🏷️ **Total de puntos (spine):** "
+    f"**{view.ranking_total_points}** · "
+    "`N puntos ≠0` = períodos con venta (y≠0) · `% ≠0` = proporción sobre el total."
+)
+_show_ranking(view.ranking_wmape, f"tabla_wmape_{view.selected_id}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Métricas
@@ -257,19 +385,20 @@ for col, title, key in (
         st.metric("BIAS", f"{m['bias']:+.2%}")
         st.caption(f"{m['n']} períodos")
 
-st.markdown("#### Métricas Rolling 28d (`yhat28`)")
-st.caption(
-    "Walk-forward por bloques de 28 días. Priors = modelo final (opción B). "
-    "WMAPE₂₈ = Σ|y−ŷ₂₈|/Σ|y| (excl. y=0)."
-)
-m28 = view.metrics_28
-c28a, c28b, c28c = st.columns(3)
-with c28a:
-    st.metric("wMAPE 28", f"{m28['wmape_28']:.2%}")
-with c28b:
-    st.metric("BIAS 28", f"{m28['bias_28']:+.2%}")
-with c28c:
-    st.metric("N períodos", f"{m28['n']}")
+if has_rolling:
+    st.markdown("#### Métricas Rolling 28d (`yhat28`)")
+    st.caption(
+        "Walk-forward por bloques de 28 días. Priors = modelo final (opción B). "
+        "WMAPE₂₈ = Σ|y−ŷ₂₈|/Σ|y| (excl. y=0)."
+    )
+    m28 = view.metrics_28
+    c28a, c28b, c28c = st.columns(3)
+    with c28a:
+        st.metric("wMAPE 28", f"{m28['wmape_28']:.2%}")
+    with c28b:
+        st.metric("BIAS 28", f"{m28['bias_28']:+.2%}")
+    with c28c:
+        st.metric("N períodos", f"{m28['n']}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gráfico (solo mapeo de series ya calculadas)
@@ -367,10 +496,32 @@ st.plotly_chart(fig, width="stretch")
 # ─────────────────────────────────────────────────────────────────────────────
 # Detalle
 # ─────────────────────────────────────────────────────────────────────────────
+_DETAIL_LABELS = {
+    "ds": "Fecha",
+    "y": "Real",
+    "yhat": "Pronóstico",
+    "yhat28": "Rolling 28d",
+    "value": "Valor real",
+    "valuehat": "Valor pron.",
+    "valuehat28": "Valor rolling",
+    "period_type": "Período",
+    "unique_id": "ID",
+    "sku_desc": "SKU",
+    "store_name": "Tienda",
+    "seccion": "Sección",
+    "abs_error": "Error abs.",
+}
+
 with st.expander("Ver datos detallados"):
-    st.caption(f"Agregación **{view.freq}** · Unidad **{view.unidad}**")
+    st.caption(
+        f"Agregación **{view.freq}** · Unidad **{view.unidad}** · "
+        f"Solo este elemento de la jerarquía: **{view.label}**"
+    )
+    detail = view.detail.rename(
+        {c: _DETAIL_LABELS[c] for c in view.detail.columns if c in _DETAIL_LABELS}
+    )
     st.dataframe(
-        view.detail,
+        detail,
         width="stretch",
         hide_index=True,
         height=_RANK_HEIGHT,

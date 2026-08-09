@@ -28,6 +28,7 @@ Rendimiento (ver README § Rendimiento para detalle y benchmarks):
   - Checkpoint por sección (`forecast_seccion_<n>_partial.parquet`) para no
     perder trabajo si el proceso se corta.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -121,6 +122,7 @@ class ForecastConfig:
     holidays: dict
     current_zone: str
     id_ejecucion: str
+    compute_rolling28: bool = False
     now_year: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -144,6 +146,7 @@ class ForecastConfig:
             holidays=settings.HOLIDAYS,
             current_zone=settings.CURRENT_ZONE,
             id_ejecucion=settings.ID_EJECUCION,
+            compute_rolling28=settings.COMPUTE_ROLLING28,
         )
 
 
@@ -328,9 +331,19 @@ class CalendarFeatureBuilder:
         feats = self._calendar_dummies(dates)
         # columnas de drivers (excluir ids de negocio)
         _exclude = {
-            "ds", "y", "unique_id", "value", "valuehat", "conteo_sku",
-            "sku_desc", "store_name", "seccion", "intercept",
-            "asp", "edp", "discount",
+            "ds",
+            "y",
+            "unique_id",
+            "value",
+            "valuehat",
+            "conteo_sku",
+            "sku_desc",
+            "store_name",
+            "seccion",
+            "intercept",
+            "asp",
+            "edp",
+            "discount",
         }
         if req_columns is None:
             req_columns = [c for c in feats.columns if c not in _exclude]
@@ -541,9 +554,7 @@ class RLSForecastRunner:
         return float(np.exp(sigma2 / 2))
 
     def _default_priors(self, n_features: int):
-        return [
-            RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
-        ] + [
+        return [RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)] + [
             RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
             for _ in range(max(0, n_features - 1))
         ]
@@ -616,7 +627,11 @@ class RLSForecastRunner:
             pricehat = np.expm1(log_pricehat)
         pricehat = np.round(pricehat, 2).ravel()
 
-        y_real = test_g["y"].to_numpy() if "y" in test_g.columns else np.zeros(len(yhat_test))
+        y_real = (
+            test_g["y"].to_numpy()
+            if "y" in test_g.columns
+            else np.zeros(len(yhat_test))
+        )
         price_real = (
             test_g["value"].to_numpy()
             if "value" in test_g.columns
@@ -752,7 +767,9 @@ class RLSForecastRunner:
                 if wm.height:
                     wm_frames.append(wm)
         wmapes_df = (
-            pl.concat(wm_frames, how="diagonal_relaxed") if wm_frames else pl.DataFrame()
+            pl.concat(wm_frames, how="diagonal_relaxed")
+            if wm_frames
+            else pl.DataFrame()
         )
         return res_df, wmapes_df
 
@@ -829,7 +846,11 @@ class RLSForecastRunner:
         y_all = g["y"].to_numpy().astype(np.float64)
         has_value = "value" in g.columns
         if has_value:
-            Xp_all = g.select(pdcols).to_numpy().astype(np.float64, order="C") if pdcols else X_all
+            Xp_all = (
+                g.select(pdcols).to_numpy().astype(np.float64, order="C")
+                if pdcols
+                else X_all
+            )
             v_all = g["value"].to_numpy().astype(np.float64)
         else:
             Xp_all = X_all
@@ -964,7 +985,11 @@ class RLSForecastRunner:
                 if uid in parts
             }
             for fut in tqdm(
-                as_completed(futures), total=len(futures), desc=desc, unit="serie", leave=False
+                as_completed(futures),
+                total=len(futures),
+                desc=desc,
+                unit="serie",
+                leave=False,
             ):
                 uid = futures[fut]
                 try:
@@ -1066,6 +1091,7 @@ class RLSForecastRunner:
 # Orquestador – split por sección
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def densify_section_panel(
     df: pl.DataFrame,
     date_start: dt.date,
@@ -1095,7 +1121,9 @@ def densify_section_panel(
     else:
         uids = pl.DataFrame({"unique_id": pl.Series([], dtype=pl.Utf8)})
     if extra_uids is not None and extra_uids.height:
-        uids = pl.concat([uids, extra_uids.select("unique_id")], how="diagonal_relaxed").unique()
+        uids = pl.concat(
+            [uids, extra_uids.select("unique_id")], how="diagonal_relaxed"
+        ).unique()
 
     if uids.height == 0:
         return df
@@ -1117,9 +1145,7 @@ def densify_section_panel(
 
     if df.height:
         data_cols = [
-            c
-            for c in df.columns
-            if c not in ("unique_id", "ds") and c not in meta_cols
+            c for c in df.columns if c not in ("unique_id", "ds") and c not in meta_cols
         ]
         join_df = df.select(["unique_id", "ds"] + data_cols)
         out = grid.join(join_df, on=["unique_id", "ds"], how="left")
@@ -1206,9 +1232,7 @@ class RLSForecastPipeline:
         if len(sku_ids) <= self._limit_series:
             return df_train
         rng = np.random.default_rng(42)
-        keep = set(
-            rng.choice(sku_ids, size=self._limit_series, replace=False).tolist()
-        )
+        keep = set(rng.choice(sku_ids, size=self._limit_series, replace=False).tolist())
         logger.warning(
             "⚠ --limit-series activo: %d SKUs de %d (solo para debug/benchmark, "
             "NO usar en producción)",
@@ -1218,7 +1242,11 @@ class RLSForecastPipeline:
         return df_train.filter((depth < 2) | pl.col("unique_id").is_in(list(keep)))
 
     def _build_calendar_frame(
-        self, unique_ids: list[str], start: dt.date, end: dt.date, template: pl.DataFrame
+        self,
+        unique_ids: list[str],
+        start: dt.date,
+        end: dt.date,
+        template: pl.DataFrame,
     ) -> pl.DataFrame:
         """Genera filas ds para [start, end] por unique_id (y=0) sin loops por celda en Polars."""
         n_days = (end - start).days + 1
@@ -1228,7 +1256,9 @@ class RLSForecastPipeline:
         dates = pl.date_range(start, end, interval="1d", eager=True)
 
         # Meta una sola pasada (unique_id → sku_desc / store_name / seccion)
-        meta_cols = [c for c in ("sku_desc", "store_name", "seccion") if c in template.columns]
+        meta_cols = [
+            c for c in ("sku_desc", "store_name", "seccion") if c in template.columns
+        ]
         if meta_cols:
             meta = (
                 template.select(["unique_id"] + meta_cols)
@@ -1318,7 +1348,9 @@ class RLSForecastPipeline:
                 pl.lit(0.0).alias("discount"),
             )
 
-        logger.info("EDP: decompose_price batched (indexors) sobre %d series…", n_series)
+        logger.info(
+            "EDP: decompose_price batched (indexors) sobre %d series…", n_series
+        )
         df_sorted = df.sort(["unique_id", "ds"])
         counts = (
             df_sorted.select("unique_id")
@@ -1444,14 +1476,16 @@ class RLSForecastPipeline:
             ]
 
         with _stage_timer(f"{seccion}: agregación+densify OOS"):
-            df_oos = self._aggregator.aggregate(raw_oos) if raw_oos.height else pl.DataFrame()
+            df_oos = (
+                self._aggregator.aggregate(raw_oos)
+                if raw_oos.height
+                else pl.DataFrame()
+            )
             if df_oos.height:
                 # Densificar OOS al spine de la sección [test_start, test_end]
                 # y alinear unique_ids con train (mismas series)
                 train_uids = df_train.select("unique_id").unique()
-                df_oos = densify_section_panel(
-                    df_oos, hz["test_start"], hz["test_end"]
-                )
+                df_oos = densify_section_panel(df_oos, hz["test_start"], hz["test_end"])
                 # asegurar todas las series de train también en OOS (ceros si no hubo venta)
                 oos_uids = df_oos.select("unique_id").unique()
                 missing = train_uids.join(oos_uids, on="unique_id", how="anti")
@@ -1459,7 +1493,10 @@ class RLSForecastPipeline:
                     spine_oos = pl.DataFrame(
                         {
                             "ds": pl.date_range(
-                                hz["test_start"], hz["test_end"], interval="1d", eager=True
+                                hz["test_start"],
+                                hz["test_end"],
+                                interval="1d",
+                                eager=True,
                             )
                         }
                     )
@@ -1477,7 +1514,12 @@ class RLSForecastPipeline:
                         meta = (
                             df_train.select(["unique_id"] + meta_cols)
                             .group_by("unique_id")
-                            .agg([pl.col(c).drop_nulls().first().alias(c) for c in meta_cols])
+                            .agg(
+                                [
+                                    pl.col(c).drop_nulls().first().alias(c)
+                                    for c in meta_cols
+                                ]
+                            )
                         )
                         extra = extra.join(meta, on="unique_id", how="left")
                     df_oos = pl.concat([df_oos, extra], how="diagonal_relaxed")
@@ -1511,7 +1553,9 @@ class RLSForecastPipeline:
                     df_fcst_raw.with_columns(pl.lit(1).alias("intercept")),
                     req_columns=driver_cols,
                 ).sort("ds")
-                logger.info("Sección %s: forecast-only shape=%s", seccion, df_fcst.shape)
+                logger.info(
+                    "Sección %s: forecast-only shape=%s", seccion, df_fcst.shape
+                )
             else:
                 df_fcst = pl.DataFrame()
 
@@ -1540,7 +1584,9 @@ class RLSForecastPipeline:
         if df_fcst.height:
             targets["forecast_only"] = df_fcst
 
-        with _stage_timer(f"{seccion}: fit+predict ({len(targets)} target(s), 1 fit/serie)"):
+        with _stage_timer(
+            f"{seccion}: fit+predict ({len(targets)} target(s), 1 fit/serie)"
+        ):
             res_df, wmapes_df = runner.fit_and_predict_multi(
                 df_train,
                 targets,
@@ -1565,22 +1611,45 @@ class RLSForecastPipeline:
         if not res_df.height:
             return pl.DataFrame(), pl.DataFrame(), driver_cols
 
-        # ── Rolling 28d sobre toda la historia (train+OOS+forecast panel) ──
-        panel_parts = [df_train]
-        if df_oos.height:
-            panel_parts.append(df_oos)
-        if df_fcst.height:
-            panel_parts.append(df_fcst)
-        panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(
-            ["unique_id", "ds"]
-        )
-        logger.info(
-            "Sección %s: rolling 28d sobre panel shape=%s…", seccion, panel.shape
-        )
-        with _stage_timer(f"{seccion}: rolling28 (O(n)/serie, threaded)"):
-            roll = runner.run_rolling_28(
-                panel, self._cfg.forecast_levels, desc=f"{seccion} rolling28"
+        with _stage_timer(f"{seccion}: rolling28 (opt-in)"):
+            res_df, wmapes_df = self._attach_rolling28(
+                runner, res_df, wmapes_df, df_train, df_oos, df_fcst
             )
+
+        return res_df, wmapes_df, driver_cols
+
+    def _attach_rolling28(
+        self,
+        runner: RLSForecastRunner,
+        res_df: pl.DataFrame,
+        wmapes_df: pl.DataFrame,
+        df_train: pl.DataFrame,
+        df_oos: pl.DataFrame,
+        df_fcst: pl.DataFrame,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """
+        Rolling 28d (yhat28 / valuehat28) sobre toda la historia
+        (train+OOS+forecast). Cuando `compute_rolling28=False` (config) hace
+        early-return y `res_df` NO gana columnas yhat28/valuehat28 (parquet
+        más liviano y dashboard sin controles rolling). No modifica yhat/valuehat.
+        """
+        if not self._cfg.compute_rolling28:
+            logger.info("rolling 28d desactivado (COMPUTE_ROLLING28=False)")
+            return res_df, wmapes_df
+
+        panel_parts = [p for p in (df_train, df_oos, df_fcst) if p.height]
+        if not panel_parts:
+            # sin panel no hay rolling; si ya había res_df, se deja sin col. rolling
+            if res_df.height:
+                res_df = res_df.with_columns(
+                    pl.lit(None).cast(pl.Float64).alias("yhat28"),
+                    pl.lit(None).cast(pl.Float64).alias("valuehat28"),
+                )
+            return res_df, wmapes_df
+
+        panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
+        logger.info("rolling 28d: panel shape=%s…", panel.shape)
+        roll = runner.run_rolling_28(panel, self._cfg.forecast_levels, desc="rolling28")
         if roll.height and res_df.height:
             # alinear tipos de ds
             if res_df["ds"].dtype != roll["ds"].dtype:
@@ -1592,8 +1661,7 @@ class RLSForecastPipeline:
             )
             wm28 = RLSForecastRunner.compute_wmape28(
                 res_df.filter(
-                    pl.col("y").is_not_null()
-                    & pl.col("yhat28").is_not_null()
+                    pl.col("y").is_not_null() & pl.col("yhat28").is_not_null()
                 )
             )
             if wm28.height:
@@ -1602,8 +1670,7 @@ class RLSForecastPipeline:
                 else:
                     wmapes_df = wm28
             logger.info(
-                "Sección %s: yhat28 unido (%d filas roll, %d series wm28)",
-                seccion,
+                "yhat28 unido (%d filas roll, %d series wm28)",
                 roll.height,
                 wm28.height if wm28.height else 0,
             )
@@ -1612,8 +1679,7 @@ class RLSForecastPipeline:
                 pl.lit(None).cast(pl.Float64).alias("yhat28"),
                 pl.lit(None).cast(pl.Float64).alias("valuehat28"),
             )
-
-        return res_df, wmapes_df, driver_cols
+        return res_df, wmapes_df
 
     def run(self) -> tuple[pl.DataFrame, pl.DataFrame]:
         stages = tqdm(
@@ -1665,15 +1731,15 @@ class RLSForecastPipeline:
         )
         _advance("resultados consolidados")
         stages.close()
-        logger.info(
-            "⏱ Pipeline RLS: TOTAL %.1fs", time.perf_counter() - pipeline_t0
-        )
+        logger.info("⏱ Pipeline RLS: TOTAL %.1fs", time.perf_counter() - pipeline_t0)
         return res_df, wmapes_df
 
     def _write_checkpoint(self, seccion: str, res: pl.DataFrame) -> None:
         try:
             self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
-            partial_path = self._cfg.out_dir / f"forecast_seccion_{seccion}_partial.parquet"
+            partial_path = (
+                self._cfg.out_dir / f"forecast_seccion_{seccion}_partial.parquet"
+            )
             res.write_parquet(
                 partial_path, compression="zstd", compression_level=3, statistics=True
             )
@@ -1708,7 +1774,10 @@ class RLSForecastPipeline:
         )
         if "period_type" in sku_level.columns:
             sku_level = sku_level.filter(pl.col("period_type") == "forecast_only")
-        elif "forecast_start" in sku_level.columns and "forecast_end" in sku_level.columns:
+        elif (
+            "forecast_start" in sku_level.columns
+            and "forecast_end" in sku_level.columns
+        ):
             sku_level = sku_level.filter(
                 (pl.col("ds").cast(pl.Date) >= pl.col("forecast_start").cast(pl.Date))
                 & (pl.col("ds").cast(pl.Date) <= pl.col("forecast_end").cast(pl.Date))
@@ -1745,9 +1814,7 @@ class RLSForecastPipeline:
                 # fallback openpyxl / xlsxwriter no disponible → csv
                 csv_path = out_path.with_suffix(".csv")
                 summary.write_csv(csv_path)
-                logger.warning(
-                    "write_excel falló; exportado CSV: %s", csv_path
-                )
+                logger.warning("write_excel falló; exportado CSV: %s", csv_path)
                 continue
             logger.info(
                 "✓ Excel sección %s (%d filas): %s",
@@ -1774,12 +1841,23 @@ def _parse_args() -> argparse.Namespace:
             "sección/tienda) para iterar rápido. NO usar en producción."
         ),
     )
+    parser.add_argument(
+        "--rolling28",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override de settings.COMPUTE_ROLLING28: --rolling28 habilita el "
+            "walk-forward yhat28/valuehat28; --no-rolling28 lo deshabilita."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     config = ForecastConfig.from_settings()
+    if args.rolling28 is not None:
+        config.compute_rolling28 = args.rolling28
     pipeline = RLSForecastPipeline(
         config, n_jobs=args.n_jobs, limit_series=args.limit_series
     )
