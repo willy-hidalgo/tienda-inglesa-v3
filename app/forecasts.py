@@ -351,9 +351,7 @@ class CalendarFeatureBuilder:
         feats = self._calendar_dummies(dates)
         # Tendencia lineal (años desde 1970-01-01) → factor "trend" de la
         # descomposición causal de la sección. Misma fórmula en train/OOS/forecast.
-        feats = feats.with_columns(
-            (pl.col("ds").dt.epoch("d") / 365.25).alias("trend")
-        )
+        feats = feats.with_columns((pl.col("ds").dt.epoch("d") / 365.25).alias("trend"))
         # columnas de drivers (excluir ids de negocio)
         _exclude = {
             "ds",
@@ -1265,6 +1263,7 @@ class RLSForecastPipeline:
             len(sku_ids),
         )
         return df_train.filter((depth < 2) | pl.col("unique_id").is_in(list(keep)))
+
     # ── Fase B: modelo a nivel sección + desagregación top-down ────────────
     @staticmethod
     def _factor_group(feature: str) -> str:
@@ -1308,9 +1307,7 @@ class RLSForecastPipeline:
             return pl.DataFrame(schema=schema)
         ref_epoch = (ref_date - dt.date(1970, 1, 1)).days
         with_weeks = train.with_columns(
-            (((pl.col("ds").cast(pl.Date).dt.epoch("d") - ref_epoch) // 7)).alias(
-                "_week"
-            )
+            ((pl.col("ds").cast(pl.Date).dt.epoch("d") - ref_epoch) // 7).alias("_week")
         )
         weekly = (
             with_weeks.filter(pl.col("y") > 0)
@@ -1358,7 +1355,9 @@ class RLSForecastPipeline:
         sp = slopes.rename({"unique_id": "parent", "slope": "slope_p"})
         return (
             parent_map.join(
-                sums.rename({"unique_id": "child", "_ty": "_cy"}), on="child", how="left"
+                sums.rename({"unique_id": "child", "_ty": "_cy"}),
+                on="child",
+                how="left",
             )
             .join(
                 sums.rename({"unique_id": "parent", "_ty": "_py"}),
@@ -1428,9 +1427,7 @@ class RLSForecastPipeline:
             ).select(keep_cols)
         ref_epoch = (train_start - dt.date(1970, 1, 1)).days
         alloc = (
-            children.join(
-                tbl, left_on="unique_id", right_on="child", how="left"
-            )
+            children.join(tbl, left_on="unique_id", right_on="child", how="left")
             .join(parent_fcst, on=["parent", "ds"], how="left")
             .join(last_prices, on="unique_id", how="left")
             .with_columns(
@@ -1661,9 +1658,7 @@ class RLSForecastPipeline:
             }
             for col, factor in FACTOR_EFFECT_COLUMNS:
                 idx = idx_by_factor[factor]
-                cols[col] = (
-                    (X[:, idx] @ coefs[idx]) if idx else np.zeros(X.shape[0])
-                )
+                cols[col] = (X[:, idx] @ coefs[idx]) if idx else np.zeros(X.shape[0])
             frames.append(pl.DataFrame(cols))
         if not frames:
             return pl.DataFrame()
@@ -1757,9 +1752,7 @@ class RLSForecastPipeline:
                 continue
             ctr_tr = sum(mean_train[i] * coefs[i] for i in idx)
             ctr_fc = (
-                sum(X_fcst[i] * coefs[i] for i in idx)
-                if X_fcst is not None
-                    else None
+                sum(X_fcst[i] * coefs[i] for i in idx) if X_fcst is not None else None
             )
             rows.append(
                 {
@@ -1781,7 +1774,6 @@ class RLSForecastPipeline:
             )
 
         return pl.DataFrame(rows)
-
 
     def _build_calendar_frame(
         self,
@@ -2223,7 +2215,9 @@ class RLSForecastPipeline:
 
         panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
         logger.info("rolling 28d: panel shape=%s…", panel.shape)
-        lvls = ["seccion"] if self._cfg.section_level_model else self._cfg.forecast_levels
+        lvls = (
+            ["seccion"] if self._cfg.section_level_model else self._cfg.forecast_levels
+        )
         roll = runner.run_rolling_28(panel, lvls, desc="rolling28")
         if roll.height and res_df.height:
             # alinear tipos de ds
