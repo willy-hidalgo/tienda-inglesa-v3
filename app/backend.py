@@ -50,6 +50,34 @@ HORIZON_COLUMNS = {
     "forecast_end",
 }
 
+# Descomposición causal de la sección: columnas `ef_*` que el pipeline
+# (SECTION_LEVEL_MODEL + DECOMPOSE_EFFECTS) escribe en las filas de la sección
+# del forecast.parquet. Deben coincidir con FACTOR_EFFECT_COLUMNS de
+# app/forecasts.py (aquí se duplican para que backend no importe rls_opt).
+FACTOR_COLS = [
+    "ef_level",
+    "ef_trend",
+    "ef_seasonality",
+    "ef_edp",
+    "ef_discount",
+    "ef_feature_display",
+    "ef_volume",
+    "ef_price",
+]
+EFFECT_COLUMNS = FACTOR_COLS + ["ef_total", "ef_resid"]
+EFFECT_LABELS = {
+    "ef_level": "Nivel",
+    "ef_trend": "Tendencia",
+    "ef_seasonality": "Estacionalidad",
+    "ef_edp": "EDP",
+    "ef_discount": "Descuento",
+    "ef_feature_display": "Feature/Display",
+    "ef_volume": "Volumen",
+    "ef_price": "Precio",
+    "ef_total": "ln(1+ŷ) total",
+    "ef_resid": "Residuo (corrección)",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Carga
@@ -112,6 +140,10 @@ def aggregate_temporal(df: pl.DataFrame, freq: str) -> pl.DataFrame:
         aggs.append(pl.col("value").sum())
     if "valuehat" in df.columns:
         aggs.append(pl.col("valuehat").sum())
+    # Efectos causales de la sección: aditivos en espacio log → se suman.
+    for c in EFFECT_COLUMNS:
+        if c in df.columns:
+            aggs.append(pl.col(c).sum())
     if "period_type" in df.columns:
         aggs.append(pl.col("period_type").max())
     for col in ("sku_desc", "store_name", "seccion", "unique_id"):
@@ -541,6 +573,11 @@ def build_chart_series(
             return df[name].to_list()
         return []
 
+    effects = {
+        c: {"hist": _col(hist, c), "fcst": _col(fcst, c)}
+        for c in EFFECT_COLUMNS
+        if c in df_view.columns
+    }
     return {
         "hist_ds": hist["ds"].to_list() if hist.height else [],
         "hist_y": hist["y"].to_list() if hist.height else [],
@@ -549,6 +586,8 @@ def build_chart_series(
         "fcst_ds": fcst["ds"].to_list() if fcst.height else [],
         "fcst_yhat": fcst["yhat"].to_list() if fcst.height else [],
         "fcst_yhat28": _col(fcst, "yhat28"),
+        "effects": effects,
+        "effect_names": list(effects.keys()),
         "cutoff": cutoff,
         "test_end": test_end,
     }
@@ -561,6 +600,13 @@ def detail_view(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("y") - pl.col("yhat")).abs().alias("abs_error")
         )
         cols = [c for c in DETAIL_COLUMNS if c in df.columns]
+    # En el nivel sección se muestran además las series de efectos causales.
+    if df.height and "unique_id" in df.columns:
+        is_section = "||" not in str(df["unique_id"][0])
+        if is_section:
+            for c in EFFECT_COLUMNS:
+                if c in df.columns and c not in cols:
+                    cols.append(c)
     return df.select(cols)
 
 
@@ -608,6 +654,22 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
         .alias(c)
         for c in num_cols
     ]
+    eff_cols = [c for c in EFFECT_COLUMNS if c in df.columns]
+
+    def _fmt_eff(v: float | None) -> str:
+        if v is None:
+            return ""
+        try:
+            if v != v:  # NaN
+                return ""
+            return f"{float(v):+.4f}"
+        except (TypeError, ValueError):
+            return ""
+
+    exprs += [
+        pl.col(c).map_elements(_fmt_eff, return_dtype=pl.Utf8).alias(c)
+        for c in eff_cols
+    ]
     return df.with_columns(exprs)
 
 
@@ -644,6 +706,7 @@ class DashboardContext:
     all_ids: list[str]
     has_rolling: bool
     has_value_cols: bool
+    has_effects: bool = False
 
 
 @dataclass
@@ -669,6 +732,7 @@ class DashboardView:
     nombre_nivel: str
     has_value_cols: bool
     has_rolling: bool
+    has_effects: bool = False
     store_id: str | None = None
     store_name: str | None = None
 
@@ -686,6 +750,7 @@ def build_dashboard_context(df: pl.DataFrame, unidad: str) -> DashboardContext:
     """
     has_value = has_value_columns(df)
     has_rolling = "yhat28" in df.columns or "valuehat28" in df.columns
+    has_effects = any(c in df.columns for c in EFFECT_COLUMNS)
     unit_df = prepare_unit_df(df, unidad, has_value)
     label_map, desc_map = build_label_maps(df)
     per_id = aggregate_wmape_by_id(unit_df)
@@ -698,6 +763,7 @@ def build_dashboard_context(df: pl.DataFrame, unidad: str) -> DashboardContext:
         all_ids=all_ids,
         has_rolling=has_rolling,
         has_value_cols=has_value,
+        has_effects=has_effects,
     )
 
 
@@ -805,6 +871,7 @@ def prepare_dashboard_state_from_context(
         nombre_nivel=nombre_nivel,
         has_value_cols=ctx.has_value_cols,
         has_rolling=ctx.has_rolling,
+        has_effects=ctx.has_effects,
         store_id=store_id,
         store_name=store_name,
     )

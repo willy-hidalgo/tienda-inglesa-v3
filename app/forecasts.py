@@ -2,6 +2,8 @@
 Pipeline de forecasting jerárquico con Regresión RLS
 =====================================================
 Niveles: sección (1 / 23) → SKU → local (tienda).
+Modo por defecto (SECTION_LEVEL_MODEL=True): modelo RLS SOLO a nivel
+sección + descomposición causal + desagregación top-down por nivel/trend.
 
 Ventanas por sección (SECCIONES):
   - train: [train_start, train_end]  train_end = test_start original
@@ -90,6 +92,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Columnas ef_* (descomposición causal de la sección) añadidas a las filas de
+# la sección en forecast.parquet para que el dashboard las dibuje/tabule.
+# Deben coincidir con EFFECT_COLUMNS de app/backend.py.
+FACTOR_EFFECT_COLUMNS: list[tuple[str, str]] = [
+    ("ef_level", "level"),
+    ("ef_trend", "trend"),
+    ("ef_seasonality", "seasonality"),
+    ("ef_edp", "edp"),
+    ("ef_discount", "discount"),
+    ("ef_feature_display", "feature_display"),
+    ("ef_volume", "volume"),
+    ("ef_price", "price"),
+]
+
 
 @contextmanager
 def _stage_timer(label: str):
@@ -123,6 +139,8 @@ class ForecastConfig:
     current_zone: str
     id_ejecucion: str
     compute_rolling28: bool = False
+    section_level_model: bool = False
+    decompose_effects: bool = False
     now_year: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -147,6 +165,8 @@ class ForecastConfig:
             current_zone=settings.CURRENT_ZONE,
             id_ejecucion=settings.ID_EJECUCION,
             compute_rolling28=settings.COMPUTE_ROLLING28,
+            section_level_model=getattr(settings, "SECTION_LEVEL_MODEL", False),
+            decompose_effects=getattr(settings, "DECOMPOSE_EFFECTS", False),
         )
 
 
@@ -329,6 +349,11 @@ class CalendarFeatureBuilder:
             return df
         dates = df.select("ds").unique().sort("ds")
         feats = self._calendar_dummies(dates)
+        # Tendencia lineal (años desde 1970-01-01) → factor "trend" de la
+        # descomposición causal de la sección. Misma fórmula en train/OOS/forecast.
+        feats = feats.with_columns(
+            (pl.col("ds").dt.epoch("d") / 365.25).alias("trend")
+        )
         # columnas de drivers (excluir ids de negocio)
         _exclude = {
             "ds",
@@ -336,7 +361,6 @@ class CalendarFeatureBuilder:
             "unique_id",
             "value",
             "valuehat",
-            "conteo_sku",
             "sku_desc",
             "store_name",
             "seccion",
@@ -1188,6 +1212,7 @@ class RLSForecastPipeline:
         self._limit_series = limit_series
         self._calendar: HolidayCalendar | None = None
         self._feature_builder: CalendarFeatureBuilder | None = None
+        self._decomposition_frames: list[pl.DataFrame] = []
         self._aggregator = DataAggregator(
             config.date_column,
             config.quantity_column,
@@ -1240,6 +1265,523 @@ class RLSForecastPipeline:
             len(sku_ids),
         )
         return df_train.filter((depth < 2) | pl.col("unique_id").is_in(list(keep)))
+    # ── Fase B: modelo a nivel sección + desagregación top-down ────────────
+    @staticmethod
+    def _factor_group(feature: str) -> str:
+        """Factor causal de la descomposición de la sección para un feature."""
+        if feature == "intercept":
+            return "level"
+        if feature == "trend":
+            return "trend"
+        if feature.startswith("weekday_") or feature.startswith("month_"):
+            return "seasonality"
+        if feature == "edp":
+            return "edp"
+        if feature == "discount":
+            return "discount"
+        if feature == "conteo_sku":
+            return "volume"
+        if feature == "asp":
+            return "price"
+        return "feature_display"
+
+    @staticmethod
+    def _parent_map(train: pl.DataFrame) -> pl.DataFrame:
+        """Mapa hijo → padre (sección→tienda→SKU) deducido del unique_id."""
+        schema = {"child": pl.Utf8, "parent": pl.Utf8}
+        if train.height == 0:
+            return pl.DataFrame(schema=schema)
+        rows: list[dict] = []
+        for uid in train["unique_id"].unique().to_list():
+            parts = uid.split("||")
+            if len(parts) == 2:
+                rows.append({"child": uid, "parent": parts[0]})
+            elif len(parts) == 3:
+                rows.append({"child": uid, "parent": f"{parts[0]}||{parts[1]}"})
+        return pl.DataFrame(rows) if rows else pl.DataFrame(schema=schema)
+
+    @staticmethod
+    def _week_slopes(train: pl.DataFrame, ref_date: dt.date) -> pl.DataFrame:
+        """Pendiente log-lineal semanal (años) absoluta por serie."""
+        schema = {"unique_id": pl.Utf8, "slope": pl.Float64}
+        if train.height == 0:
+            return pl.DataFrame(schema=schema)
+        ref_epoch = (ref_date - dt.date(1970, 1, 1)).days
+        with_weeks = train.with_columns(
+            (((pl.col("ds").cast(pl.Date).dt.epoch("d") - ref_epoch) // 7)).alias(
+                "_week"
+            )
+        )
+        weekly = (
+            with_weeks.filter(pl.col("y") > 0)
+            .group_by(["unique_id", "_week"])
+            .agg(pl.col("y").sum().alias("_wy"))
+            .with_columns(((pl.col("_week") * 7) / 365.25).alias("_t"))
+        )
+        rows: list[dict] = []
+        for gdf in weekly.partition_by("unique_id", maintain_order=True):
+            gdf = gdf.sort("_t")
+            uid = gdf["unique_id"][0]
+            if gdf.height < 3:
+                rows.append({"unique_id": uid, "slope": 0.0})
+                continue
+            x = gdf["_t"].to_numpy().astype(np.float64)
+            yv = np.log1p(gdf["_wy"].to_numpy().astype(np.float64))
+            slope = float(np.polyfit(x, yv, 1)[0])
+            rows.append(
+                {"unique_id": uid, "slope": slope if np.isfinite(slope) else 0.0}
+            )
+        return pl.DataFrame(rows) if rows else pl.DataFrame(schema=schema)
+
+    @staticmethod
+    def _level_trend_table(
+        train: pl.DataFrame, parent_map: pl.DataFrame, ref_date: dt.date
+    ) -> pl.DataFrame:
+        """Tabla nivel/tendencia por hijo: (child, parent, share, slope_c, slope_p).
+
+        share      = Σy_hijo / Σy_padre (nivel dentro del padre)
+        slope_c/p  = pendientes log-lineales semanales del hijo y su padre
+        trend_diff = slope_c − slope_p → exp(trend_diff·años) en la asignación
+        """
+        schema = {
+            "child": pl.Utf8,
+            "parent": pl.Utf8,
+            "share": pl.Float64,
+            "slope_c": pl.Float64,
+            "slope_p": pl.Float64,
+        }
+        if train.height == 0 or parent_map.height == 0:
+            return pl.DataFrame(schema=schema)
+        sums = train.group_by("unique_id").agg(pl.col("y").sum().alias("_ty"))
+        slopes = RLSForecastPipeline._week_slopes(train, ref_date)
+        sc = slopes.rename({"unique_id": "child", "slope": "slope_c"})
+        sp = slopes.rename({"unique_id": "parent", "slope": "slope_p"})
+        return (
+            parent_map.join(
+                sums.rename({"unique_id": "child", "_ty": "_cy"}), on="child", how="left"
+            )
+            .join(
+                sums.rename({"unique_id": "parent", "_ty": "_py"}),
+                on="parent",
+                how="left",
+            )
+            .join(sc, on="child", how="left")
+            .join(sp, on="parent", how="left")
+            .with_columns(
+                (pl.col("_cy") / pl.col("_py").clip(lower_bound=1e-12)).alias("share")
+            )
+            .with_columns(
+                pl.col("slope_c").fill_null(0.0),
+                pl.col("slope_p").fill_null(0.0),
+            )
+            .select(["child", "parent", "share", "slope_c", "slope_p"])
+        )
+
+    @staticmethod
+    def _last_prices(train: pl.DataFrame) -> pl.DataFrame:
+        """Último precio observado (>0) por serie → valuehat de los hijos."""
+        schema = {"unique_id": pl.Utf8, "_last_price": pl.Float64}
+        if train.height == 0:
+            return pl.DataFrame(schema=schema)
+        return (
+            train.sort(["unique_id", "ds"])
+            .filter(pl.col("value") > 0)
+            .group_by("unique_id")
+            .agg(pl.col("value").last().alias("_last_price"))
+        )
+
+    @staticmethod
+    def _allocate_level(
+        children: pl.DataFrame,
+        parent_fcst: pl.DataFrame,
+        tbl: pl.DataFrame,
+        last_prices: pl.DataFrame,
+        train_start: dt.date,
+        period_type: str,
+    ) -> pl.DataFrame:
+        """Reparte el pronóstico del padre entre sus hijos (un nivel).
+
+        yhat_hijo(t) = yhat_padre(t) · share_hijo · exp((slope_c − slope_p)·t)
+        normalizado por (padre, día) → Σ hijos = padre. En cascada
+        (sección→tienda→SKU) produce un top-down jerárquico coherente.
+        """
+        keep_cols = [
+            c
+            for c in (
+                "unique_id",
+                "ds",
+                "y",
+                "value",
+                "valuehat",
+                "yhat",
+                "conteo_sku",
+                "sku_desc",
+                "store_name",
+                "seccion",
+            )
+            if c in children.columns or c in ("yhat", "valuehat")
+        ]
+        if children.height == 0 or parent_fcst.height == 0:
+            return children.with_columns(
+                pl.lit(None).cast(pl.Float64).alias("yhat"),
+                pl.lit(None).cast(pl.Float64).alias("valuehat"),
+            ).select(keep_cols)
+        ref_epoch = (train_start - dt.date(1970, 1, 1)).days
+        alloc = (
+            children.join(
+                tbl, left_on="unique_id", right_on="child", how="left"
+            )
+            .join(parent_fcst, on=["parent", "ds"], how="left")
+            .join(last_prices, on="unique_id", how="left")
+            .with_columns(
+                _share=pl.col("share").fill_null(0.0),
+                _td=(pl.col("slope_c") - pl.col("slope_p"))
+                .clip(lower_bound=-0.5, upper_bound=0.5)
+                .fill_null(0.0),
+                _lp=pl.col("_last_price").fill_null(0.0),
+                _yr=((pl.col("ds").cast(pl.Date).dt.epoch("d") - ref_epoch) / 365.25),
+            )
+            .with_columns(
+                _raw=(pl.col("_share") * (pl.col("_td") * pl.col("_yr")).exp())
+            )
+            .with_columns(_den=pl.col("_raw").sum().over(["parent", "ds"]))
+            .with_columns(
+                yhat=(
+                    pl.col("_yhat_parent")
+                    * pl.col("_raw")
+                    / pl.col("_den").clip(lower_bound=1e-12)
+                ).cast(pl.Float64),
+                valuehat=pl.when(pl.lit(period_type) == "in_sample")
+                .then(pl.col("value"))
+                .otherwise(pl.col("_lp").round(2)),
+            )
+            .filter(pl.col("_yhat_parent").is_not_null())
+            .select(keep_cols)
+        )
+        return alloc
+
+    def _run_section_level(
+        self,
+        seccion: str,
+        df_train: pl.DataFrame,
+        df_oos: pl.DataFrame,
+        df_fcst: pl.DataFrame,
+        driver_cols: list[str],
+        meta: dict,
+        hz: dict,
+        runner: RLSForecastRunner,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """Modelo RLS SOLO a nivel sección + desagregación nivel/tendencia.
+
+        - 1 solo fit por sección (model_y + model_p) sobre la serie agregada.
+        - Tienda/SKU: se aplica el modelo de sección repartiendo yhat_sección
+          con `share_level` (proporción de ventas) y `trend_diff` (crecimiento
+          relativo) → top-down coherente por construcción.
+        - Descompone los efectos causales de la sección (level/trend/
+          seasonality/edp/discount/feature_display/volume/price).
+        """
+        sec_train = df_train.filter(pl.col("unique_id") == seccion)
+        if sec_train.height == 0:
+            return pl.DataFrame(), pl.DataFrame()
+
+        model_y, model_p = runner._fit_models(sec_train)
+
+        targets: dict[str, pl.DataFrame] = {"in_sample": df_train}
+        if df_oos.height:
+            targets["out_sample"] = df_oos
+        if df_fcst.height:
+            targets["forecast_only"] = df_fcst
+
+        sec_frames: list[pl.DataFrame] = []
+        for name, frame in targets.items():
+            sec_g = frame.filter(pl.col("unique_id") == seccion)
+            if sec_g.height == 0:
+                continue
+            fr = runner._predict_with_models(
+                seccion, model_y, model_p, sec_train, sec_g, meta
+            )
+            if fr is not None and fr.height:
+                sec_frames.append(fr.with_columns(pl.lit(name).alias("period_type")))
+        if not sec_frames:
+            return pl.DataFrame(), pl.DataFrame()
+        sec_res = pl.concat(sec_frames, how="diagonal_relaxed")
+
+        # Nivel y tendencia que corresponde a cada serie (se calculan 1 vez).
+        # Top-down jerárquico en cascada: sección → tienda → SKU con
+        # coherencia aditiva exacta (Σ tiendas = sección; Σ SKUs/tienda =
+        # tienda) usando shares dentro del padre y difs de tendencia.
+        parent_map = self._parent_map(df_train)
+        tbl = self._level_trend_table(df_train, parent_map, hz["train_start"])
+        last_prices = self._last_prices(df_train)
+
+        depth_expr = pl.col("unique_id").str.count_matches(r"\|\|", literal=False)
+        child_frames: list[pl.DataFrame] = []
+        for name, frame in targets.items():
+            # El pronóstico del nivel padre arranca con la sección (modelo fit).
+            parents = sec_res.filter(pl.col("period_type") == name).select(
+                pl.col("unique_id").alias("parent"),
+                "ds",
+                pl.col("yhat").alias("_yhat_parent"),
+            )
+            for depth in (1, 2):
+                child_g = frame.filter(
+                    (depth_expr == depth) & pl.col("y").is_not_null()
+                )
+                if child_g.height == 0:
+                    continue
+                alloc = self._allocate_level(
+                    child_g,
+                    parents,
+                    tbl,
+                    last_prices,
+                    hz["train_start"],
+                    name,
+                )
+                if alloc.height:
+                    child_frames.append(
+                        alloc.with_columns(pl.lit(name).alias("period_type"))
+                    )
+                    # Nivel siguiente: el padre es este nivel ya repartido.
+                    parents = alloc.select(
+                        pl.col("unique_id").alias("parent"),
+                        "ds",
+                        pl.col("yhat").alias("_yhat_parent"),
+                    )
+
+        parts: list[pl.DataFrame] = [sec_res]
+        if child_frames:
+            parts.extend(child_frames)
+        res_df = pl.concat(parts, how="diagonal_relaxed")
+
+        # forecast-only: sin actuals → y/value en 0 (línea punteada aguas abajo)
+        res_df = res_df.with_columns(
+            pl.when(pl.col("period_type") == "forecast_only")
+            .then(0.0)
+            .otherwise(pl.col("y"))
+            .alias("y"),
+            pl.when(pl.col("period_type") == "forecast_only")
+            .then(0.0)
+            .otherwise(pl.col("value"))
+            .alias("value"),
+        )
+
+        # wMAPE/BIAS por serie (in_sample + out_sample, excluye forecast_only).
+        wm_frames: list[pl.DataFrame] = []
+        for name in targets:
+            sub = res_df.filter(pl.col("period_type") == name)
+            if sub.height:
+                wm = RLSForecastRunner._compute_wmape(sub)
+                if wm.height:
+                    wm_frames.append(wm)
+        wmapes_df = (
+            pl.concat(wm_frames, how="diagonal_relaxed")
+            if wm_frames
+            else pl.DataFrame()
+        )
+
+        # Descomposición causal de la sección.
+        if getattr(self._cfg, "decompose_effects", False):
+            # (a) agregada → decomposition.parquet (coeficientes β·X prom. train/fcst)
+            dec = self._decompose_section(
+                seccion, model_y, df_train, df_fcst, driver_cols
+            )
+            if dec is not None and dec.height:
+                self._decomposition_frames.append(dec)
+            # (b) por-día → columnas ef_* en las filas de la sección (gráfico/detalle)
+            effect_panel = self._build_effect_panel(
+                seccion, model_y, driver_cols, targets
+            )
+            if effect_panel.height:
+                res_df = res_df.join(
+                    effect_panel,
+                    on=["unique_id", "ds", "period_type"],
+                    how="left",
+                )
+                factor_cols = [c for c, _ in FACTOR_EFFECT_COLUMNS]
+                has_ef = pl.col("ef_level").is_not_null()
+                res_df = (
+                    res_df.with_columns(
+                        pl.sum_horizontal([pl.col(c) for c in factor_cols]).alias(
+                            "_ef_sum"
+                        ),
+                        ((pl.col("yhat") + 1.0).log()).alias("_ef_total"),
+                    )
+                    .with_columns(
+                        pl.when(has_ef).then(pl.col("_ef_total")).alias("ef_total"),
+                        pl.when(has_ef)
+                        .then(pl.col("_ef_total") - pl.col("_ef_sum"))
+                        .alias("ef_resid"),
+                    )
+                    .drop(["_ef_sum", "_ef_total"])
+                )
+
+        return res_df, wmapes_df
+
+    def _build_effect_panel(
+        self,
+        seccion: str,
+        model_y,
+        driver_cols: list[str],
+        frames_by_period: dict[str, pl.DataFrame],
+    ) -> pl.DataFrame:
+        """Panel diario de efectos causales para la serie de la sección.
+
+        Cada fila = (unique_id, ds, period_type, ef_level, …, ef_price) con la
+        contribución diaria β·X por factor. La suma de los 8 factores es el
+        valor predicho en espacio log-log (log1p(yhat)); `ef_total`/`ef_resid`
+        se derivan en `_run_section_level` sobre el yhat real del parquet.
+        """
+        try:
+            coefs = np.asarray(model_y.final_coef_[0], dtype=np.float64).ravel()
+        except Exception:
+            return pl.DataFrame()
+        if coefs.shape[0] != len(driver_cols):
+            return pl.DataFrame()
+
+        factor_of = [self._factor_group(c) for c in driver_cols]
+        idx_by_factor = {
+            factor: [i for i, f in enumerate(factor_of) if f == factor]
+            for factor in dict(FACTOR_EFFECT_COLUMNS).values()
+        }
+        frames: list[pl.DataFrame] = []
+        for name, frame in frames_by_period.items():
+            sec = frame.filter(pl.col("unique_id") == seccion).sort("ds")
+            if sec.height == 0:
+                continue
+            X = np.nan_to_num(
+                sec.select(driver_cols).to_numpy().astype(np.float64, order="C"),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            cols: dict[str, object] = {
+                "unique_id": [seccion] * sec.height,
+                "ds": sec["ds"].cast(pl.Date).to_list(),
+                "period_type": [name] * sec.height,
+            }
+            for col, factor in FACTOR_EFFECT_COLUMNS:
+                idx = idx_by_factor[factor]
+                cols[col] = (
+                    (X[:, idx] @ coefs[idx]) if idx else np.zeros(X.shape[0])
+                )
+            frames.append(pl.DataFrame(cols))
+        if not frames:
+            return pl.DataFrame()
+        return pl.concat(frames, how="diagonal_relaxed")
+
+    def _decompose_section(
+        self,
+        seccion: str,
+        model_y,
+        df_train: pl.DataFrame,
+        df_fcst: pl.DataFrame,
+        driver_cols: list[str],
+    ) -> pl.DataFrame | None:
+        """Descompone la demanda de la sección en efectos causales (β·X)."""
+        try:
+            coefs = np.asarray(model_y.final_coef_[0], dtype=np.float64).ravel()
+        except Exception:
+            return None
+        if coefs.shape[0] != len(driver_cols):
+            return None
+
+        sec_train = df_train.filter(pl.col("unique_id") == seccion).sort("ds")
+        if sec_train.height == 0:
+            return None
+        X_train = np.nan_to_num(
+            sec_train.select(driver_cols).to_numpy().astype(np.float64, order="C"),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        mean_train = X_train.mean(axis=0)
+        total_train = float(mean_train @ coefs)
+
+        X_fcst = None
+        total_fcst = None
+        if df_fcst is not None and df_fcst.height:
+            sec_fcst = df_fcst.filter(pl.col("unique_id") == seccion).sort("ds")
+            if sec_fcst.height:
+                _X = np.nan_to_num(
+                    sec_fcst.select(driver_cols)
+                    .to_numpy()
+                    .astype(np.float64, order="C"),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                X_fcst = _X.mean(axis=0)
+                total_fcst = float(X_fcst @ coefs)
+
+        rows: list[dict] = []
+        for i, feat in enumerate(driver_cols):
+            factor = self._factor_group(feat)
+            ctr_tr = float(mean_train[i] * coefs[i])
+            ctr_fc = float(X_fcst[i] * coefs[i]) if X_fcst is not None else None
+            rows.append(
+                {
+                    "unique_id": seccion,
+                    "factor": factor,
+                    "feature": feat,
+                    "coef": float(coefs[i]),
+                    "contrib_mean_train": ctr_tr,
+                    "contrib_mean_fcst": ctr_fc,
+                    "pct_train": (ctr_tr / total_train)
+                    if abs(total_train) > 1e-12
+                    else None,
+                    "pct_fcst": (ctr_fc / total_fcst)
+                    if X_fcst is not None
+                    and total_fcst is not None
+                    and abs(total_fcst) > 1e-12
+                    else None,
+                }
+            )
+
+        # Resumen por factor causal (sumas de contribuciones).
+        for factor in (
+            "level",
+            "trend",
+            "seasonality",
+            "edp",
+            "discount",
+            "feature_display",
+            "volume",
+            "price",
+        ):
+            idx = [
+                i
+                for i, f in enumerate(map(self._factor_group, driver_cols))
+                if f == factor
+            ]
+            if not idx:
+                continue
+            ctr_tr = sum(mean_train[i] * coefs[i] for i in idx)
+            ctr_fc = (
+                sum(X_fcst[i] * coefs[i] for i in idx)
+                if X_fcst is not None
+                    else None
+            )
+            rows.append(
+                {
+                    "unique_id": seccion,
+                    "factor": factor,
+                    "feature": f"Σ {factor}",
+                    "coef": None,
+                    "contrib_mean_train": float(ctr_tr),
+                    "contrib_mean_fcst": float(ctr_fc) if ctr_fc is not None else None,
+                    "pct_train": (ctr_tr / total_train)
+                    if abs(total_train) > 1e-12
+                    else None,
+                    "pct_fcst": (ctr_fc / total_fcst)
+                    if ctr_fc is not None
+                    and total_fcst is not None
+                    and abs(total_fcst) > 1e-12
+                    else None,
+                }
+            )
+
+        return pl.DataFrame(rows)
+
 
     def _build_calendar_frame(
         self,
@@ -1271,13 +1813,32 @@ class RLSForecastPipeline:
         # Cross join fechas × series (vectorizado)
         ids_df = pl.DataFrame({"unique_id": unique_ids})
         grid = ids_df.join(pl.DataFrame({"ds": dates}), how="cross")
-        grid = grid.join(meta, on="unique_id", how="left").with_columns(
+        grid = grid.join(meta, on="unique_id", how="left")
+        # Variables exógenas hacia la zona forecast (no hay actuals): se
+        # extrapolan con el ÚLTIMO valor observado por serie. Sin esto, el
+        # fill-0 de extract_drivers anularía la contribución de edp/asp/
+        # discount/conteo_sku (volumen) en la zona de solo-forecast.
+        for _col in ("conteo_sku", "edp", "asp", "discount"):
+            if _col not in template.columns:
+                continue
+            last_v = (
+                template.sort(["unique_id", "ds"])
+                .filter(pl.col(_col).is_not_null() & (pl.col(_col) != 0.0))
+                .group_by("unique_id")
+                .agg(pl.col(_col).last().alias(_col))
+            )
+            if last_v.height:
+                grid = grid.join(last_v, on="unique_id", how="left")
+            if _col not in grid.columns:
+                grid = grid.with_columns(pl.lit(0.0).alias(_col))
+        grid = grid.with_columns(
             pl.lit(0.0).alias("y"),
             pl.lit(0.0).alias("value"),
             pl.lit(1).alias("intercept"),
-            pl.lit(0).alias("conteo_sku"),
         )
-        return grid
+        return grid.with_columns(
+            [pl.col(_c).fill_null(0) for _c in grid.columns if _c != "ds"]
+        )
 
     @staticmethod
     def _calculate_edp_per_series(df: pl.DataFrame) -> pl.DataFrame:
@@ -1468,7 +2029,6 @@ class RLSForecastPipeline:
                     "value",
                     "valuehat",
                     "unique_id",
-                    "conteo_sku",
                     "sku_desc",
                     "store_name",
                     "seccion",
@@ -1577,23 +2137,37 @@ class RLSForecastPipeline:
             "forecast_end": hz["forecast_end"],
         }
 
-        # ── Fase 1: 1 solo fit por serie, predicción sobre los 3 targets ────
+        # ── Fase 1: fit UNA vez por serie, predicción sobre los 3 targets ──
         targets: dict[str, pl.DataFrame] = {"in_sample": df_train}
         if df_oos.height:
             targets["out_sample"] = df_oos
         if df_fcst.height:
             targets["forecast_only"] = df_fcst
 
-        with _stage_timer(
-            f"{seccion}: fit+predict ({len(targets)} target(s), 1 fit/serie)"
-        ):
-            res_df, wmapes_df = runner.fit_and_predict_multi(
-                df_train,
-                targets,
-                self._cfg.forecast_levels,
-                desc=f"{seccion} fit+predict",
-                meta=meta,
-            )
+        if self._cfg.section_level_model:
+            # Fase B: modelo SOLO a nivel sección + desagregación top-down.
+            with _stage_timer(f"{seccion}: fit sección + desagregación nivel/trend"):
+                res_df, wmapes_df = self._run_section_level(
+                    seccion,
+                    df_train,
+                    df_oos,
+                    df_fcst,
+                    driver_cols,
+                    meta,
+                    hz,
+                    runner,
+                )
+        else:
+            with _stage_timer(
+                f"{seccion}: fit+predict ({len(targets)} target(s), 1 fit/serie)"
+            ):
+                res_df, wmapes_df = runner.fit_and_predict_multi(
+                    df_train,
+                    targets,
+                    self._cfg.forecast_levels,
+                    desc=f"{seccion} fit+predict",
+                    meta=meta,
+                )
 
         if res_df.height:
             # forecast-only: sin actuals → y/value en 0 (línea punteada aguas abajo)
@@ -1649,7 +2223,8 @@ class RLSForecastPipeline:
 
         panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
         logger.info("rolling 28d: panel shape=%s…", panel.shape)
-        roll = runner.run_rolling_28(panel, self._cfg.forecast_levels, desc="rolling28")
+        lvls = ["seccion"] if self._cfg.section_level_model else self._cfg.forecast_levels
+        roll = runner.run_rolling_28(panel, lvls, desc="rolling28")
         if roll.height and res_df.height:
             # alinear tipos de ds
             if res_df["ds"].dtype != roll["ds"].dtype:
@@ -1759,6 +2334,17 @@ class RLSForecastPipeline:
             wmape_path, compression="zstd", compression_level=3, statistics=True
         )
         logger.info("✓ WMAPE guardado en: %s", wmape_path)
+        if getattr(self, "_decomposition_frames", None):
+            dec_df = pl.concat(self._decomposition_frames, how="diagonal_relaxed")
+            if dec_df.height:
+                dec_path = self._cfg.out_dir / "decomposition.parquet"
+                dec_df.write_parquet(
+                    dec_path,
+                    compression="zstd",
+                    compression_level=3,
+                    statistics=True,
+                )
+                logger.info("✓ Descomposición causal guardada en: %s", dec_path)
         self._export_forecast_excel(res_df)
 
     def _export_forecast_excel(self, res_df: pl.DataFrame) -> None:

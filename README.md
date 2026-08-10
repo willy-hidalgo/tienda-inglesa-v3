@@ -47,6 +47,82 @@ Jerarquía: **sección → tienda → SKU**.
 
 Ranking: columnas **Código | Descripción | métrica | N puntos** (paginado de 5).
 
+## Modelo a nivel sección (descomposición causal + top-down)
+
+> **Modo por defecto:** `settings.SECTION_LEVEL_MODEL = True`. El modelo RLS se
+> ajusta **una sola vez por sección** (series `"1"` y `"23"`) y los pronósticos
+> de tienda y SKU se obtienen **aplicando ese modelo** con una desagregación
+> jerárquica *top-down*. Con `SECTION_LEVEL_MODEL = False` el pipeline vuelve al
+> modo anterior (1 fit RLS por cada serie individual de sección/tienda/SKU).
+>
+> **Rendimiento:** de miles de fits RLS por ejecución → **2 fits por sección**
+> (1 fit `model_y` + 1 fit `model_p`), es decir 4 fits totales.
+
+### Descomposición causal de la sección
+
+Con `settings.DECOMPOSE_EFFECTS = True` (default) se emite
+`data/output/decomposition.parquet`: la demanda `log1p(y)` de la sección se
+descompone como suma de contribuciones β·X por factor causal:
+
+| Factor            | Features                                        |
+| ----------------- | ----------------------------------------------- |
+| `level`           | `intercept`                                      |
+| `trend`           | `trend` (lineal, en años)                        |
+| `seasonality`     | `weekday_*`, `month_*`                           |
+| `edp`             | `edp`                                            |
+| `discount`        | `discount`                                       |
+| `feature_display` | festivos/promo (p. ej. `navidad_0`, ramps)       |
+| `volume`          | `conteo_sku` (variedad/volumen de la sección)    |
+| `price`           | `asp` (precio medio)                             |
+
+Cada fila tiene el coeficiente y la contribución media en **train** y en la
+ventana **solo forecast** (además del % sobre el total).
+
+#### Series temporales de efectos por día (`ef_*`)
+
+Además del parquet agregado (`decomposition.parquet`), las filas de **la
+sección** en `forecast.parquet` llevan las contribuciones diarias β·X de cada
+factor en espacio `ln(1+ŷ)` (demanda original transformada), con las columnas
+siguientes (las filas hijas — tienda/SKU — dejan estas columnas nulas, pues la
+descomposición se calcula a nivel sección):
+
+| Columna                 | Factor                  |
+| ----------------------- | ----------------------- |
+| `ef_level`              | level (intercept)       |
+| `ef_trend`              | trend                   |
+| `ef_seasonality`        | seasonality             |
+| `ef_edp`                | edp                     |
+| `ef_discount`           | discount                |
+| `ef_feature_display`    | feature_display         |
+| `ef_volume`             | volume                  |
+| `ef_price`              | price                   |
+| `ef_total`              | ln(1+ŷ) total           |
+| `ef_resid`              | residuo (corrección)    |
+
+`ef_total = Σ ef_*` y `ef_resid = ef_total − Σ ef_*`; juntos coinciden con el
+`ln(1+ŷ)` predicho a nivel sección (el residuo pequeño corrige el redondeo a
+entero de `yhat`).
+
+### Nivel y tendencia que corresponde a cada serie
+
+Para cada tienda y SKU se calcula **una sola vez** (sobre el train):
+
+- **share** = Σy_hijo / Σy_padre (nivel dentro de su padre)
+- **pendiente** log-lineal semanal (en años) por serie
+
+El pronóstico del padre se reparte a sus hijos aplicando el modelo de sección:
+
+```
+yhat_hijo(t) = yhat_padre(t) · share_hijo · exp((slope_hijo − slope_padre)·t)
+```
+
+normalizado por (padre, día) → **coherencia aditiva exacta**: Σ tiendas =
+sección, y Σ SKUs de cada tienda = tienda (*top-down* en cascada
+sección → tienda → SKU). El `valuehat` de los hijos se fija al último precio
+observado (>0) en train. El rolling 28d en esta modalidad se calcula **solo a
+nivel sección** (las columnas `yhat28`/`valuehat28` de tiendas/SKUs quedan
+nulas).
+
 ## Ventanas por sección (`SECCIONES`)
 
 Cada sección tiene su propio `test_start`, `test_end` y lista de locales.
@@ -80,6 +156,12 @@ Ejemplo sección 1: `test_start=2026-03-29`, `test_end=2026-04-26`.
   § Rolling 28d). Si no, el dashboard muestra solo `yhat`.
 - El gráfico muestra **todos** los períodos, incluidos los de `y=0` (los ceros
   solo se excluyen de las métricas); línea punteada en zona solo-forecast.
+- A nivel **sección**, un selector lateral
+  "Descomposición de efectos (sección)" dibuja las contribuciones causales
+  diarias (`ef_*`) como **áreas apiladas traslúcidas en el eje derecho**
+  (`ln(1+ŷ)`), mientras la **predicción `yhat` aparece como línea negra** en el
+  eje izquierdo. `ef_total` = Σ factores; `ef_resid` la corrección por
+  redondeo.
 - Click en fila → sincroniza selectores de la sidebar.
 - El dashboard es **puramente de lectura**: consume `forecast.parquet` ya
   calculado y cada interacción es **O(subconjunto)** sobre el contexto
@@ -226,6 +308,12 @@ las causas de abajo, esto escalaba de forma cuadrática y jamás terminaba con
 miles de series reales).
 
 ### Causas raíz y fix
+
+> Con `SECTION_LEVEL_MODEL = True` (default) los `2 fits/serie` de abajo se
+> reducen aún más: **2 fits por sección** (uno por variable `y`/precio), es
+> decir **4 fits totales** para las secciones 1 y 23 — el resto de niveles
+> tienda/SKU ya no ajusta modelo, aplica el de la sección (ver
+> [Modelo a nivel sección](#modelo-a-nivel-sección-descomposición-causal--top-down)).
 
 | # | Causa                                                                                                                                                                                                                                                           | Antes                                                 | Ahora                                                                                                                                                                                                                                   |
 | - | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

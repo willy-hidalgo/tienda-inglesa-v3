@@ -13,8 +13,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import plotly.graph_objects as go
 import polars as pl
@@ -69,6 +72,7 @@ def _save_context(key: str, ctx: backend.DashboardContext) -> None:
                 "all_ids": ctx.all_ids,
                 "has_rolling": ctx.has_rolling,
                 "has_value_cols": ctx.has_value_cols,
+                "has_effects": ctx.has_effects,
             },
             ensure_ascii=False,
         ),
@@ -100,8 +104,10 @@ def _load_cached(key: str) -> backend.DashboardContext | None:
             all_ids=meta["all_ids"],
             has_rolling=meta["has_rolling"],
             has_value_cols=meta["has_value_cols"],
+            has_effects=meta.get("has_effects", False),
         )
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        logger.warning("No se pudo cargar el contexto cacheado: %s", exc)
         return None
 
 
@@ -115,8 +121,8 @@ def _prune_cache(keep: int = 10) -> None:
             key = m.name[: -len(".meta.json")]
             for suffix in (".meta.json", ".unit.parquet", ".per.parquet", ".labels.parquet"):
                 (_CACHE_DIR / f"{key}{suffix}").unlink(missing_ok=True)
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning("No se pudo podar el cache: %s", exc)
 
 
 def _load_context(uploaded_file, default_path, unidad):
@@ -426,22 +432,21 @@ if ch["hist_ds"]:
                 x=ch["hist_ds"],
                 y=ch["hist_yhat"],
                 name=f"{_opt_yhat} (predicción)",
-                fill="tozeroy",
                 mode="lines",
-                line=dict(color="rgba(255, 127, 14, 1)"),
-                fillcolor="rgba(255, 127, 14, 0.25)",
+                line=dict(color="black", width=2),
             )
         )
-if ch["fcst_ds"] and show_yhat:
-    fig.add_trace(
-        go.Scatter(
-            x=ch["fcst_ds"],
-            y=ch["fcst_yhat"],
-            name=f"{_opt_yhat} (solo forecast)",
-            mode="lines",
-            line=dict(color="rgba(255, 127, 14, 1)", dash="dot", width=2),
+    if ch["fcst_ds"] and show_yhat:
+        fig.add_trace(
+            go.Scatter(
+                x=ch["fcst_ds"],
+                y=ch["fcst_yhat"],
+                name=f"{_opt_yhat} (solo forecast)",
+                mode="lines",
+                line=dict(color="black", dash="dot", width=2),
+            )
         )
-    )
+
 if show_yhat28 and ch.get("hist_yhat28"):
     fig.add_trace(
         go.Scatter(
@@ -463,6 +468,81 @@ if show_yhat28 and ch.get("fcst_yhat28"):
         )
     )
 
+# ── Descomposición de efectos causales (solo nivel sección) ──────────────
+show_effects = False
+selected_effects: list[str] = []
+if view.has_effects and ch.get("effects"):
+    eff_opts = [c for c in backend.EFFECT_COLUMNS if c in ch["effects"]]
+    if eff_opts:
+        selected_effects = st.sidebar.multiselect(
+            "Descomposición de efectos (sección)",
+            options=eff_opts,
+            default=[c for c in eff_opts if c not in ("ef_total", "ef_resid")],
+            key="effects_visible",
+            help=(
+                "Áreas apiladas de contribuciones causales diarias en "
+                "log₁ₚ(ŷ, unidades): Σ factores = ln(1+ŷ) sección. Eje derecho."
+            ),
+        )
+        show_effects = bool(selected_effects)
+
+
+def _to_rgb(hexcolor: str) -> str:
+    h = hexcolor.lstrip("#")
+    return ", ".join(str(int(h[i : i + 2], 16)) for i in (0, 2, 4))
+
+
+if show_effects and selected_effects:
+    # Paleta estilo imagen de referencia (áreas apiladas):
+    #   Level → gris, Trend → gris oscuro, Seasonality → amarillo,
+    #   EDP → verde claro, Discount → púrpura, Feature/Display → rosa,
+    #   Volume → gris muy oscuro, Price → rojo.
+    _EFFECT_PALETTE = {
+        "ef_level": "#7f8c8d",
+        "ef_trend": "#5d6d7e",
+        "ef_seasonality": "#f7dc6f",
+        "ef_edp": "#82e0aa",
+        "ef_discount": "#af7ac5",
+        "ef_feature_display": "#f1948a",
+        "ef_volume": "#2c3e50",
+        "ef_price": "#e74c3c",
+        "ef_total": "#7f7f7f",
+        "ef_resid": "#7f7f7f",
+    }
+    for e in selected_effects:
+        lbl = backend.EFFECT_LABELS.get(e, e)
+        color = _EFFECT_PALETTE.get(e, "#7f7f7f")
+        is_total = e == "ef_total"
+        fillcolor = (
+            f"rgba({_to_rgb(color)}, 0.35)" if not is_total else "rgba(0, 0, 0, 0)"
+        )
+        hist_y = ch["effects"][e]["hist"] or []
+        fcst_y = ch["effects"][e]["fcst"] or []
+        xs: list = []
+        ys: list = []
+        if hist_y:
+            xs += list(ch["hist_ds"])
+            ys += list(hist_y)
+        if fcst_y:
+            xs += list(ch["fcst_ds"])
+            ys += list(fcst_y)
+        if not xs:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                name=lbl,
+                mode="lines",
+                line=dict(color=color, width=0.6),
+                fill="tonexty",
+                fillcolor=fillcolor,
+                stackgroup="ef_stack",
+                yaxis="y2",
+            )
+        )
+
+
 cutoff_x = ch["cutoff"]
 if isinstance(cutoff_x, dt.date) and not isinstance(cutoff_x, dt.datetime):
     cutoff_x = dt.datetime.combine(cutoff_x, dt.time.min)
@@ -482,15 +562,44 @@ if isinstance(te, dt.date):
         annotation_text="Fin OOS",
         annotation_position="top right",
     )
-fig.update_layout(
+_layout = dict(
     title=f"y vs yhat — {view.label} ({view.freq.lower()}, {unidad_label})",
     xaxis_title="Fecha",
-    yaxis_title=f"{unidad_label} / {freq_label}",
+    yaxis=dict(title=f"{unidad_label} / {freq_label}"),
     legend_title_text="",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     hovermode="x unified",
-    margin=dict(l=40, r=40, t=50, b=40),
+    margin=dict(l=40, r=40, t=80, b=40),
 )
+if show_effects:
+    # Anclar el eje derecho a 0 (parte inferior) usando como techo el
+    # ln(1+ŷ) total de la sección. Así las áreas apiladas colorean SOLO la
+    # fracción inferior (Σ efectos seleccionados) y dejan sin color la parte
+    # superior, en lugar de colorear todo el fondo al hacer auto-range sobre
+    # los valores log1p (~14-16).
+    _y2 = dict(
+        title="ln(1+ŷ) contrib. causal",
+        overlaying="y",
+        side="right",
+        showgrid=False,
+    )
+    _eftot = ch["effects"].get("ef_total", {})
+    _cand = [
+        float(v)
+        for v in (_eftot.get("hist", []) + _eftot.get("fcst", []))
+        if v is not None and v == v
+    ]
+    if _cand:
+        _y2["range"] = [0, max(_cand) * 1.03]
+    _layout["yaxis2"] = _y2
+fig.update_layout(**_layout)
 st.caption("Mostrando forecast: **" + ", ".join(series_forecast) + "**")
+if show_effects:
+    st.caption(
+        "⚗️ Efectos causales (eje derecho, log₁ₚ unidades): "
+        "ln(1+ŷ sección) = Σ(level, trend, seasonality, edp, discount, "
+        "feature/display, volume, price) + residuo."
+    )
 st.plotly_chart(fig, width="stretch")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +619,16 @@ _DETAIL_LABELS = {
     "store_name": "Tienda",
     "seccion": "Sección",
     "abs_error": "Error abs.",
+    "ef_level": "Efecto nivel",
+    "ef_trend": "Efecto tendencia",
+    "ef_seasonality": "Efecto estacionalidad",
+    "ef_edp": "Efecto EDP",
+    "ef_discount": "Efecto descuento",
+    "ef_feature_display": "Efecto feature/display",
+    "ef_volume": "Efecto volumen",
+    "ef_price": "Efecto precio",
+    "ef_total": "ln(1+ŷ) total",
+    "ef_resid": "Residuo (corrección)",
 }
 
 with st.expander("Ver datos detallados"):

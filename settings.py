@@ -123,6 +123,18 @@ AGGREGATION_LEVELS = {
 FORECAST_LEVELS = ["seccion", "store", "sku"]
 NOMBRES_NIVELES = ["seccion", "store", "sku"]
 
+# ── Modelo a nivel sección (descomposición causal + top-down) ────────────────
+# El modelo RLS se ajusta SOLO sobre la serie de la sección (1 fit por sección)
+# y los pronósticos de tienda/SKU se obtienen aplicando ese modelo con shares
+# de nivel y difs de tendencia por serie (top-down coherente por construcción).
+# Si se apaga, el pipeline vuelve al comportamiento anterior (1 fit por cada
+# serie individual de sección/tienda/SKU).
+SECTION_LEVEL_MODEL = True
+# Emite data/output/decomposition.parquet con la descomposición de efectos
+# causales de la sección: level, trend, seasonality, edp, discount,
+# feature_display (festivos), volume (conteo_sku) y price (asp).
+DECOMPOSE_EFFECTS = True
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parámetros del modelo RLS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,11 +184,25 @@ HOLIDAYS = {
         "window_after_days": 2,
         "active": 1,
     },
-    "promo_mar": {
+    "promo_mar_1": {
         "month": 3,
         "day": 12,
         "window_before_days": 1,
-        "window_after_days": 5,
+        "window_after_days": 6,
+        "active": 1,
+    },
+    # "promo_mar_2": {
+    #     "month": 3,
+    #     "day": 7,
+    #     "window_before_days": 1,
+    #     "window_after_days": 5,
+    #     "active": 1,
+    # },
+    "promo_mar_3": {
+        "month": 3,
+        "day": 16,
+        "window_before_days": 6,
+        "window_after_days": 3,
         "active": 1,
     },
     "promo_sep": {

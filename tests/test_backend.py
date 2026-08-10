@@ -303,3 +303,69 @@ def test_format_detail_display():
     assert out["value"][0] == "999,999"
     assert out["valuehat"][0] == "0"
     assert out["abs_error"][0] == "235"
+def test_dashboard_effects_section_only():
+    """Efectos causales (ef_*): se exponen SOLO a nivel sección (gráfico y
+    detalle); a nivel tienda/SKU no aparecen en el detalle."""
+    df = _sample_forecast().with_columns(
+        pl.when(pl.col("unique_id") == "23")
+        .then(pl.lit(6.2))
+        .otherwise(None)
+        .alias("ef_level"),
+        pl.when(pl.col("unique_id") == "23")
+        .then(pl.lit(-0.35))
+        .otherwise(None)
+        .alias("ef_trend"),
+        pl.when(pl.col("unique_id") == "23")
+        .then(pl.lit(0.05))
+        .otherwise(None)
+        .alias("ef_seasonality"),
+    )
+    ctx = build_dashboard_context(df, "Unidades")
+    assert ctx.has_effects is True
+
+    kwargs = dict(
+        unidad="Unidades",
+        freq="Diario",
+        cutoff_date=dt.date(2025, 11, 30),
+        candidatos=["23", "23||00155"],
+        nombre_nivel="seccion",
+    )
+    view = prepare_dashboard_state(
+        df, selected_id="23", **{k: v for k, v in kwargs.items()}
+    )
+    assert view.has_effects is True
+    assert "ef_level" in view.chart["effects"]
+    assert "effect_names" in view.chart
+    assert "ef_level" in view.detail.columns
+
+    # A nivel tienda: sin efectos en la tabla detallada
+    child_view = prepare_dashboard_state(
+        df,
+        unidad="Unidades",
+        freq="Diario",
+        selected_id="23||00155",
+        cutoff_date=dt.date(2025, 11, 30),
+        candidatos=["23||00155"],
+        nombre_nivel="store",
+    )
+    assert child_view.has_effects is True
+    assert "ef_level" not in child_view.detail.columns
+
+
+def test_format_detail_display_effects():
+    df = pl.DataFrame(
+        {
+            "unique_id": ["1"],
+            "ds": [dt.date(2024, 1, 1)],
+            "y": [100.0],
+            "yhat": [110.0],
+            "ef_level": [4.6052],
+            "ef_trend": [-0.1],
+            "ef_price": [0.0],
+        }
+    )
+    out = backend.format_detail_display(df)
+    assert out["ef_level"][0] == "+4.6052"
+    assert out["ef_trend"][0] == "-0.1000"
+    assert out["ef_price"][0] == "+0.0000"
+    assert out["y"][0] == "100"
