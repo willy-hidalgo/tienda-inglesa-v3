@@ -8,6 +8,7 @@ Cualquier cambio de selección solo recorre subconjuntos (rankings = tabla
 pre-agregada; gráfico/métricas = serie elegida) → respuesta inmediata y
 correcta, sin re-procesar el panel completo.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -114,12 +115,15 @@ def _load_cached(key: str) -> backend.DashboardContext | None:
 def _prune_cache(keep: int = 10) -> None:
     """Mantiene acotado el dir de cache (descarta los keys más viejos)."""
     try:
-        metas = sorted(
-            _CACHE_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime
-        )
+        metas = sorted(_CACHE_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime)
         for m in metas[:-keep]:
             key = m.name[: -len(".meta.json")]
-            for suffix in (".meta.json", ".unit.parquet", ".per.parquet", ".labels.parquet"):
+            for suffix in (
+                ".meta.json",
+                ".unit.parquet",
+                ".per.parquet",
+                ".labels.parquet",
+            ):
                 (_CACHE_DIR / f"{key}{suffix}").unlink(missing_ok=True)
     except OSError as exc:
         logger.warning("No se pudo podar el cache: %s", exc)
@@ -311,7 +315,10 @@ if view.store_id:
     store_lbl = (
         f"{view.store_id} — {view.store_name}" if view.store_name else view.store_id
     )
-    st.caption(f"🏬 Tienda: **{store_lbl}** · los SKUs listados pertenecen a esta tienda.")
+    st.caption(
+        f"🏬 Tienda: **{store_lbl}** · los SKUs listados pertenecen a esta tienda."
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rankings
@@ -352,7 +359,7 @@ _pref = _seg[0]
 for _i in range(1, len(_seg)):
     _pref += f"||{_seg[_i]}"
     _crumbs.append(label_map.get(_pref, _seg[_i]))
-st.caption(f"🧭 **Ruta:** " + " › ".join(_crumbs))
+st.caption("🧭 **Ruta:** " + " › ".join(_crumbs))
 st.caption(
     f"Nivel actual: **{view.nombre_nivel}** · Unidad: **{view.unidad}** · "
     f"Se muestran solo los **{view.ranking_n_series} hijos directos** del nivel "

@@ -191,13 +191,13 @@ HOLIDAYS = {
         "window_after_days": 6,
         "active": 1,
     },
-    # "promo_mar_2": {
-    #     "month": 3,
-    #     "day": 7,
-    #     "window_before_days": 1,
-    #     "window_after_days": 5,
-    #     "active": 1,
-    # },
+    "promo_mar_2": {
+        "month": 3,
+        "day": 7,
+        "window_before_days": 1,
+        "window_after_days": 5,
+        "active": 1,
+    },
     "promo_mar_3": {
         "month": 3,
         "day": 16,
