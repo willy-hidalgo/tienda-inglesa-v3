@@ -18,3 +18,5 @@ data/.dashcache/
 # Windows artefactos basura (ej. redirects `> nul`)
 nul
 
+data/output/forecast.parquet
+data/output/
