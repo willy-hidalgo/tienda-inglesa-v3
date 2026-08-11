@@ -4,19 +4,43 @@ import numpy as np
 from numba import jit
 
 
-@jit(nopython=True, cache=True)
 def decompose_price(
     sales_dollars: np.ndarray,
     sales_units: np.ndarray,
     indexors: Sequence[np.ndarray] | Sequence[slice] | None = None,
     max_tpr_len: int = 16,
 ):
-    """Helper function to calculate ASP, EDP and Discount for all data rows"""
+    """Helper function to calculate ASP, EDP and Discount for all data rows.
+
+    Wrapper Python (no jitted): resuelve `indexors=None` ANTES de llamar al
+    kernel numba. Esto es necesario porque si la resolución del default se
+    hiciera dentro de la función `@jit(nopython=True)` (como antes), numba
+    tiene que inferir estáticamente un único tipo para la variable
+    `indexors` a través de las dos ramas del `if` (la del default interno y
+    la del valor recibido) y falla al intentar unificar
+    `list(slice<a:b>)` con `list(slice<a:b:c>)` en cuanto se le pasa una
+    lista de slices "real" (con múltiples series) distinta al slice-default
+    de una sola serie. Resolviendo el default acá afuera, el kernel siempre
+    recibe un tipo homogéneo y estable.
+    """
+    if indexors is None:
+        indexors = [slice(0, sales_dollars.shape[0])]
+    return _decompose_price_kernel(
+        sales_dollars, sales_units, indexors, max_tpr_len
+    )
+
+
+@jit(nopython=True, cache=True)
+def _decompose_price_kernel(
+    sales_dollars: np.ndarray,
+    sales_units: np.ndarray,
+    indexors,
+    max_tpr_len: int = 16,
+):
+    """Kernel numba puro: `indexors` siempre es una lista concreta (no
+    Optional) resuelta por el wrapper `decompose_price` de arriba."""
 
     assert sales_dollars.shape == sales_units.shape
-
-    if indexors is None:
-        indexors = [slice(None, None, None)]
 
     # Set up output arrays
     # FIX: sales_units puede venir en 0 (día sin ventas) -> división por cero

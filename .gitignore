@@ -5,6 +5,16 @@ build/
 dist/
 wheels/
 *.egg-info
+data/output/
+*.parquet
+
 
 # Virtual environments
 .venv
+
+# Dashboard disk cache (build artifact, regenerado)
+data/.dashcache/
+
+# Windows artefactos basura (ej. redirects `> nul`)
+nul
+

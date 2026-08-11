@@ -2,6 +2,7 @@
 Configuración central del proyecto de forecasting jerárquico RLS.
 Secciones 1 y 23 · niveles: sección → SKU → local (tienda).
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -39,6 +40,11 @@ TEST_START = dt.date(2025, 11, 1)
 TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
 ROLLING_HORIZON_DAYS = 28  # yhat28 / valuehat28 walk-forward
+# Rolling 28d es OPT-IN: por defecto NO se calcula (ahorra el walk-forward
+# sobre toda la historia de todas las series). Si se habilita, el parquet
+# incluye yhat28/valuehat28 y el dashboard muestra el multiselect de series,
+# la línea verde y las métricas WMAPE₂₈/BIAS₂₈.
+COMPUTE_ROLLING28 = False
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
 FECHAS_TEST = (TEST_START, TEST_END)
@@ -274,8 +280,7 @@ def section_horizons(seccion: str, first_data: dt.date | None = None) -> dict:
     forecast_end = cfg.get("forecast_end") or (
         test_end + dt.timedelta(days=METRIC_HORIZON_DAYS)
     )
-    if forecast_end < forecast_start:
-        forecast_end = forecast_start
+    forecast_end = max(forecast_end, forecast_start)
     return {
         "train_start": train_start,
         "train_end": train_end,
