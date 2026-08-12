@@ -8,6 +8,7 @@ Cualquier cambio de selección solo recorre subconjuntos (rankings = tabla
 pre-agregada; gráfico/métricas = serie elegida) → respuesta inmediata y
 correcta, sin re-procesar el panel completo.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -108,12 +109,15 @@ def _load_cached(key: str) -> backend.DashboardContext | None:
 def _prune_cache(keep: int = 10) -> None:
     """Mantiene acotado el dir de cache (descarta los keys más viejos)."""
     try:
-        metas = sorted(
-            _CACHE_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime
-        )
+        metas = sorted(_CACHE_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime)
         for m in metas[:-keep]:
             key = m.name[: -len(".meta.json")]
-            for suffix in (".meta.json", ".unit.parquet", ".per.parquet", ".labels.parquet"):
+            for suffix in (
+                ".meta.json",
+                ".unit.parquet",
+                ".per.parquet",
+                ".labels.parquet",
+            ):
                 (_CACHE_DIR / f"{key}{suffix}").unlink(missing_ok=True)
     except Exception:
         pass
@@ -247,29 +251,54 @@ selected_id = st.sidebar.selectbox(
     format_func=lambda x: f"Sección {x}",
 )
 
-niveles_recorridos: list[tuple[str, list[str]]] = [(NOMBRES[0], opciones_raiz)]
-nivel = 1
-while True:
-    hijos = backend.opciones_nivel(all_ids, selected_id)
-    if not hijos:
-        break
-    nombre_nivel = NOMBRES[nivel] if nivel < len(NOMBRES) else f"Nivel {nivel}"
-    niveles_recorridos.append((nombre_nivel, hijos))
-    opcion_mantener = f"— Quedarse en «{label_for(selected_id)}» —"
-    key = f"nivel_{nivel}__{selected_id}"
-    eleccion = st.sidebar.selectbox(
-        nombre_nivel,
-        [opcion_mantener] + hijos,
-        index=0,
-        key=key,
-        format_func=lambda x: x if x.startswith("—") else label_for(x),
-    )
-    if eleccion == opcion_mantener:
-        break
-    selected_id = eleccion
-    nivel += 1
+# Selección simultánea de tiendas y/ou SKUs (nivel 1)
+seccion_seleccionada = selected_id.split("||")[0]
+st.sidebar.markdown("#### Tiendas y/o SKUs")
+tiendas_disponibles = backend.obtener_tiendas_seccion(seccion_seleccionada)
+skus_disponibles = backend.obtener_skus_seccion(ctx.unit_df, seccion_seleccionada)
 
-nombre_nivel_actual, candidatos = niveles_recorridos[-1]
+# Multi-select para tiendas
+tiendas_seleccionadas = st.sidebar.multiselect(
+    "Tiendas",
+    options=tiendas_disponibles,
+    default=[],
+    key="tiendas_seleccionadas",
+    format_func=lambda x: (
+        f"{x} — {settings.SECCIONES.get(seccion_seleccionada, {}).get('local_names', {}).get(x, '')}"
+        if x
+        and settings.SECCIONES.get(seccion_seleccionada, {})
+        .get("local_names", {})
+        .get(x, "")
+        else x
+    ),
+)
+
+# Multi-select para SKUs
+skus_seleccionados = st.sidebar.multiselect(
+    "SKUs",
+    options=skus_disponibles,
+    default=[],
+    key="skus_seleccionados",
+    format_func=lambda x: x,
+)
+
+# Para el ranking y filtrado, necesitamos generar las combinaciones selecciónadas
+# Si no se seleccionan tiendas, se usan todas las disponibles
+# Si no se seleccionan SKUs, se usan todos los disponibles
+tiendas_para_usar = (
+    tiendas_seleccionadas if tiendas_seleccionadas else tiendas_disponibles
+)
+skus_para_usar = skus_seleccionados if skus_seleccionados else skus_disponibles
+
+# Generar las unique_id combinations para el filtrado
+candidatos = []
+for tienda in tiendas_para_usar:
+    for sku in skus_para_usar:
+        candidatos.append(f"{seccion_seleccionada}||{tienda}||{sku}")
+
+nombre_nivel_actual = (
+    "tienda_y_sku"  # Indicamos que estamos en nivel de tienda/y/sku simultáneo
+)
 
 # Corte in/out = train_end de la sección: lo resuelve backend dentro de
 # prepare_dashboard_state_from_context (sin duplicar filtros del sidebar).
@@ -305,7 +334,10 @@ if view.store_id:
     store_lbl = (
         f"{view.store_id} — {view.store_name}" if view.store_name else view.store_id
     )
-    st.caption(f"🏬 Tienda: **{store_lbl}** · los SKUs listados pertenecen a esta tienda.")
+    st.caption(
+        f"🏬 Tienda: **{store_lbl}** · los SKUs listados pertenecen a esta tienda."
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rankings
@@ -333,20 +365,50 @@ def _show_ranking(display, key: str) -> None:
         },
     )
     if event and event.selection and event.selection.rows:
-        st.session_state["sel_from_table"] = display["unique_id"][
-            event.selection.rows[0]
-        ]
+        clicked_id = display["unique_id"][event.selection.rows[0]]
+        # Determine what type of item was clicked and update appropriate selection
+        if key.startswith("tabla_tiendas"):  # Store ranking table
+            # clicked_id is store-level (e.g., "1||00122")
+            # Toggle this store in the multi-select
+            current_selections = st.session_state.get("tiendas_seleccionadas", [])
+            if clicked_id in current_selections:
+                # Remove from selection
+                st.session_state["tiendas_seleccionadas"] = [
+                    x for x in current_selections if x != clicked_id
+                ]
+            else:
+                # Add to selection
+                st.session_state["tiendas_seleccionadas"] = current_selections + [
+                    clicked_id
+                ]
+        elif key.startswith("tabla_skus"):  # SKU ranking table
+            # clicked_id is section-SKU level (e.g., "1||SKU_A")
+            # Extract just the SKU part for the multi-select
+            parts = clicked_id.split("||")
+            if len(parts) >= 2:
+                sku_id = parts[1]  # e.g., "SKU_A" from "1||SKU_A"
+                current_selections = st.session_state.get("skus_seleccionados", [])
+                if sku_id in current_selections:
+                    # Remove from selection
+                    st.session_state["skus_seleccionados"] = [
+                        x for x in current_selections if x != sku_id
+                    ]
+                else:
+                    # Add to selection
+                    st.session_state["skus_seleccionados"] = current_selections + [
+                        sku_id
+                    ]
         st.rerun()
 
 
-st.markdown("#### Ranking wMAPE + Rotación")
+st.markdown("#### Ranking de Tiendas")
 _seg = selected_id.split("||")
 _crumbs = [f"Sección {_seg[0]}"]
 _pref = _seg[0]
 for _i in range(1, len(_seg)):
     _pref += f"||{_seg[_i]}"
     _crumbs.append(label_map.get(_pref, _seg[_i]))
-st.caption(f"🧭 **Ruta:** " + " › ".join(_crumbs))
+st.caption("🧭 **Ruta:** " + " › ".join(_crumbs))
 st.caption(
     f"Nivel actual: **{view.nombre_nivel}** · Unidad: **{view.unidad}** · "
     f"Se muestran solo los **{view.ranking_n_series} hijos directos** del nivel "
@@ -357,7 +419,11 @@ st.caption(
     f"**{view.ranking_total_points}** · "
     "`N puntos ≠0` = períodos con venta (y≠0) · `% ≠0` = proporción sobre el total."
 )
-_show_ranking(view.ranking_wmape, f"tabla_wmape_{view.selected_id}")
+_show_ranking(view.ranking_tiendas, f"tabla_tiendas_{view.selected_id}")
+
+st.markdown("#### Ranking de SKUs")
+st.caption("Rankeado por wMAPE ascendente (mejor performance primero)")
+_show_ranking(view.ranking_skus, f"tabla_skus_{view.selected_id}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Métricas

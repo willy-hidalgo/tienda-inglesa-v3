@@ -345,15 +345,30 @@ class CalendarFeatureBuilder:
             "edp",
             "discount",
         }
+        existing = set(df.columns)
         if req_columns is None:
-            req_columns = [c for c in feats.columns if c not in _exclude]
+            req_columns = [
+                c for c in feats.columns if c not in _exclude and c not in existing
+            ]
+        else:
+            # Si el DataFrame ya tiene alguna de las columnas pedidas, no las
+            # solicitamos de las features de calendario para evitar duplicados.
+            req_columns = [c for c in req_columns if c not in existing]
+
         feats = self._holiday_dummies(feats, req_columns)
         feat_cols = [c for c in feats.columns if c != "ds"]
-        # asegurar columnas pedidas
-        missing = [c for c in (req_columns or []) if c not in feats.columns]
+        feat_cols = [c for c in dict.fromkeys(feat_cols) if c not in existing]
+
+        # asegurar columnas pedidas que no existan ya en df
+        missing = [
+            c
+            for c in (req_columns or [])
+            if c not in feats.columns and c not in existing
+        ]
         if missing:
             feats = feats.with_columns([pl.lit(0).alias(c) for c in missing])
-            feat_cols = [c for c in feats.columns if c != "ds"]
+            feat_cols = [c for c in feats.columns if c != "ds" and c not in existing]
+
         return df.join(feats.select(["ds"] + feat_cols), on="ds", how="left")
 
 
@@ -971,6 +986,16 @@ class RLSForecastRunner:
         if not unique_ids:
             return pl.DataFrame(schema=empty_schema)
 
+        logger.info(
+            "rolling28: %d unique_id en tasks, panel filas=%d, workers=%d",
+            len(unique_ids),
+            panel.height,
+            self._workers(),
+        )
+        logger.info(
+            "rolling28: construyendo particiones de %d unique_id...",
+            len(unique_ids),
+        )
         parts = self._normalize_partition_dict(
             panel.filter(pl.col("unique_id").is_in(unique_ids)).partition_by(
                 "unique_id", as_dict=True
@@ -984,6 +1009,8 @@ class RLSForecastRunner:
                 for uid in unique_ids
                 if uid in parts
             }
+            completed = 0
+            log_every = 200 if len(futures) > 200 else len(futures) + 1
             for fut in tqdm(
                 as_completed(futures),
                 total=len(futures),
@@ -991,7 +1018,14 @@ class RLSForecastRunner:
                 unit="serie",
                 leave=False,
             ):
+                completed += 1
                 uid = futures[fut]
+                if completed % log_every == 0 or completed == len(futures):
+                    logger.info(
+                        "rolling28: %d/%d series completadas",
+                        completed,
+                        len(futures),
+                    )
                 try:
                     one = fut.result()
                 except Exception as exc:
@@ -1384,6 +1418,225 @@ class RLSForecastPipeline:
             pl.Series("discount", np.asarray(discount, dtype=np.float64)),
         )
 
+    def _fit_section_level_models(
+        self,
+        section_data: pl.DataFrame,
+        driver_cols: list[str],
+        rmse_error: float,
+        forgetting_factor: float,
+        min_y_to_update: float,
+        use_correction_factor: bool,
+    ):
+        """
+        Ajusta modelos RLS a nivel de sección para las variables y y value.
+
+        Returns:
+            tuple: (model_y, model_p) - los modelos RLS ajustados
+        """
+        if RecursiveLeastSquaresRegression is None:
+            raise RuntimeError("rls_opt no disponible")
+
+        # Prepare y variable (log1p(y))
+        X_y = section_data.select(driver_cols).to_numpy().astype(np.float64, order="C")
+        y = section_data["y"].to_numpy()
+        log_y = np.log1p(y)
+        model_y = RecursiveLeastSquaresRegression(
+            forgetting_factor=forgetting_factor,
+            min_y_to_update=min_y_to_update,
+            return_all_coefs=False,
+        )
+        priors_y = [RLSConstantPrior(standard_error=0.5, rmse_error=rmse_error)] + [
+            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=rmse_error)
+            for _ in range(max(0, len(driver_cols) - 1))
+        ]
+        model_y.fit(x=X_y, y=log_y, priors=priors_y)
+
+        # Prepare value variable (log1p(value))
+        # Excluir asp, edp, discount para el modelo de precio (como en el código original)
+        _price_exclude = {"asp", "edp", "discount"}
+        driver_cols_price = [c for c in driver_cols if c not in _price_exclude]
+        X_p = (
+            section_data.select(driver_cols_price)
+            .to_numpy()
+            .astype(np.float64, order="C")
+        )
+        price = section_data["value"].to_numpy()
+        log_price = np.log1p(np.clip(price, 0.0, None))
+        model_p = RecursiveLeastSquaresRegression(
+            forgetting_factor=forgetting_factor,
+            min_y_to_update=1e-8,  # Mismo valor que en el código original
+            return_all_coefs=False,
+        )
+        priors_p = [RLSConstantPrior(standard_error=0.5, rmse_error=rmse_error)] + [
+            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=rmse_error)
+            for _ in range(max(0, len(driver_cols_price) - 1))
+        ]
+        model_p.fit(x=X_p, y=log_price, priors=priors_p)
+
+        return model_y, model_p
+
+    def _predict_using_section_procedure(
+        self,
+        target_df: pl.DataFrame,
+        section_coeffs_y: np.ndarray,
+        section_coeffs_p: np.ndarray,
+        driver_cols: list[str],
+        period_type: str,
+        meta: dict,
+    ) -> tuple[list[pl.DataFrame], list[pl.DataFrame]]:
+        """
+        Aplica el procedimiento de predicción usando modelos de sección:
+        1. Extraer coeficientes de sección (ya proporcionados)
+        2. Para cada unique_id en target_df:
+           a. Obtener datos históricos para esa combinación
+           b. Separar actuals (y) de drivers (excluyendo intercept)
+           c. Calcular efectos de drivers: drivers × coeficientes_sección
+           d. Calcular net y: actuals - efectos_de_drivers
+           e. Aplicar smoothing exponencial a net y para obtener net_y_hat (parámetro 0.1)
+           f. Predicción final: yhat = net_y_hat + suma_de_efectos_de_drivers
+        3. Lo mismo para la variable value
+
+        Returns:
+            tuple: (prediction_frames, wmape_frames)
+        """
+        if target_df.height == 0:
+            return [], []
+
+        # Particionar una sola vez por serie para evitar múltiples filtros costosos
+        sorted_target = target_df.sort(["unique_id", "ds"])
+        groups = sorted_target.partition_by("unique_id", maintain_order=True)
+
+        n_series = len(groups)
+        logger.info(
+            "Predicción de sección: procesando %d series para %s", n_series, period_type
+        )
+
+        prediction_frames = []
+        wmape_frames = []
+
+        # Procesar cada unique_id
+        for uid_data in groups:
+            if uid_data.height == 0:
+                continue
+            uid = uid_data["unique_id"][0]
+
+            # Preparar datos para y variable
+            effective_driver_cols_y = [c for c in driver_cols if c != "intercept"]
+            X_y = (
+                uid_data.select(effective_driver_cols_y)
+                .to_numpy()
+                .astype(np.float64, order="C")
+            )
+            y_actual = uid_data["y"].to_numpy()
+
+            # Calcular efectos de drivers: X_y × section_coeffs_y
+            # section_coeffs_y ya excluye el intercept, por lo que también removemos
+            # la columna intercept de los drivers antes de multiplicar.
+            driver_effects_y = (
+                X_y @ section_coeffs_y
+                if len(section_coeffs_y) > 0
+                else np.zeros(len(y_actual))
+            )
+
+            # Calcular net y: actuals - driver effects
+            net_y = y_actual - driver_effects_y
+
+            # Aplicar smoothing exponencial a net y para obtener net_y_hat (parámetro 0.1)
+            # net_y_hat[t] = 0.1 * net_y[t] + 0.9 * net_y_hat[t-1]
+            net_y_hat = np.zeros_like(net_y)
+            if len(net_y) > 0:
+                net_y_hat[0] = net_y[0]  # Primera observación sin suavizado
+                for i in range(1, len(net_y)):
+                    net_y_hat[i] = 0.1 * net_y[i] + 0.9 * net_y_hat[i - 1]
+
+            # Predicción final para y: yhat = net_y_hat + driver effects
+            yhat = net_y_hat + driver_effects_y
+
+            # Preparar datos para value variable
+            # Excluir asp, edp, discount para el modelo de precio
+            _price_exclude = {"asp", "edp", "discount"}
+            driver_cols_price = [
+                c for c in driver_cols if c not in _price_exclude and c != "intercept"
+            ]
+            X_p = (
+                uid_data.select(driver_cols_price)
+                .to_numpy()
+                .astype(np.float64, order="C")
+            )
+            value_actual = uid_data["value"].to_numpy()
+
+            # Calcular efectos de drivers para value: X_p × section_coeffs_p
+            driver_effects_p = (
+                X_p @ section_coeffs_p
+                if len(section_coeffs_p) > 0
+                else np.zeros(len(value_actual))
+            )
+
+            # Calcular net value: actuals - driver effects
+            net_value = value_actual - driver_effects_p
+
+            # Aplicar smoothing exponencial a net value con parámetro 0.1
+            net_value_hat = np.zeros_like(net_value)
+            if len(net_value) > 0:
+                net_value_hat[0] = net_value[0]  # Primera observación sin suavizado
+                for i in range(1, len(net_value)):
+                    net_value_hat[i] = 0.1 * net_value[i] + 0.9 * net_value_hat[i - 1]
+
+            # Predicción final para value: valuehat = net_value_hat + driver effects
+            valuehat = net_value_hat + driver_effects_p
+
+            # Construir el DataFrame de resultado para este unique_id
+            result_data = {
+                "unique_id": [uid] * len(uid_data),
+                "ds": uid_data["ds"].to_list(),
+                "y": y_actual,
+                "yhat": yhat,
+                "value": value_actual,
+                "valuehat": valuehat,
+            }
+
+            # Añadir metadata si existe
+            if meta:
+                for k, v in meta.items():
+                    result_data[k] = [v] * len(uid_data)
+
+            # Copiar columnas metafrom uid_data si existen
+            for col in ("sku_desc", "store_name", "seccion", "conteo_sku"):
+                if col in uid_data.columns:
+                    result_data[col] = uid_data[col].to_list()
+
+            # Añadir columna period_type
+            result_data["period_type"] = [period_type] * len(uid_data)
+
+            frame = pl.DataFrame(result_data)
+            prediction_frames.append(frame)
+
+            # Para WMAPE, necesitamos calcular errores solo para out_sample
+            if period_type == "out_sample":
+                # Calcular errores absolutos relativos
+                abs_error = np.abs(y_actual - yhat)
+                # Evitar división por cero
+                mask = y_actual != 0
+                if np.any(mask):
+                    wmape_value = np.sum(abs_error[mask]) / np.sum(
+                        np.abs(y_actual[mask])
+                    )
+                else:
+                    wmape_value = 0.0
+
+                wmape_frame = pl.DataFrame(
+                    {
+                        "unique_id": [uid],
+                        "wmape": [wmape_value],
+                        "sum_y": [np.sum(np.abs(y_actual))],  # Suma de |y| para WMAPE
+                        "n_with_sales": [np.sum(y_actual != 0)],  # Puntos con ventas
+                        "n_ds": [len(y_actual)],  # Total de puntos
+                    }
+                )
+                wmape_frames.append(wmape_frame)
+
+        return prediction_frames, wmape_frames
+
     def _run_section(
         self,
         selected: pl.DataFrame,
@@ -1559,13 +1812,58 @@ class RLSForecastPipeline:
             else:
                 df_fcst = pl.DataFrame()
 
-        runner = RLSForecastRunner(
-            driver_cols=driver_cols,
-            rmse_error=self._cfg.rmse_error,
-            forgetting_factor=self._cfg.forgetting_factor,
-            min_y_to_update=self._cfg.min_y_to_update,
-            use_correction_factor=self._cfg.correction_factor,
-            n_jobs=self._n_jobs,
+        if driver_cols is None:
+            driver_cols = [
+                c
+                for c in df_train.columns
+                if c
+                not in (
+                    "ds",
+                    "y",
+                    "value",
+                    "valuehat",
+                    "unique_id",
+                    "conteo_sku",
+                    "sku_desc",
+                    "store_name",
+                    "seccion",
+                )
+            ]
+
+        # Extract section-level data for fitting (where unique_id has no "||")
+        section_train = df_train.filter(
+            pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 0
+        )
+
+        if section_train.height == 0:
+            logger.warning("Sección %s: No hay datos de sección para ajustar", seccion)
+            return pl.DataFrame(), pl.DataFrame(), driver_cols
+
+        # Apply feature engineering to section data (must match what's done to target data)
+        section_train = self._feature_builder.extract_drivers(
+            section_train, req_columns=driver_cols
+        ).sort("ds")
+
+        # Fit section-level RLS models for y and value variables
+        logger.info("Sección %s: ajustando modelos RLS a nivel de sección", seccion)
+        section_model_y, section_model_p = self._fit_section_level_models(
+            section_train,
+            driver_cols,
+            self._cfg.rmse_error,
+            self._cfg.forgetting_factor,
+            self._cfg.min_y_to_update,
+            self._cfg.correction_factor,
+        )
+
+        # Extract section-level coefficients (excluding intercept)
+        section_coeffs_y = section_model_y.final_coef_[-1][1:]  # Excluir intercept
+        section_coeffs_p = section_model_p.final_coef_[-1][1:]  # Excluir intercept
+
+        logger.info(
+            "Sección %s: coeficientes sección obtenidos (y: %d, value: %d)",
+            seccion,
+            len(section_coeffs_y),
+            len(section_coeffs_p),
         )
 
         meta = {
@@ -1577,22 +1875,46 @@ class RLSForecastPipeline:
             "forecast_end": hz["forecast_end"],
         }
 
-        # ── Fase 1: 1 solo fit por serie, predicción sobre los 3 targets ────
+        # Prepare targets
         targets: dict[str, pl.DataFrame] = {"in_sample": df_train}
         if df_oos.height:
             targets["out_sample"] = df_oos
         if df_fcst.height:
             targets["forecast_only"] = df_fcst
 
-        with _stage_timer(
-            f"{seccion}: fit+predict ({len(targets)} target(s), 1 fit/serie)"
-        ):
-            res_df, wmapes_df = runner.fit_and_predict_multi(
-                df_train,
-                targets,
-                self._cfg.forecast_levels,
-                desc=f"{seccion} fit+predict",
-                meta=meta,
+        # Process each target using section-level models and prediction procedure
+        with _stage_timer(f"{seccion}: predicción usando modelos de sección"):
+            res_frames = []
+            wm_frames = []
+
+            for period_type, target_df in targets.items():
+                if target_df.height == 0:
+                    continue
+
+                # Apply prediction procedure for each unique_id in target
+                period_frames = self._predict_using_section_procedure(
+                    target_df=target_df,
+                    section_coeffs_y=section_coeffs_y,
+                    section_coeffs_p=section_coeffs_p,
+                    driver_cols=driver_cols,
+                    period_type=period_type,
+                    meta=meta,
+                )
+
+                if period_frames:
+                    res_frames.extend(period_frames[0])  # prediction frames
+                    if period_frames[1]:  # wmape frames
+                        wm_frames.extend(period_frames[1])
+
+            res_df = (
+                pl.concat(res_frames, how="diagonal_relaxed")
+                if res_frames
+                else pl.DataFrame()
+            )
+            wmapes_df = (
+                pl.concat(wm_frames, how="diagonal_relaxed")
+                if wm_frames
+                else pl.DataFrame()
             )
 
         if res_df.height:
@@ -1612,6 +1934,15 @@ class RLSForecastPipeline:
             return pl.DataFrame(), pl.DataFrame(), driver_cols
 
         with _stage_timer(f"{seccion}: rolling28 (opt-in)"):
+            # construir runner aquí y pasarlo a _attach_rolling28 (tests monkeypatchan el runner)
+            runner = RLSForecastRunner(
+                driver_cols=driver_cols or [],
+                rmse_error=self._cfg.rmse_error,
+                forgetting_factor=self._cfg.forgetting_factor,
+                min_y_to_update=self._cfg.min_y_to_update,
+                use_correction_factor=self._cfg.correction_factor,
+                n_jobs=self._n_jobs,
+            )
             res_df, wmapes_df = self._attach_rolling28(
                 runner, res_df, wmapes_df, df_train, df_oos, df_fcst
             )
@@ -1649,6 +1980,7 @@ class RLSForecastPipeline:
 
         panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
         logger.info("rolling 28d: panel shape=%s…", panel.shape)
+        # runner is provided by the caller (tests may monkeypatch its methods)
         roll = runner.run_rolling_28(panel, self._cfg.forecast_levels, desc="rolling28")
         if roll.height and res_df.height:
             # alinear tipos de ds

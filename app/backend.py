@@ -13,6 +13,7 @@ módulo es la ÚNICA capa de cálculo del dashboard:
   - `prepare_dashboard_state` / `prepare_dashboard_state_from_context`:
     ViewModel listo para renderizar.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -135,9 +136,46 @@ def opciones_nivel(all_ids: list[str], prefix: str | None) -> list[str]:
         return sorted(i for i in all_ids if "||" not in i)
     depth = prefix.count("||") + 1
     pref = prefix + "||"
-    return sorted(
-        i for i in all_ids if i.startswith(pref) and i.count("||") == depth
-    )
+    return sorted(i for i in all_ids if i.startswith(pref) and i.count("||") == depth)
+
+
+def obtener_tiendas_seccion(seccion: str) -> list[str]:
+    """Obtener todas las tiendas (locales) de una sección desde settings."""
+    return list(settings.SECCIONES.get(seccion, {}).get("locales", []))
+
+
+def obtener_skus_seccion(df: pl.DataFrame, seccion: str) -> list[str]:
+    """Obtener todos los SKUs únicos presentes en una sección a partir de los datos."""
+    if df.height == 0:
+        return []
+    # Filtrar IDs que pertenecen a la sección y tienen formato sección||tienda||sku
+    prefix = seccion + "||"
+    ids_seccion = [
+        uid
+        for uid in df["unique_id"].unique().to_list()
+        if uid.startswith(prefix) and uid.count("||") == 2
+    ]
+    # Extraer la parte SKU (después del segundo ||)
+    skus = []
+    for uid in ids_seccion:
+        partes = uid.split("||")
+        if len(partes) >= 3:
+            skus.append(partes[2])
+    return sorted(list(set(skus)))  # Eliminar duplicados y ordenar
+
+
+def opciones_simultaneas_seccion(
+    all_ids: list[str], df: pl.DataFrame, seccion: str
+) -> tuple[list[str], list[str]]:
+    """
+    Obtener opciones simultáneas de tiendas y SKUs para una sección.
+
+    Returns:
+        tuple[lista_de_tiendas, lista_de_skus]
+    """
+    tiendas = obtener_tiendas_seccion(seccion)
+    skus = obtener_skus_seccion(df, seccion)
+    return tiendas, skus
 
 
 def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
@@ -160,9 +198,7 @@ def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
     has_desc = "sku_desc" in parts.columns
     has_sname = "store_name" in parts.columns
     if has_desc:
-        parts = parts.with_columns(
-            pl.col("sku_desc").replace("", None).alias("_desc")
-        )
+        parts = parts.with_columns(pl.col("sku_desc").replace("", None).alias("_desc"))
     if has_sname:
         parts = parts.with_columns(
             pl.col("store_name").replace("", None).alias("_sname")
@@ -178,8 +214,8 @@ def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
         .alias("_depth")
     )
 
-    label_expr = (
-        pl.when(pl.col("_depth") == 0).then(pl.format("Sección {}", pl.col("field_0")))
+    label_expr = pl.when(pl.col("_depth") == 0).then(
+        pl.format("Sección {}", pl.col("field_0"))
     )
     if has_sname:
         label_expr = label_expr.when(pl.col("_depth") == 1).then(
@@ -302,6 +338,193 @@ def aggregate_wmape_by_id(df: pl.DataFrame) -> pl.DataFrame:
     return _with_n_ds(agg).select(schema.keys())
 
 
+def aggregate_wmape_by_tienda(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Agrega WMAPE por nivel de tienda (seccion||tienda).
+    Excluye y==0/nulos y forecast_only del cálculo.
+    """
+    schema = {
+        "unique_id": pl.Utf8,
+        "wmape": pl.Float64,
+        "sum_y": pl.Float64,
+        "n_with_sales": pl.UInt32,
+        "n_ds": pl.UInt32,
+    }
+
+    if df.height == 0:
+        return pl.DataFrame(
+            schema={
+                "unique_id": pl.Utf8,
+                "wmape": pl.Float64,
+                "sum_y": pl.Float64,
+                "n_with_sales": pl.UInt32,
+                "n_ds": pl.UInt32,
+            }
+        )
+
+    has_ds = "ds" in df.columns
+    n_ds = None
+    if has_ds:
+        n_ds = (
+            df.select(["unique_id", "ds"])
+            .unique()
+            .group_by("unique_id")
+            .agg(pl.len().alias("n_ds"))
+        )
+
+    base = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+    if "period_type" in base.columns:
+        base = base.filter(pl.col("period_type") != "forecast_only")
+
+    def _with_n_ds(frame: pl.DataFrame) -> pl.DataFrame:
+        if n_ds is None:
+            return frame.with_columns(pl.lit(0).cast(pl.UInt32).alias("n_ds"))
+        return frame.join(n_ds, on="unique_id", how="left").with_columns(
+            pl.col("n_ds").fill_null(0).cast(pl.UInt32)
+        )
+
+    # Agrupar por sección y tienda para crear unique_id de tienda
+    tienda_df = (
+        base.with_columns(pl.col("unique_id").str.split_exact("||", 2).alias("_parts"))
+        .unnest("_parts")
+        .with_columns(
+            [
+                pl.when(pl.col("field_1").is_not_null())
+                .then(pl.col("field_1"))
+                .otherwise(
+                    pl.col("store_name")
+                    if "store_name" in base.columns
+                    else pl.lit(None)
+                )
+                .alias("store"),
+                pl.col("field_0").alias("seccion"),
+            ]
+        )
+        .group_by(["seccion", "store"])
+        .agg(
+            [
+                pl.col("y").sum().alias("sum_y"),
+                (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
+                pl.len().alias("n_with_sales"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.concat_str(
+                    [pl.col("seccion"), pl.col("store")], separator="||"
+                ).alias("unique_id"),
+                pl.col("seccion").alias("seccion"),
+            ]
+        )
+    )
+
+    # Calcular WMAPE para cada tienda
+    tienda_df = tienda_df.with_columns(
+        [(pl.col("sum_abs_error") / pl.col("sum_y")).alias("wmape")]
+    ).filter(pl.col("sum_y") != 0)
+
+    # Seleccionar y ordenar columnas
+    result = tienda_df.select(
+        [
+            "unique_id",
+            "wmape",
+            pl.col("sum_y").alias("sum_y"),
+            pl.col("n_with_sales"),
+        ]
+    )
+
+    # Añadir n_ds si es necesario
+    if has_ds:
+        result = _with_n_ds(result)
+    return result.select(schema.keys())
+
+
+def aggregate_wmape_by_sku(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Agrega WMAPE por nivel de SKU (agregando todas las tiendas que llevan ese SKU).
+    Excluye y==0/nulos y forecast_only del cálculo.
+    """
+    schema = {
+        "unique_id": pl.Utf8,
+        "wmape": pl.Float64,
+        "sum_y": pl.Float64,
+        "n_with_sales": pl.UInt32,
+        "n_ds": pl.UInt32,
+    }
+
+    if df.height == 0:
+        return pl.DataFrame(schema=schema)
+
+    has_ds = "ds" in df.columns
+    n_ds = None
+    if has_ds:
+        n_ds = (
+            df.select(["unique_id", "ds"])
+            .unique()
+            .group_by("unique_id")
+            .agg(pl.len().alias("n_ds"))
+        )
+
+    base = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+    if "period_type" in base.columns:
+        base = base.filter(pl.col("period_type") != "forecast_only")
+
+    def _with_n_ds(frame: pl.DataFrame) -> pl.DataFrame:
+        if n_ds is None:
+            return frame.with_columns(pl.lit(0).cast(pl.UInt32).alias("n_ds"))
+        return frame.join(n_ds, on="unique_id", how="left").with_columns(
+            pl.col("n_ds").fill_null(0).cast(pl.UInt32)
+        )
+
+    # Agrupar por sección y SKU para crear unique_id de SKU
+    sku_df = (
+        base.with_columns(pl.col("unique_id").str.split_exact("||", 2).alias("_parts"))
+        .unnest("_parts")
+        .with_columns(
+            [
+                pl.col("field_2").alias("sku"),
+                pl.col("field_0").alias("seccion"),
+            ]
+        )
+        .group_by(["seccion", "sku"])
+        .agg(
+            [
+                pl.col("y").sum().alias("sum_y"),
+                (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
+                pl.len().alias("n_with_sales"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.concat_str([pl.col("seccion"), pl.col("sku")], separator="||").alias(
+                    "unique_id"
+                ),
+                pl.col("seccion").alias("seccion"),
+            ]
+        )
+    )
+
+    # Calcular WMAPE para cada SKU (agregado por sección)
+    sku_df = sku_df.with_columns(
+        [(pl.col("sum_abs_error") / pl.col("sum_y")).alias("wmape")]
+    ).filter(pl.col("sum_y") != 0)
+
+    # Seleccionar y ordenar columnas
+    result = sku_df.select(
+        [
+            "unique_id",
+            "wmape",
+            pl.col("sum_y").alias("sum_y"),
+            pl.col("n_with_sales"),
+        ]
+    )
+
+    # Añadir n_ds si es necesario
+    if has_ds:
+        result = _with_n_ds(result)
+    return result.select(schema.keys())
+
+
 def wmape_por_id(
     ids: list[str],
     df: pl.DataFrame,
@@ -330,9 +553,7 @@ def wmape_por_id(
     n_fechas_spine = int(n_fechas_spine or 0)
 
     agg = aggregate_wmape_by_id(df).filter(pl.col("unique_id").is_in(ids))
-    missing = [
-        i for i in ids if i not in set(agg["unique_id"].to_list())
-    ]
+    missing = [i for i in ids if i not in set(agg["unique_id"].to_list())]
     if missing:
         agg = pl.concat(
             [
@@ -477,7 +698,9 @@ def resolve_horizons(
     if isinstance(first_d, dt.datetime):
         first_d = first_d.date()
     hz = settings.section_horizons(seccion, first_d)
-    train_end = meta_date_from_df(df_daily, "train_end", hz["train_end"], available_cols)
+    train_end = meta_date_from_df(
+        df_daily, "train_end", hz["train_end"], available_cols
+    )
     test_start = meta_date_from_df(
         df_daily, "test_start", hz["test_start"], available_cols
     )
@@ -488,9 +711,7 @@ def resolve_horizons(
         hz.get("forecast_start", hz["test_end"] + dt.timedelta(days=1)),
         available_cols,
     )
-    if fcst_start is None or (
-        isinstance(test_end, dt.date) and fcst_start <= test_end
-    ):
+    if fcst_start is None or (isinstance(test_end, dt.date) and fcst_start <= test_end):
         fcst_start = test_end + dt.timedelta(days=1) if test_end else fcst_start
     fcst_end = meta_date_from_df(
         df_daily, "forecast_end", hz["forecast_end"], available_cols
@@ -536,6 +757,7 @@ def build_chart_series(
     hist, fcst = split_hist_forecast(
         df_view, test_end, forecast_start, forecast_end, has_period
     )
+
     def _col(df, name):
         if name in df.columns and df.height:
             return df[name].to_list()
@@ -557,9 +779,7 @@ def build_chart_series(
 def detail_view(df: pl.DataFrame) -> pl.DataFrame:
     cols = [c for c in DETAIL_COLUMNS if c in df.columns]
     if "abs_error" not in cols and "y" in df.columns and "yhat" in df.columns:
-        df = df.with_columns(
-            (pl.col("y") - pl.col("yhat")).abs().alias("abs_error")
-        )
+        df = df.with_columns((pl.col("y") - pl.col("yhat")).abs().alias("abs_error"))
         cols = [c for c in DETAIL_COLUMNS if c in df.columns]
     return df.select(cols)
 
@@ -573,7 +793,6 @@ def ds_range(df: pl.DataFrame) -> tuple[dt.date | None, dt.date | None]:
     if isinstance(mx, dt.datetime):
         mx = mx.date()
     return mn, mx
-
 
 
 def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
@@ -599,14 +818,11 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
             if v != v:  # NaN
                 return ""
             return f"{round(float(v)):,}"
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return ""
 
     exprs = [
-        pl.col(c)
-        .map_elements(_fmt, return_dtype=pl.Utf8)
-        .alias(c)
-        for c in num_cols
+        pl.col(c).map_elements(_fmt, return_dtype=pl.Utf8).alias(c) for c in num_cols
     ]
     return df.with_columns(exprs)
 
@@ -616,9 +832,7 @@ def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:
     if df_view.height == 0 or "yhat28" not in df_view.columns:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
     scored = df_view.filter(
-        pl.col("y").is_not_null()
-        & (pl.col("y") != 0)
-        & pl.col("yhat28").is_not_null()
+        pl.col("y").is_not_null() & (pl.col("y") != 0) & pl.col("yhat28").is_not_null()
     )
     if scored.height == 0:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
@@ -657,6 +871,8 @@ class DashboardView:
     freq: str
     horizons: dict[str, dt.date | None]
     ranking_wmape: pl.DataFrame
+    ranking_tiendas: pl.DataFrame
+    ranking_skus: pl.DataFrame
     ranking_n_series: int
     ranking_total_points: int
     metrics: dict[str, dict[str, float | int]]
@@ -721,8 +937,7 @@ def _resolve_n_points(
         sub = ctx.per_id.filter(pl.col("unique_id").is_in(candidatos))
         if sub.height:
             n_data = int(sub["n_ds"].max())
-            if n_data > n_spine:
-                n_spine = n_data
+            n_spine = max(n_spine, n_data)
     return int(n_spine or 0)
 
 
@@ -767,6 +982,51 @@ def prepare_dashboard_state_from_context(
         ctx.per_id, selected_id, ctx.desc_map, n_points_total, candidatos=candidatos
     )
 
+    # Calcular ranking de tiendas (agregado por tienda)
+    # Use the full unit-level dataframe (ctx.unit_df) so aggregation
+    # computes store-level metrics from daily series, not from the
+    # pre-aggregated per_id frame.
+    tiendas_per_id = aggregate_wmape_by_tienda(unit_df)
+    # Filtrar por candidatos si se especificaron tiendas
+    if candidatos is not None:
+        # Extraer tiendas únicas de los candidatos
+        tiendas_candidatos = list(
+            set(cid.split("||")[1] for cid in candidatos if len(cid.split("||")) >= 2)
+        )
+        if tiendas_candidatos:
+            tiendas_per_id = tiendas_per_id.filter(
+                pl.col("unique_id").is_in(
+                    [f"{seccion}||{t}" for t in tiendas_candidatos]
+                )
+            )
+    ranking_tiendas = ranking_wmape_table(
+        tiendas_per_id,
+        "",
+        ctx.desc_map,
+        n_points_total,
+        candidatos=None,  # Ya filtrado arriba
+    )
+
+    # Calcular ranking de SKUs (agregado por SKU)
+    skus_per_id = aggregate_wmape_by_sku(unit_df)
+    # Filtrar por candidatos si se especificaron SKUs
+    if candidatos is not None:
+        # Extraer SKUs únicos de los candidatos
+        skus_candidatos = list(
+            set(cid.split("||")[2] for cid in candidatos if len(cid.split("||")) >= 3)
+        )
+        if skus_candidatos:
+            skus_per_id = skus_per_id.filter(
+                pl.col("unique_id").is_in([f"{seccion}||{s}" for s in skus_candidatos])
+            )
+    ranking_skus = ranking_wmape_table(
+        skus_per_id,
+        "",
+        ctx.desc_map,
+        n_points_total,
+        candidatos=None,  # Ya filtrado arriba
+    )
+
     metrics = metrics_in_out_total(df_view, cutoff, test_end or cutoff)
     metrics_28 = (
         metrics_rolling28(df_view)
@@ -793,6 +1053,8 @@ def prepare_dashboard_state_from_context(
         freq=freq,
         horizons=horizons,
         ranking_wmape=ranking_wmape,
+        ranking_tiendas=ranking_tiendas,
+        ranking_skus=ranking_skus,
         ranking_n_series=len(candidatos),
         ranking_total_points=n_points_total,
         metrics=metrics,
