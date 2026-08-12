@@ -569,17 +569,25 @@ class RLSForecastRunner:
         return float(np.exp(sigma2 / 2))
 
     def _default_priors(self, n_features: int):
-        return [RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)] + [
-            RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
-            for _ in range(max(0, n_features - 1))
-        ]
+        if RLSConstantPrior is None or RLSPrior is None:
+            raise RuntimeError("No se ha instanciado RLSConstantPrior ó RLSPrior")
+        else:
+            return [
+                RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
+            ] + [
+                RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
+                for _ in range(max(0, n_features - 1))
+            ]
 
     def _new_rls(self, min_y: float, return_all_coefs: bool = False):
-        return RecursiveLeastSquaresRegression(
-            forgetting_factor=self._forgetting_factor,
-            min_y_to_update=min_y,
-            return_all_coefs=return_all_coefs,
-        )
+        if RecursiveLeastSquaresRegression is None:
+            raise RuntimeError("No se ha instanciado RecursiveLeastSquaresRegression")
+        else:
+            return RecursiveLeastSquaresRegression(
+                forgetting_factor=self._forgetting_factor,
+                min_y_to_update=min_y,
+                return_all_coefs=return_all_coefs,
+            )
 
     # ── Fit único por serie (Fase 1) ────────────────────────────────────────
     def _fit_models(self, train_g: pl.DataFrame):
