@@ -1685,37 +1685,67 @@ class RLSForecastPipeline:
             )
             return res_section, pl.DataFrame(), driver_cols
 
-        # ── Tienda / sku / tienda+sku: derivado (sin RLS) ───────────────────
-        # 1 sola pasada vectorizada sobre TODO el panel (train+OOS+forecast)
-        # a la vez — ver `RLSForecastRunner.compute_derived_forecasts`.
-        panel_parts = [df_train.with_columns(pl.lit("in_sample").alias("period_type"))]
-        if df_oos.height:
-            panel_parts.append(df_oos.with_columns(pl.lit("out_sample").alias("period_type")))
-        if df_fcst.height:
-            panel_parts.append(df_fcst.with_columns(pl.lit("forecast_only").alias("period_type")))
-        panel_all = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
-        if meta:
-            panel_all = panel_all.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
+        # ── NUEVO: Ajustar RLS a nivel tienda (misma lógica que sección) ────────
+        # Obtener locales de la sección desde settings
+        locales = settings.SECCIONES[seccion]["locales"]
 
-        with _stage_timer(f"{seccion}: derivado tienda/sku (vectorizado, sin RLS)"):
-            res_derived = runner.compute_derived_forecasts(
-                panel_all, coefs, alpha=settings.SES_ALPHA
-            )
+        # Lista para almacenar resultados de tiendas
+        store_results = []
 
-        if res_derived.height:
-            res_derived = res_derived.with_columns(
-                pl.when(pl.col("period_type") == "forecast_only")
-                .then(0.0)
-                .otherwise(pl.col("y"))
-                .alias("y"),
-                pl.when(pl.col("period_type") == "forecast_only")
-                .then(0.0)
-                .otherwise(pl.col("value"))
-                .alias("value"),
-            )
+        # Ajustar RLS para cada tienda en la sección
+        for store_id in locales:
+            # Construir unique_id para la tienda
+            store_unique_id = settings.make_unique_id(seccion, store=store_id)
 
+            # Filtrar datos de entrenamiento para esta tienda
+            train_store = df_train.filter(pl.col("unique_id") == store_unique_id)
+
+            # Solo proceder si hay datos suficientes
+            if train_store.height == 0:
+                logger.warning(f"Sección {seccion}: Sin datos para tienda {store_id}")
+                continue
+
+            try:
+                # Ajustar RLS para esta tienda (misma configuración que sección)
+                store_res, _ = runner.fit_and_predict_sections(
+                    train_store,
+                    {name: df.filter(pl.col("unique_id") == store_unique_id) for name, df in targets.items()},
+                    [store_unique_id],
+                    desc=f"{seccion} tienda {store_id} RLS",
+                    meta=meta,
+                )
+
+                if store_res.height:
+                    # Aplicar el mismo post-procesamiento que para la sección
+                    store_res = store_res.with_columns(
+                        pl.when(pl.col("period_type") == "forecast_only")
+                        .then(0.0)
+                        .otherwise(pl.col("y"))
+                        .alias("y"),
+                        pl.when(pl.col("period_type") == "forecast_only")
+                        .then(0.0)
+                        .otherwise(pl.col("value"))
+                        .alias("value"),
+                        pl.lit(None).cast(pl.Float64).alias("driver_effect"),
+                        pl.lit(None).cast(pl.Float64).alias("driver_effect_value"),
+                    )
+                    store_results.append(store_res)
+
+            except Exception as exc:
+                logger.warning(f"Sección {seccion}: Error ajustando RLS para tienda {store_id}: {exc}")
+                continue
+
+        # Combinar resultados de todas las tiendas
+        res_store = pl.concat(store_results, how="diagonal_relaxed") if store_results else pl.DataFrame()
+        logger.info(f"Sección {seccion}: obtenidas {res_store.height} filas de pronósticos a nivel tienda")
+
+        # ── PARA EL MOMENTO: No calcular estimados a nivel tienda/sku ────────
+        # Esto significa que no hacemos derivación adicional (ni para SKU ni para tienda+SKU)
+        res_derived = pl.DataFrame()  # DataFrame vacío
+
+        # Combinar resultados de sección y tiendas
         res_df = pl.concat(
-            [f for f in (res_section, res_derived) if f.height], how="diagonal_relaxed"
+            [f for f in (res_section, res_store) if f.height], how="diagonal_relaxed"
         )
         if not res_df.height:
             return pl.DataFrame(), pl.DataFrame(), driver_cols
@@ -1727,7 +1757,17 @@ class RLSForecastPipeline:
         # absoluto (ni siquiera nulas) — el dashboard detecta si el
         # rolling28 fue calculado por la sola presencia de la columna.
         if getattr(settings, "COMPUTE_ROLLING_28", False):
-            panel_section = panel_all.filter(pl.col("unique_id") == seccion)
+            # Crear panel específico para la sección (train+OOS+forecast)
+            panel_parts_section = [df_train.with_columns(pl.lit("in_sample").alias("period_type"))]
+            if df_oos.height:
+                panel_parts_section.append(df_oos.with_columns(pl.lit("out_sample").alias("period_type")))
+            if df_fcst.height:
+                panel_parts_section.append(df_fcst.with_columns(pl.lit("forecast_only").alias("period_type")))
+            panel_all_section = pl.concat(panel_parts_section, how="diagonal_relaxed").sort(["unique_id", "ds"])
+            if meta:
+                panel_all_section = panel_all_section.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
+
+            panel_section = panel_all_section.filter(pl.col("unique_id") == seccion)
             logger.info(
                 "Sección %s: rolling 28d (solo nivel sección) sobre panel shape=%s…",
                 seccion,
