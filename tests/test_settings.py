@@ -89,28 +89,59 @@ def test_section_horizons_1():
     assert hz["forecast_end"] == dt.date(2026, 5, 26)
 
 
-def test_display_label_store_then_sku():
+def test_make_unique_id_and_split_roundtrip():
+    assert settings.make_unique_id("1") == "1"
+    assert settings.make_unique_id("1", store="00122") == "1||T:00122"
+    assert settings.make_unique_id("1", sku="SKU99") == "1||S:SKU99"
+    assert (
+        settings.make_unique_id("1", store="00122", sku="SKU99")
+        == "1||T:00122||S:SKU99"
+    )
+    # orden de construcción no importa; el id siempre es T antes de S
+    assert settings.make_unique_id("1", sku="SKU99", store="00122") == "1||T:00122||S:SKU99"
+
+    for uid, expected in [
+        ("1", {"seccion": "1", "store": None, "sku": None}),
+        ("1||T:00122", {"seccion": "1", "store": "00122", "sku": None}),
+        ("1||S:SKU99", {"seccion": "1", "store": None, "sku": "SKU99"}),
+        (
+            "1||T:00122||S:SKU99",
+            {"seccion": "1", "store": "00122", "sku": "SKU99"},
+        ),
+    ]:
+        assert settings.split_unique_id(uid) == expected
+
+
+def test_display_label_all_combinations():
     assert "Sección" in settings.display_label("1")
-    # tienda
-    lbl_store = settings.display_label("1||00122", store_name="CENTRAL")
+
+    lbl_store = settings.display_label("1||T:00122", store_name="CENTRAL")
     assert "00122" in lbl_store
     assert "CENTRAL" in lbl_store
     assert not lbl_store.startswith("1||")
-    # sku
-    lbl_sku = settings.display_label(
-        "1||00122||SKU99", sku_desc="LECHE", store_name="CENTRAL"
+
+    lbl_sku_only = settings.display_label("1||S:SKU99", sku_desc="LECHE")
+    assert "SKU99" in lbl_sku_only
+    assert "LECHE" in lbl_sku_only
+    assert "@" not in lbl_sku_only  # sin tienda no hay "@ tienda"
+
+    lbl_combo = settings.display_label(
+        "1||T:00122||S:SKU99", sku_desc="LECHE", store_name="CENTRAL"
     )
-    assert "SKU99" in lbl_sku
-    assert "LECHE" in lbl_sku
+    assert "SKU99" in lbl_combo
+    assert "LECHE" in lbl_combo
+    assert "00122" in lbl_combo
+    assert "CENTRAL" in lbl_combo
 
 
 def test_ranking_code_and_description():
     assert settings.ranking_code("1") == "1"
-    assert settings.ranking_code("1||00122") == "00122"
-    assert settings.ranking_code("1||00122||SKU9") == "SKU9"
-    assert settings.ranking_description("1||00122", store_name="CENTRAL") == "CENTRAL"
+    assert settings.ranking_code("1||T:00122") == "00122"
+    assert settings.ranking_code("1||S:SKU9") == "SKU9"
+    assert settings.ranking_code("1||T:00122||S:SKU9") == "00122"  # prioridad tienda
+    assert settings.ranking_description("1||T:00122", store_name="CENTRAL") == "CENTRAL"
     assert (
-        settings.ranking_description("1||00122||SKU9", sku_desc="LECHE") == "LECHE"
+        settings.ranking_description("1||S:SKU9", sku_desc="LECHE") == "LECHE"
     )
 
 
@@ -120,4 +151,3 @@ def test_levels_order():
         "STORE_ID",
         "SKU_ID",
     ]
-

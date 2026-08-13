@@ -2,7 +2,6 @@
 Configuración central del proyecto de forecasting jerárquico RLS.
 Secciones 1 y 23 · niveles: sección → SKU → local (tienda).
 """
-
 from __future__ import annotations
 
 import datetime as dt
@@ -40,11 +39,24 @@ TEST_START = dt.date(2025, 11, 1)
 TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
 ROLLING_HORIZON_DAYS = 28  # yhat28 / valuehat28 walk-forward
-# Rolling 28d es OPT-IN: por defecto NO se calcula (ahorra el walk-forward
-# sobre toda la historia de todas las series). Si se habilita, el parquet
-# incluye yhat28/valuehat28 y el dashboard muestra el multiselect de series,
-# la línea verde y las métricas WMAPE₂₈/BIAS₂₈.
-COMPUTE_ROLLING28 = False
+COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat28
+                             # (el dashboard detecta la ausencia de estas
+                             # columnas en el parquet para ocultar el control
+                             # de selección de series y la sección de métricas
+                             # rolling28; ver README § Rolling 28d). Desde el
+                             # cambio de arquitectura (RLS solo a nivel
+                             # sección), el rolling28 SOLO se calcula para los
+                             # nodos de sección — ver README § Modelo jerárquico.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modelo jerárquico: RLS solo a nivel sección; tienda/sku/tienda+sku se
+# derivan sin RLS (efecto de drivers + suavización exponencial sobre el
+# residuo). Ver README § Modelo jerárquico para el detalle del método.
+# ─────────────────────────────────────────────────────────────────────────────
+SES_ALPHA = 0.1  # alpha fijo de la suavización exponencial simple (SES)
+                 # aplicada sobre "y_neto" (y menos el efecto de los drivers
+                 # de la sección) para obtener yhat en nodos tienda/sku/
+                 # tienda+sku. Fijo (no auto-tuneado) por velocidad.
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
 FECHAS_TEST = (TEST_START, TEST_END)
@@ -280,7 +292,8 @@ def section_horizons(seccion: str, first_data: dt.date | None = None) -> dict:
     forecast_end = cfg.get("forecast_end") or (
         test_end + dt.timedelta(days=METRIC_HORIZON_DAYS)
     )
-    forecast_end = max(forecast_end, forecast_start)
+    if forecast_end < forecast_start:
+        forecast_end = forecast_start
     return {
         "train_start": train_start,
         "train_end": train_end,
@@ -295,6 +308,40 @@ def section_horizons(seccion: str, first_data: dt.date | None = None) -> dict:
     }
 
 
+def make_unique_id(
+    seccion: str, store: str | None = None, sku: str | None = None
+) -> str:
+    """
+    Construye el unique_id según el nuevo esquema de filtros independientes
+    (tienda y sku ya no son jerárquicos entre sí, pueden combinarse en
+    cualquier orden):
+      - "1"                    → sección
+      - "1||T:00122"           → sección + tienda (todos los SKU)
+      - "1||S:SKU123"          → sección + sku (todas las tiendas)
+      - "1||T:00122||S:SKU123" → sección + tienda + sku
+    El orden interno del id siempre es T antes de S (canónico), sin importar
+    el orden en que el usuario haya elegido los filtros en la UI.
+    """
+    parts = [seccion]
+    if store is not None:
+        parts.append(f"T:{store}")
+    if sku is not None:
+        parts.append(f"S:{sku}")
+    return "||".join(parts)
+
+
+def split_unique_id(unique_id: str) -> dict[str, str | None]:
+    """Descompone unique_id en seccion / store / sku (esquema T:/S: — ver `make_unique_id`)."""
+    parts = unique_id.split("||")
+    out: dict[str, str | None] = {"seccion": parts[0], "store": None, "sku": None}
+    for p in parts[1:]:
+        if p.startswith("T:"):
+            out["store"] = p[2:]
+        elif p.startswith("S:"):
+            out["sku"] = p[2:]
+    return out
+
+
 def display_label(
     unique_id: str,
     sku_desc: str | None = None,
@@ -302,46 +349,34 @@ def display_label(
 ) -> str:
     """
     Etiqueta visible sin código de sección.
-    Jerarquía: sección → tienda → SKU
-    - sección: "1" / "23"
-    - tienda:  "00122 — CENTRAL"
-    - SKU:     "SKU123 — DESCRIPCION"
+    - sección:          "Sección 1"
+    - tienda:            "00122 — CENTRAL"
+    - sku (todas tiendas): "SKU123 — DESCRIPCION"
+    - tienda + sku:      "SKU123 — DESCRIPCION @ 00122 — CENTRAL"
     """
-    parts = unique_id.split("||")
-    if len(parts) == 1:
-        return f"Sección {parts[0]}"
-    if len(parts) == 2:
-        # sección||tienda
-        store = parts[1]
-        if store_name:
-            return f"{store} — {store_name}"
-        return store
-    # sección||tienda||sku
-    store, sku = parts[1], parts[2]
-    if sku_desc:
-        return f"{sku} — {sku_desc}"
-    return sku
+    p = split_unique_id(unique_id)
+    store, sku = p["store"], p["sku"]
+    if store is None and sku is None:
+        return f"Sección {p['seccion']}"
 
+    store_part = f"{store} — {store_name}" if store_name else store
+    sku_part = f"{sku} — {sku_desc}" if sku_desc else sku
 
-def split_unique_id(unique_id: str) -> dict[str, str | None]:
-    """Descompone unique_id en seccion / store / sku según la jerarquía actual."""
-    parts = unique_id.split("||")
-    out: dict[str, str | None] = {"seccion": parts[0], "store": None, "sku": None}
-    if len(parts) >= 2:
-        out["store"] = parts[1]
-    if len(parts) >= 3:
-        out["sku"] = parts[2]
-    return out
+    if store is not None and sku is None:
+        return store_part
+    if store is None and sku is not None:
+        return sku_part
+    return f"{sku_part} @ {store_part}"
 
 
 def ranking_code(unique_id: str) -> str:
-    """Código visible en ranking (sin sección): tienda o sku."""
-    parts = unique_id.split("||")
-    if len(parts) == 1:
-        return parts[0]
-    if len(parts) == 2:
-        return parts[1]  # store
-    return parts[2]  # sku
+    """Código visible en ranking (sin sección): prioridad tienda > sku."""
+    p = split_unique_id(unique_id)
+    if p["store"] is not None:
+        return p["store"]
+    if p["sku"] is not None:
+        return p["sku"]
+    return p["seccion"]
 
 
 def ranking_description(
@@ -350,12 +385,14 @@ def ranking_description(
     store_name: str | None = None,
 ) -> str:
     """Descripción para ranking: nombre de tienda o DESCRIPCION de SKU."""
-    parts = unique_id.split("||")
-    if len(parts) == 1:
-        return f"Sección {parts[0]}"
-    if len(parts) == 2:
+    p = split_unique_id(unique_id)
+    if p["store"] is not None and p["sku"] is None:
         return store_name or ""
-    return sku_desc or ""
+    if p["sku"] is not None and p["store"] is None:
+        return sku_desc or ""
+    if p["store"] is not None and p["sku"] is not None:
+        return sku_desc or store_name or ""
+    return f"Sección {p['seccion']}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,7 +1,17 @@
 """
 Pipeline de forecasting jerárquico con Regresión RLS
 =====================================================
-Niveles: sección (1 / 23) → SKU → local (tienda).
+Niveles: sección (1 / 23), con dos FILTROS INDEPENDIENTES (no jerárquicos)
+por debajo: tienda y SKU — cualquiera puede estar vacío, uno solo, o ambos
+a la vez (ver settings.make_unique_id / README § Filtros independientes).
+
+Modelo jerárquico (ver README § Modelo jerárquico):
+  - RLS se ajusta ÚNICAMENTE a nivel sección (2 modelos: variable y,
+    variable precio).
+  - Tienda / SKU / tienda+SKU se DERIVAN sin RLS: efecto de drivers (con
+    los coeficientes de la sección) + suavización exponencial simple (SES)
+    causal sobre el residuo ("y_neto"). Totalmente vectorizado con Polars,
+    sin loop por serie — ver `RLSForecastRunner.compute_derived_forecasts`.
 
 Ventanas por sección (SECCIONES):
   - train: [train_start, train_end]  train_end = test_start original
@@ -10,25 +20,25 @@ Ventanas por sección (SECCIONES):
   - test (OOS): lunes ≥ test_start → test_end  → métricas out-of-sample
   - forecast-only: test_end+1 → test_end+28  (sin actuals, línea punteada)
 
-100% Polars + numpy. OOP, paralelizable por unique_id (threads: numba libera
-el GIL en `_rls` / `decompose_price`, así que ThreadPoolExecutor da
-paralelismo real sin el costo de pickling de DataFrames Polars entre
-procesos).
+100% Polars + numpy. Los 1-2 fits RLS por sección corren secuencial (son
+pocas series); el resto de las series (tienda/sku/tienda+sku) es una sola
+operación vectorizada, sin paralelismo por serie necesario.
 
 Rendimiento (ver README § Rendimiento para detalle y benchmarks):
-  - 1 solo fit por serie/variable (antes: 3 fits redundantes sobre train
-    para in-sample / OOS / forecast-only).
+  - RLS solo a nivel sección: de miles de fits (uno por serie) a solo 2-4
+    fits totales por sección — el resto se deriva vectorizado.
   - EDP vectorizado en una sola llamada numba con `indexors` (antes: 1
     llamada numba por serie vía loop Python).
   - Rolling 28d: 1 fit por serie con `return_all_coefs=True`, walk-forward
-    O(n) leyendo el vector de coeficientes vigente en cada bloque (antes:
-    hasta 2 reajustes completos por bloque de 28 días → O(n²)).
+    O(n) leyendo el vector de coeficientes vigente en cada bloque. Es
+    **opcional** vía `settings.COMPUTE_ROLLING_28` (default: `False`) y,
+    desde el modelo jerárquico, limitado al nivel sección (único nivel con
+    RLS real); si está desactivado no se agregan `yhat28`/`valuehat28`.
   - `--limit-series N` para iterar rápido en desarrollo sin correr el
     dataset completo.
   - Checkpoint por sección (`forecast_seccion_<n>_partial.parquet`) para no
     perder trabajo si el proceso se corta.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -122,7 +132,6 @@ class ForecastConfig:
     holidays: dict
     current_zone: str
     id_ejecucion: str
-    compute_rolling28: bool = False
     now_year: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -146,7 +155,6 @@ class ForecastConfig:
             holidays=settings.HOLIDAYS,
             current_zone=settings.CURRENT_ZONE,
             id_ejecucion=settings.ID_EJECUCION,
-            compute_rolling28=settings.COMPUTE_ROLLING28,
         )
 
 
@@ -331,19 +339,9 @@ class CalendarFeatureBuilder:
         feats = self._calendar_dummies(dates)
         # columnas de drivers (excluir ids de negocio)
         _exclude = {
-            "ds",
-            "y",
-            "unique_id",
-            "value",
-            "valuehat",
-            "conteo_sku",
-            "sku_desc",
-            "store_name",
-            "seccion",
-            "intercept",
-            "asp",
-            "edp",
-            "discount",
+            "ds", "y", "unique_id", "value", "valuehat", "conteo_sku",
+            "sku_desc", "store_name", "seccion", "intercept",
+            "asp", "edp", "discount",
         }
         if req_columns is None:
             req_columns = [c for c in feats.columns if c not in _exclude]
@@ -362,10 +360,11 @@ class CalendarFeatureBuilder:
 # ─────────────────────────────────────────────────────────────────────────────
 class DataAggregator:
     """
-    unique_id (sección → tienda → SKU):
-      - "1"                  (sección)
-      - "1||00122"           (tienda)
-      - "1||00122||SKU123"   (SKU en tienda)
+    unique_id — filtros independientes tienda/sku (ver settings.make_unique_id):
+      - "1"                      (sección)
+      - "1||T:00122"             (tienda, todos los SKU)
+      - "1||S:SKU123"            (sku, todas las tiendas)
+      - "1||T:00122||S:SKU123"   (tienda + sku)
     Columnas extra: sku_desc, store_name, seccion
     """
 
@@ -381,6 +380,14 @@ class DataAggregator:
         self._prc_col = price_column
         self._levels = aggregation_levels
 
+    @staticmethod
+    def _base_aggs() -> list[pl.Expr]:
+        return [
+            pl.col("y").sum(),
+            pl.col("value").sum(),
+            pl.count("y").alias("conteo_sku"),
+        ]
+
     def aggregate(self, df: pl.DataFrame) -> pl.DataFrame:
         rename_map = {
             self._date_col: "ds",
@@ -394,104 +401,107 @@ class DataAggregator:
             if col in df.columns:
                 df = df.with_columns(pl.col(col).cast(pl.Utf8).str.strip_chars())
 
-        # Mapas de descripción
-        sku_desc_map: dict[str, str] = {}
+        # Mapas de descripción (se adjuntan ANTES de agregar, para no tener
+        # que reconstruirlos parseando el unique_id después).
+        sku_desc_df = pl.DataFrame(
+            schema={"SKU_ID": pl.Utf8, "sku_desc": pl.Utf8}
+        )
         if "DESCRIPCION" in df.columns:
-            tmp = (
+            sku_desc_df = (
                 df.select(["SKU_ID", "DESCRIPCION"])
                 .drop_nulls()
                 .unique(subset=["SKU_ID"])
-            )
-            sku_desc_map = dict(
-                zip(tmp["SKU_ID"].to_list(), tmp["DESCRIPCION"].to_list())
+                .rename({"DESCRIPCION": "sku_desc"})
             )
 
-        store_name_map: dict[tuple[str, str], str] = {}
-        for sec, cfg in settings.SECCIONES.items():
-            for loc, name in cfg["local_names"].items():
-                store_name_map[(sec, loc)] = name
-
-        frames: list[pl.DataFrame] = []
-        level_keys = list(self._levels.keys())  # SECCION, SKU_ID, STORE_ID
-
-        for depth in range(1, len(level_keys) + 1):
-            keys = level_keys[:depth]
-            id_expr = pl.concat_str([pl.col(k) for k in keys], separator="||")
-            agg_exprs = [
-                pl.col("y").sum(),
-                pl.col("value").sum(),
-                pl.count("y").alias("conteo_sku"),
-            ]
-            sum_df = (
-                df.group_by(["ds"] + keys)
-                .agg(agg_exprs)
-                .with_columns(
-                    id_expr.alias("unique_id"),
-                    pl.col("SECCION").alias("seccion"),
-                )
-            )
-            frames.append(sum_df)
-
-        out = (
-            pl.concat(frames, how="diagonal_relaxed")
-            .with_columns(pl.lit(1).alias("intercept"))
-            .sort(["unique_id", "ds"])
-        )
-
-        # Enriquecer descripciones: unique_id = sec || store || sku
-        uids_df = out.select("unique_id").unique()
-        parts = uids_df.with_columns(
-            pl.col("unique_id").str.split_exact("||", 2).alias("_p")
-        ).unnest("_p")
-        # field_0=seccion, field_1=store, field_2=sku
-        rename = {}
-        cols = parts.columns
-        for i, name in enumerate(["_sec", "_store", "_sku"]):
-            src = f"field_{i}"
-            if src in cols:
-                rename[src] = name
-        parts = parts.rename(rename) if rename else parts
-
-        sku_df = (
-            pl.DataFrame(
-                {
-                    "_sku": list(sku_desc_map.keys()),
-                    "sku_desc": list(sku_desc_map.values()),
-                }
-            )
-            if sku_desc_map
-            else pl.DataFrame(schema={"_sku": pl.Utf8, "sku_desc": pl.Utf8})
-        )
         store_rows = [
-            {"_sec": sec, "_store": loc, "store_name": name}
-            for (sec, loc), name in store_name_map.items()
+            {"SECCION": sec, "STORE_ID": loc, "store_name": name}
+            for sec, cfg in settings.SECCIONES.items()
+            for loc, name in cfg["local_names"].items()
         ]
-        store_df = (
+        store_name_df = (
             pl.DataFrame(store_rows)
             if store_rows
             else pl.DataFrame(
-                schema={"_sec": pl.Utf8, "_store": pl.Utf8, "store_name": pl.Utf8}
+                schema={"SECCION": pl.Utf8, "STORE_ID": pl.Utf8, "store_name": pl.Utf8}
             )
         )
 
-        meta = parts
-        if "_sku" in meta.columns:
-            meta = meta.join(sku_df, on="_sku", how="left")
-        else:
-            meta = meta.with_columns(pl.lit("").alias("sku_desc"))
-        if "_sec" in meta.columns and "_store" in meta.columns:
-            meta = meta.join(store_df, on=["_sec", "_store"], how="left")
-        else:
-            meta = meta.with_columns(pl.lit("").alias("store_name"))
+        base_aggs = self._base_aggs()
 
-        meta = meta.select(
-            [
-                "unique_id",
-                pl.col("sku_desc").fill_null(""),
-                pl.col("store_name").fill_null(""),
-            ]
+        # 1) sección
+        lvl_sec = (
+            df.group_by(["ds", "SECCION"])
+            .agg(base_aggs)
+            .with_columns(
+                pl.col("SECCION").alias("unique_id"),
+                pl.col("SECCION").alias("seccion"),
+                pl.lit("").alias("sku_desc"),
+                pl.lit("").alias("store_name"),
+            )
         )
-        out = out.join(meta, on="unique_id", how="left")
+
+        # 2) sección + tienda (todos los SKU)
+        lvl_store = (
+            df.group_by(["ds", "SECCION", "STORE_ID"])
+            .agg(base_aggs)
+            .with_columns(
+                pl.concat_str(
+                    [pl.col("SECCION"), pl.lit("||T:"), pl.col("STORE_ID")]
+                ).alias("unique_id"),
+                pl.col("SECCION").alias("seccion"),
+                pl.lit("").alias("sku_desc"),
+            )
+            .join(store_name_df, on=["SECCION", "STORE_ID"], how="left")
+            .with_columns(pl.col("store_name").fill_null(""))
+        )
+
+        # 3) sección + sku (todas las tiendas)
+        lvl_sku = (
+            df.group_by(["ds", "SECCION", "SKU_ID"])
+            .agg(base_aggs)
+            .with_columns(
+                pl.concat_str(
+                    [pl.col("SECCION"), pl.lit("||S:"), pl.col("SKU_ID")]
+                ).alias("unique_id"),
+                pl.col("SECCION").alias("seccion"),
+                pl.lit("").alias("store_name"),
+            )
+            .join(sku_desc_df, on="SKU_ID", how="left")
+            .with_columns(pl.col("sku_desc").fill_null(""))
+        )
+
+        # 4) sección + tienda + sku
+        lvl_store_sku = (
+            df.group_by(["ds", "SECCION", "STORE_ID", "SKU_ID"])
+            .agg(base_aggs)
+            .with_columns(
+                pl.concat_str(
+                    [
+                        pl.col("SECCION"),
+                        pl.lit("||T:"),
+                        pl.col("STORE_ID"),
+                        pl.lit("||S:"),
+                        pl.col("SKU_ID"),
+                    ]
+                ).alias("unique_id"),
+                pl.col("SECCION").alias("seccion"),
+            )
+            .join(store_name_df, on=["SECCION", "STORE_ID"], how="left")
+            .join(sku_desc_df, on="SKU_ID", how="left")
+            .with_columns(
+                pl.col("store_name").fill_null(""),
+                pl.col("sku_desc").fill_null(""),
+            )
+        )
+
+        out = (
+            pl.concat(
+                [lvl_sec, lvl_store, lvl_sku, lvl_store_sku], how="diagonal_relaxed"
+            )
+            .with_columns(pl.lit(1).alias("intercept"))
+            .sort(["unique_id", "ds"])
+        )
         return out.select(
             [
                 c
@@ -516,17 +526,21 @@ class DataAggregator:
 # ─────────────────────────────────────────────────────────────────────────────
 class RLSForecastRunner:
     """
-    Ajusta y predice modelos RLS por serie (unique_id).
+    Ajusta RLS SOLO a nivel sección; deriva tienda/sku/tienda+sku sin RLS.
 
-    Diseño de rendimiento (Fase 1 + 4):
-      - `fit_and_predict_multi` hace **1 solo fit** por serie (variable y,
-        variable precio) y predice sobre todos los targets pedidos
-        (in_sample / out_sample / forecast_only), en vez de 1 fit por
-        target como antes.
-      - El loop por serie corre en `ThreadPoolExecutor`: los kernels
-        numba (`_rls`, `decompose_price`) son `nopython=True` y liberan el
-        GIL, por lo que threads dan paralelismo real sin el costo de
-        pickling de DataFrames Polars que exige `ProcessPoolExecutor`.
+    Modelo jerárquico (ver README § Modelo jerárquico para el detalle):
+      - `fit_and_predict_sections`: RLS real, únicamente para los 1-2 ids
+        de nivel sección. Son pocas series, corre secuencial.
+      - `compute_derived_forecasts`: para TODO lo demás (tienda, sku,
+        tienda+sku) — sin ajustar ningún RLS. Efecto de drivers (con los
+        coeficientes ya ajustados a nivel sección) + suavización
+        exponencial simple (SES) causal sobre el residuo. Totalmente
+        vectorizado con Polars (matmul + `ewm_mean`), sin loop por serie y
+        sin threads (no hay nada que paralelizar por serie en este camino).
+      - `run_rolling_28` / `_rolling_28_one`: opcional (`settings.
+        COMPUTE_ROLLING_28`), limitado al nivel sección (único nivel con
+        RLS real) — usa `ThreadPoolExecutor` porque el kernel numba `_rls`
+        libera el GIL.
     """
 
     def __init__(
@@ -554,7 +568,9 @@ class RLSForecastRunner:
         return float(np.exp(sigma2 / 2))
 
     def _default_priors(self, n_features: int):
-        return [RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)] + [
+        return [
+            RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)
+        ] + [
             RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
             for _ in range(max(0, n_features - 1))
         ]
@@ -627,11 +643,7 @@ class RLSForecastRunner:
             pricehat = np.expm1(log_pricehat)
         pricehat = np.round(pricehat, 2).ravel()
 
-        y_real = (
-            test_g["y"].to_numpy()
-            if "y" in test_g.columns
-            else np.zeros(len(yhat_test))
-        )
+        y_real = test_g["y"].to_numpy() if "y" in test_g.columns else np.zeros(len(yhat_test))
         price_real = (
             test_g["value"].to_numpy()
             if "value" in test_g.columns
@@ -683,53 +695,52 @@ class RLSForecastRunner:
     def _workers(self) -> int:
         return self._n_jobs if self._n_jobs and self._n_jobs > 1 else 1
 
-    # ── Fit + predicción multi-target (Fase 1 + 4) ──────────────────────────
-    def fit_and_predict_multi(
+    # ── RLS SOLO a nivel sección ─────────────────────────────────────────
+    def fit_and_predict_sections(
         self,
         train: pl.DataFrame,
         targets: dict[str, pl.DataFrame],
-        forecast_levels: list[str],
-        desc: str = "Ajustando RLS",
+        section_ids: list[str],
+        desc: str = "RLS sección",
         meta: dict | None = None,
-    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    ) -> tuple[pl.DataFrame, dict[str, tuple[np.ndarray, np.ndarray]]]:
         """
-        Ajusta el modelo UNA vez por serie (sobre `train`) y predice sobre
-        todos los `targets` (dict period_type -> DataFrame de test).
+        Ajusta RLS ÚNICAMENTE para los `section_ids` dados (nivel sección —
+        con el nuevo modelo jerárquico, RLS ya no se ajusta a nivel tienda/
+        sku/tienda+sku, ver `compute_derived_forecasts`). Son 1-2 series por
+        sección, así que corre secuencial (no hace falta ThreadPoolExecutor
+        acá; el paralelismo real está en `compute_derived_forecasts`, que es
+        una sola operación vectorizada sobre todas las demás series).
 
-        Antes: 1 fit por target (in_sample/out_sample/forecast_only) → 3
-        fits redundantes sobre los mismos datos de train. Ahora: 1 fit,
-        N predicciones.
+        Devuelve (res_df, coefs) donde `coefs[section_id] = (coef_y, coef_p)`
+        son los arrays de coeficientes ajustados (mismo orden que
+        `self._driver_cols` / `self._driver_cols_price`) — insumo para
+        `compute_derived_forecasts`.
         """
-        unique_ids = self._build_tasks(train, forecast_levels)
-        logger.info("%s: %d series a ajustar", desc, len(unique_ids))
-        if not unique_ids:
-            return pl.DataFrame(), pl.DataFrame()
-
-        needed = set(unique_ids)
-        train_f = train.filter(pl.col("unique_id").is_in(list(needed)))
         train_parts = self._normalize_partition_dict(
-            train_f.partition_by("unique_id", as_dict=True)
+            train.partition_by("unique_id", as_dict=True)
         )
-        target_parts: dict[str, dict] = {}
-        for name, df in targets.items():
-            if df.height == 0:
-                target_parts[name] = {}
-                continue
-            df_f = df.filter(pl.col("unique_id").is_in(list(needed)))
-            target_parts[name] = self._normalize_partition_dict(
-                df_f.partition_by("unique_id", as_dict=True)
-            )
+        target_parts = {
+            name: self._normalize_partition_dict(df.partition_by("unique_id", as_dict=True))
+            for name, df in targets.items()
+            if df.height
+        }
 
-        def _task(uid: str) -> list[pl.DataFrame]:
+        results: list[pl.DataFrame] = []
+        coefs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for uid in section_ids:
             train_g = train_parts.get(uid)
             if train_g is None or train_g.height == 0:
-                return []
+                continue
             try:
                 model_y, model_p = self._fit_models(train_g)
-            except Exception as exc:  # serie degenerada: se loguea y se salta
+            except Exception as exc:
                 logger.warning("%s: fit falló para %s: %s", desc, uid, exc)
-                return []
-            frames: list[pl.DataFrame] = []
+                continue
+            coefs[uid] = (
+                np.asarray(model_y.final_coef_[0], dtype=np.float64).ravel(),
+                np.asarray(model_p.final_coef_[0], dtype=np.float64).ravel(),
+            )
             for name, parts in target_parts.items():
                 test_g = parts.get(uid)
                 if test_g is None or test_g.height == 0:
@@ -744,50 +755,130 @@ class RLSForecastRunner:
                     )
                     continue
                 if frame is not None and frame.height:
-                    frames.append(frame.with_columns(pl.lit(name).alias("period_type")))
-            return frames
+                    results.append(frame.with_columns(pl.lit(name).alias("period_type")))
 
-        results: list[pl.DataFrame] = []
-        with ThreadPoolExecutor(max_workers=self._workers()) as executor:
-            futures = {executor.submit(_task, uid): uid for uid in unique_ids}
-            for fut in tqdm(
-                as_completed(futures), total=len(futures), desc=desc, unit="serie"
-            ):
-                results.extend(fut.result())
+        res_df = pl.concat(results, how="diagonal_relaxed") if results else pl.DataFrame()
+        return res_df, coefs
 
-        if not results:
-            return pl.DataFrame(), pl.DataFrame()
-
-        res_df = pl.concat(results, how="diagonal_relaxed")
-        wm_frames = []
-        for name in targets:
-            sub = res_df.filter(pl.col("period_type") == name)
-            if sub.height:
-                wm = self._compute_wmape(sub)
-                if wm.height:
-                    wm_frames.append(wm)
-        wmapes_df = (
-            pl.concat(wm_frames, how="diagonal_relaxed")
-            if wm_frames
-            else pl.DataFrame()
+    # ── Tienda / sku / tienda+sku: SIN RLS — efecto de drivers + SES ───────
+    @staticmethod
+    def _apply_causal_ses(df: pl.DataFrame, src_col: str, out_col: str, alpha: float) -> pl.DataFrame:
+        """
+        SES causal (`s(t-1)`, no `s(t)`) por unique_id sobre `src_col`,
+        vectorizado con `pl.Expr.ewm_mean` (nativo de Polars, sin loop por
+        serie y sin numba):
+          - Filas "actuales" (period_type != forecast_only): la predicción
+            de cada fecha usa el estado suavizado HASTA el día anterior
+            (`shift(1)`), nunca el valor de la propia fecha — mismo
+            principio de causalidad que ya se usa en el rolling28.
+          - Filas forecast_only: se propaga CONSTANTE el último estado
+            suavizado conocido de la parte actual (propiedad estándar de una
+            SES a cualquier horizonte de forecast).
+        La primera fila de cada serie (sin día anterior) usa el propio
+        estado inicial de la SES (que Polars siembra con el primer valor),
+        equivalente a "sin modelo, se usa el propio dato" para ese único
+        punto sin historia.
+        """
+        df = df.sort(["unique_id", "ds"])
+        has_period = "period_type" in df.columns
+        is_actual_expr = (
+            (pl.col("period_type") != "forecast_only") if has_period else pl.lit(True)
         )
-        return res_df, wmapes_df
 
-    def run(
+        actual = df.filter(is_actual_expr).with_columns(
+            pl.col(src_col).ewm_mean(alpha=alpha, adjust=False).over("unique_id").alias("_s")
+        )
+        last_state = actual.group_by("unique_id").agg(pl.col("_s").last().alias("_last_s"))
+        actual = actual.with_columns(
+            pl.col("_s").shift(1).over("unique_id").fill_null(pl.col("_s")).alias(out_col)
+        ).drop("_s")
+
+        if has_period:
+            forecast = df.filter(~is_actual_expr)
+            if forecast.height:
+                forecast = forecast.join(last_state, on="unique_id", how="left").with_columns(
+                    pl.col("_last_s").fill_null(0.0).alias(out_col)
+                ).drop("_last_s")
+                return pl.concat([actual, forecast], how="diagonal_relaxed").sort(
+                    ["unique_id", "ds"]
+                )
+        return actual.sort(["unique_id", "ds"])
+
+    def compute_derived_forecasts(
         self,
-        train: pl.DataFrame,
-        test: pl.DataFrame,
-        forecast_levels: list[str],
-        desc: str = "Ajustando RLS",
-        meta: dict | None = None,
-    ) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """Compat: fit + predict sobre un único target. Ver `fit_and_predict_multi`."""
-        res_df, wmapes_df = self.fit_and_predict_multi(
-            train, {"_default": test}, forecast_levels, desc=desc, meta=meta
-        )
-        if res_df.height and "period_type" in res_df.columns:
-            res_df = res_df.drop("period_type")
-        return res_df, wmapes_df
+        panel: pl.DataFrame,
+        coefs: dict[str, tuple[np.ndarray, np.ndarray]],
+        alpha: float,
+    ) -> pl.DataFrame:
+        """
+        yhat/valuehat para TODOS los nodos que NO son de sección (tienda,
+        sku, tienda+sku) — sin ajustar ningún RLS. Procedimiento (ver README
+        § Modelo jerárquico):
+
+          1. efecto(t)  = drivers_propios_del_nodo(t) · coef_sección  (sin
+             intercepto; "coef_sección" son los coeficientes del RLS ya
+             ajustado a nivel sección, en `coefs`).
+          2. y_neto(t)  = y(t) − efecto(t)               (mismo para value).
+          3. y_neto_hat(t) = SES causal sobre y_neto      (`_apply_causal_ses`).
+          4. yhat(t)    = y_neto_hat(t) + efecto(t).
+
+        Totalmente vectorizado con Polars (matmul de drivers + `ewm_mean`)
+        sobre TODAS las series a la vez — sin loop por serie, sin numba, sin
+        threads: no hay nada que paralelizar por serie en este camino.
+        """
+        if panel.height == 0:
+            return pl.DataFrame()
+
+        non_section = panel.filter(pl.col("unique_id").str.contains(r"\|\|"))
+        if non_section.height == 0:
+            return pl.DataFrame()
+
+        # Drivers sin intercepto, identificados por NOMBRE (no por posición
+        # — no asumimos que "intercept" sea la primera columna).
+        idx_y = [i for i, c in enumerate(self._driver_cols) if c != "intercept"]
+        cols_y = [self._driver_cols[i] for i in idx_y]
+        idx_p = [i for i, c in enumerate(self._driver_cols_price) if c != "intercept"]
+        cols_p = [self._driver_cols_price[i] for i in idx_p]
+
+        frames = []
+        for seccion, (coef_y_full, coef_p_full) in coefs.items():
+            sub = non_section.filter(pl.col("unique_id").str.starts_with(f"{seccion}||"))
+            if sub.height == 0:
+                continue
+            coef_y = coef_y_full[idx_y]
+            coef_p = coef_p_full[idx_p]
+
+            X_y = sub.select(cols_y).to_numpy().astype(np.float64)
+            X_p = sub.select(cols_p).to_numpy().astype(np.float64)
+            effect_y = X_y @ coef_y
+            effect_v = X_p @ coef_p
+
+            y_all = sub["y"].to_numpy().astype(np.float64)
+            v_all = (
+                sub["value"].to_numpy().astype(np.float64)
+                if "value" in sub.columns
+                else np.zeros_like(y_all)
+            )
+
+            sub = sub.with_columns(
+                pl.Series("_effect_y", effect_y),
+                pl.Series("_effect_v", effect_v),
+                pl.Series("_y_neto", y_all - effect_y),
+                pl.Series("_v_neto", v_all - effect_v),
+            )
+            sub = self._apply_causal_ses(sub, "_y_neto", "_y_neto_hat", alpha)
+            sub = self._apply_causal_ses(sub, "_v_neto", "_v_neto_hat", alpha)
+            sub = sub.with_columns(
+                (pl.col("_y_neto_hat") + pl.col("_effect_y")).round(0).alias("yhat"),
+                (pl.col("_v_neto_hat") + pl.col("_effect_v")).round(2).alias("valuehat"),
+                pl.col("_effect_y").alias("driver_effect"),
+                pl.col("_effect_v").alias("driver_effect_value"),
+            ).drop(["_y_neto", "_v_neto", "_y_neto_hat", "_v_neto_hat", "_effect_y", "_effect_v"])
+            frames.append(sub)
+
+        if not frames:
+            return pl.DataFrame()
+        return pl.concat(frames, how="diagonal_relaxed")
 
     # ── Rolling 28d (yhat28 / valuehat28) — Fase 3(b): O(n) por serie ───────
     @staticmethod
@@ -796,6 +887,7 @@ class RLSForecastRunner:
         return d + dt.timedelta(days=(7 - d.weekday()) % 7)
 
     def _rolling_28_one(self, unique_id: str, g: pl.DataFrame) -> pl.DataFrame | None:
+
         """
         Walk-forward 28d sobre toda la historia de la serie.
 
@@ -846,11 +938,7 @@ class RLSForecastRunner:
         y_all = g["y"].to_numpy().astype(np.float64)
         has_value = "value" in g.columns
         if has_value:
-            Xp_all = (
-                g.select(pdcols).to_numpy().astype(np.float64, order="C")
-                if pdcols
-                else X_all
-            )
+            Xp_all = g.select(pdcols).to_numpy().astype(np.float64, order="C") if pdcols else X_all
             v_all = g["value"].to_numpy().astype(np.float64)
         else:
             Xp_all = X_all
@@ -985,11 +1073,7 @@ class RLSForecastRunner:
                 if uid in parts
             }
             for fut in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=desc,
-                unit="serie",
-                leave=False,
+                as_completed(futures), total=len(futures), desc=desc, unit="serie", leave=False
             ):
                 uid = futures[fut]
                 try:
@@ -1091,7 +1175,6 @@ class RLSForecastRunner:
 # Orquestador – split por sección
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def densify_section_panel(
     df: pl.DataFrame,
     date_start: dt.date,
@@ -1121,9 +1204,7 @@ def densify_section_panel(
     else:
         uids = pl.DataFrame({"unique_id": pl.Series([], dtype=pl.Utf8)})
     if extra_uids is not None and extra_uids.height:
-        uids = pl.concat(
-            [uids, extra_uids.select("unique_id")], how="diagonal_relaxed"
-        ).unique()
+        uids = pl.concat([uids, extra_uids.select("unique_id")], how="diagonal_relaxed").unique()
 
     if uids.height == 0:
         return df
@@ -1145,7 +1226,9 @@ def densify_section_panel(
 
     if df.height:
         data_cols = [
-            c for c in df.columns if c not in ("unique_id", "ds") and c not in meta_cols
+            c
+            for c in df.columns
+            if c not in ("unique_id", "ds") and c not in meta_cols
         ]
         join_df = df.select(["unique_id", "ds"] + data_cols)
         out = grid.join(join_df, on=["unique_id", "ds"], how="left")
@@ -1232,7 +1315,9 @@ class RLSForecastPipeline:
         if len(sku_ids) <= self._limit_series:
             return df_train
         rng = np.random.default_rng(42)
-        keep = set(rng.choice(sku_ids, size=self._limit_series, replace=False).tolist())
+        keep = set(
+            rng.choice(sku_ids, size=self._limit_series, replace=False).tolist()
+        )
         logger.warning(
             "⚠ --limit-series activo: %d SKUs de %d (solo para debug/benchmark, "
             "NO usar en producción)",
@@ -1242,11 +1327,7 @@ class RLSForecastPipeline:
         return df_train.filter((depth < 2) | pl.col("unique_id").is_in(list(keep)))
 
     def _build_calendar_frame(
-        self,
-        unique_ids: list[str],
-        start: dt.date,
-        end: dt.date,
-        template: pl.DataFrame,
+        self, unique_ids: list[str], start: dt.date, end: dt.date, template: pl.DataFrame
     ) -> pl.DataFrame:
         """Genera filas ds para [start, end] por unique_id (y=0) sin loops por celda en Polars."""
         n_days = (end - start).days + 1
@@ -1256,9 +1337,7 @@ class RLSForecastPipeline:
         dates = pl.date_range(start, end, interval="1d", eager=True)
 
         # Meta una sola pasada (unique_id → sku_desc / store_name / seccion)
-        meta_cols = [
-            c for c in ("sku_desc", "store_name", "seccion") if c in template.columns
-        ]
+        meta_cols = [c for c in ("sku_desc", "store_name", "seccion") if c in template.columns]
         if meta_cols:
             meta = (
                 template.select(["unique_id"] + meta_cols)
@@ -1348,9 +1427,7 @@ class RLSForecastPipeline:
                 pl.lit(0.0).alias("discount"),
             )
 
-        logger.info(
-            "EDP: decompose_price batched (indexors) sobre %d series…", n_series
-        )
+        logger.info("EDP: decompose_price batched (indexors) sobre %d series…", n_series)
         df_sorted = df.sort(["unique_id", "ds"])
         counts = (
             df_sorted.select("unique_id")
@@ -1476,16 +1553,14 @@ class RLSForecastPipeline:
             ]
 
         with _stage_timer(f"{seccion}: agregación+densify OOS"):
-            df_oos = (
-                self._aggregator.aggregate(raw_oos)
-                if raw_oos.height
-                else pl.DataFrame()
-            )
+            df_oos = self._aggregator.aggregate(raw_oos) if raw_oos.height else pl.DataFrame()
             if df_oos.height:
                 # Densificar OOS al spine de la sección [test_start, test_end]
                 # y alinear unique_ids con train (mismas series)
                 train_uids = df_train.select("unique_id").unique()
-                df_oos = densify_section_panel(df_oos, hz["test_start"], hz["test_end"])
+                df_oos = densify_section_panel(
+                    df_oos, hz["test_start"], hz["test_end"]
+                )
                 # asegurar todas las series de train también en OOS (ceros si no hubo venta)
                 oos_uids = df_oos.select("unique_id").unique()
                 missing = train_uids.join(oos_uids, on="unique_id", how="anti")
@@ -1493,10 +1568,7 @@ class RLSForecastPipeline:
                     spine_oos = pl.DataFrame(
                         {
                             "ds": pl.date_range(
-                                hz["test_start"],
-                                hz["test_end"],
-                                interval="1d",
-                                eager=True,
+                                hz["test_start"], hz["test_end"], interval="1d", eager=True
                             )
                         }
                     )
@@ -1514,12 +1586,7 @@ class RLSForecastPipeline:
                         meta = (
                             df_train.select(["unique_id"] + meta_cols)
                             .group_by("unique_id")
-                            .agg(
-                                [
-                                    pl.col(c).drop_nulls().first().alias(c)
-                                    for c in meta_cols
-                                ]
-                            )
+                            .agg([pl.col(c).drop_nulls().first().alias(c) for c in meta_cols])
                         )
                         extra = extra.join(meta, on="unique_id", how="left")
                     df_oos = pl.concat([df_oos, extra], how="diagonal_relaxed")
@@ -1553,12 +1620,11 @@ class RLSForecastPipeline:
                     df_fcst_raw.with_columns(pl.lit(1).alias("intercept")),
                     req_columns=driver_cols,
                 ).sort("ds")
-                logger.info(
-                    "Sección %s: forecast-only shape=%s", seccion, df_fcst.shape
-                )
+                logger.info("Sección %s: forecast-only shape=%s", seccion, df_fcst.shape)
             else:
                 df_fcst = pl.DataFrame()
 
+        # ── RLS SOLO a nivel sección (nuevo modelo jerárquico) ──────────────
         runner = RLSForecastRunner(
             driver_cols=driver_cols,
             rmse_error=self._cfg.rmse_error,
@@ -1577,27 +1643,67 @@ class RLSForecastPipeline:
             "forecast_end": hz["forecast_end"],
         }
 
-        # ── Fase 1: 1 solo fit por serie, predicción sobre los 3 targets ────
         targets: dict[str, pl.DataFrame] = {"in_sample": df_train}
         if df_oos.height:
             targets["out_sample"] = df_oos
         if df_fcst.height:
             targets["forecast_only"] = df_fcst
 
-        with _stage_timer(
-            f"{seccion}: fit+predict ({len(targets)} target(s), 1 fit/serie)"
-        ):
-            res_df, wmapes_df = runner.fit_and_predict_multi(
-                df_train,
-                targets,
-                self._cfg.forecast_levels,
-                desc=f"{seccion} fit+predict",
+        train_section = df_train.filter(pl.col("unique_id") == seccion)
+        targets_section = {
+            name: df.filter(pl.col("unique_id") == seccion) for name, df in targets.items()
+        }
+
+        with _stage_timer(f"{seccion}: RLS sección (1 fit por variable)"):
+            res_section, coefs = runner.fit_and_predict_sections(
+                train_section,
+                targets_section,
+                [seccion],
+                desc=f"{seccion} RLS sección",
                 meta=meta,
             )
 
-        if res_df.height:
-            # forecast-only: sin actuals → y/value en 0 (línea punteada aguas abajo)
-            res_df = res_df.with_columns(
+        if res_section.height:
+            res_section = res_section.with_columns(
+                pl.when(pl.col("period_type") == "forecast_only")
+                .then(0.0)
+                .otherwise(pl.col("y"))
+                .alias("y"),
+                pl.when(pl.col("period_type") == "forecast_only")
+                .then(0.0)
+                .otherwise(pl.col("value"))
+                .alias("value"),
+                pl.lit(None).cast(pl.Float64).alias("driver_effect"),
+                pl.lit(None).cast(pl.Float64).alias("driver_effect_value"),
+            )
+
+        if not coefs:
+            logger.warning(
+                "Sección %s: no se pudo ajustar RLS a nivel sección; "
+                "no hay coeficientes para derivar tienda/sku.",
+                seccion,
+            )
+            return res_section, pl.DataFrame(), driver_cols
+
+        # ── Tienda / sku / tienda+sku: derivado (sin RLS) ───────────────────
+        # 1 sola pasada vectorizada sobre TODO el panel (train+OOS+forecast)
+        # a la vez — ver `RLSForecastRunner.compute_derived_forecasts`.
+        panel_parts = [df_train.with_columns(pl.lit("in_sample").alias("period_type"))]
+        if df_oos.height:
+            panel_parts.append(df_oos.with_columns(pl.lit("out_sample").alias("period_type")))
+        if df_fcst.height:
+            panel_parts.append(df_fcst.with_columns(pl.lit("forecast_only").alias("period_type")))
+        panel_all = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
+        if meta:
+            panel_all = panel_all.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
+
+        with _stage_timer(f"{seccion}: derivado tienda/sku (vectorizado, sin RLS)"):
+            res_derived = runner.compute_derived_forecasts(
+                panel_all, coefs, alpha=settings.SES_ALPHA
+            )
+
+        if res_derived.height:
+            res_derived = res_derived.with_columns(
                 pl.when(pl.col("period_type") == "forecast_only")
                 .then(0.0)
                 .otherwise(pl.col("y"))
@@ -1608,78 +1714,67 @@ class RLSForecastPipeline:
                 .alias("value"),
             )
 
+        res_df = pl.concat(
+            [f for f in (res_section, res_derived) if f.height], how="diagonal_relaxed"
+        )
         if not res_df.height:
             return pl.DataFrame(), pl.DataFrame(), driver_cols
 
-        with _stage_timer(f"{seccion}: rolling28 (opt-in)"):
-            res_df, wmapes_df = self._attach_rolling28(
-                runner, res_df, wmapes_df, df_train, df_oos, df_fcst
+        wmapes_df = RLSForecastRunner._compute_wmape(res_df)
+
+        # ── Rolling 28d — SOLO nivel sección (RLS real; ver settings.COMPUTE_ROLLING_28) ──
+        # Si está desactivado, NO se agregan columnas yhat28/valuehat28 en
+        # absoluto (ni siquiera nulas) — el dashboard detecta si el
+        # rolling28 fue calculado por la sola presencia de la columna.
+        if getattr(settings, "COMPUTE_ROLLING_28", False):
+            panel_section = panel_all.filter(pl.col("unique_id") == seccion)
+            logger.info(
+                "Sección %s: rolling 28d (solo nivel sección) sobre panel shape=%s…",
+                seccion,
+                panel_section.shape,
             )
-
-        return res_df, wmapes_df, driver_cols
-
-    def _attach_rolling28(
-        self,
-        runner: RLSForecastRunner,
-        res_df: pl.DataFrame,
-        wmapes_df: pl.DataFrame,
-        df_train: pl.DataFrame,
-        df_oos: pl.DataFrame,
-        df_fcst: pl.DataFrame,
-    ) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """
-        Rolling 28d (yhat28 / valuehat28) sobre toda la historia
-        (train+OOS+forecast). Cuando `compute_rolling28=False` (config) hace
-        early-return y `res_df` NO gana columnas yhat28/valuehat28 (parquet
-        más liviano y dashboard sin controles rolling). No modifica yhat/valuehat.
-        """
-        if not self._cfg.compute_rolling28:
-            logger.info("rolling 28d desactivado (COMPUTE_ROLLING28=False)")
-            return res_df, wmapes_df
-
-        panel_parts = [p for p in (df_train, df_oos, df_fcst) if p.height]
-        if not panel_parts:
-            # sin panel no hay rolling; si ya había res_df, se deja sin col. rolling
-            if res_df.height:
+            with _stage_timer(f"{seccion}: rolling28 sección (O(n))"):
+                roll = runner.run_rolling_28(
+                    panel_section, self._cfg.forecast_levels, desc=f"{seccion} rolling28"
+                )
+            if roll.height and res_df.height:
+                # alinear tipos de ds
+                if res_df["ds"].dtype != roll["ds"].dtype:
+                    roll = roll.with_columns(pl.col("ds").cast(res_df["ds"].dtype))
+                res_df = res_df.join(
+                    roll.select(["unique_id", "ds", "yhat28", "valuehat28"]),
+                    on=["unique_id", "ds"],
+                    how="left",
+                )
+                wm28 = RLSForecastRunner.compute_wmape28(
+                    res_df.filter(
+                        pl.col("y").is_not_null()
+                        & pl.col("yhat28").is_not_null()
+                    )
+                )
+                if wm28.height:
+                    if "wmape" in wmapes_df.columns and "unique_id" in wmapes_df.columns:
+                        wmapes_df = wmapes_df.join(wm28, on="unique_id", how="left")
+                    else:
+                        wmapes_df = wm28
+                logger.info(
+                    "Sección %s: yhat28 unido (%d filas roll, %d series wm28)",
+                    seccion,
+                    roll.height,
+                    wm28.height if wm28.height else 0,
+                )
+            elif res_df.height:
                 res_df = res_df.with_columns(
                     pl.lit(None).cast(pl.Float64).alias("yhat28"),
                     pl.lit(None).cast(pl.Float64).alias("valuehat28"),
                 )
-            return res_df, wmapes_df
-
-        panel = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
-        logger.info("rolling 28d: panel shape=%s…", panel.shape)
-        roll = runner.run_rolling_28(panel, self._cfg.forecast_levels, desc="rolling28")
-        if roll.height and res_df.height:
-            # alinear tipos de ds
-            if res_df["ds"].dtype != roll["ds"].dtype:
-                roll = roll.with_columns(pl.col("ds").cast(res_df["ds"].dtype))
-            res_df = res_df.join(
-                roll.select(["unique_id", "ds", "yhat28", "valuehat28"]),
-                on=["unique_id", "ds"],
-                how="left",
-            )
-            wm28 = RLSForecastRunner.compute_wmape28(
-                res_df.filter(
-                    pl.col("y").is_not_null() & pl.col("yhat28").is_not_null()
-                )
-            )
-            if wm28.height:
-                if "wmape" in wmapes_df.columns and "unique_id" in wmapes_df.columns:
-                    wmapes_df = wmapes_df.join(wm28, on="unique_id", how="left")
-                else:
-                    wmapes_df = wm28
+        else:
             logger.info(
-                "yhat28 unido (%d filas roll, %d series wm28)",
-                roll.height,
-                wm28.height if wm28.height else 0,
+                "Sección %s: rolling28 desactivado (settings.COMPUTE_ROLLING_28=False)",
+                seccion,
             )
-        elif res_df.height:
-            res_df = res_df.with_columns(
-                pl.lit(None).cast(pl.Float64).alias("yhat28"),
-                pl.lit(None).cast(pl.Float64).alias("valuehat28"),
-            )
-        return res_df, wmapes_df
+
+        return res_df, wmapes_df, driver_cols
 
     def run(self) -> tuple[pl.DataFrame, pl.DataFrame]:
         stages = tqdm(
@@ -1731,15 +1826,15 @@ class RLSForecastPipeline:
         )
         _advance("resultados consolidados")
         stages.close()
-        logger.info("⏱ Pipeline RLS: TOTAL %.1fs", time.perf_counter() - pipeline_t0)
+        logger.info(
+            "⏱ Pipeline RLS: TOTAL %.1fs", time.perf_counter() - pipeline_t0
+        )
         return res_df, wmapes_df
 
     def _write_checkpoint(self, seccion: str, res: pl.DataFrame) -> None:
         try:
             self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
-            partial_path = (
-                self._cfg.out_dir / f"forecast_seccion_{seccion}_partial.parquet"
-            )
+            partial_path = self._cfg.out_dir / f"forecast_seccion_{seccion}_partial.parquet"
             res.write_parquet(
                 partial_path, compression="zstd", compression_level=3, statistics=True
             )
@@ -1774,10 +1869,7 @@ class RLSForecastPipeline:
         )
         if "period_type" in sku_level.columns:
             sku_level = sku_level.filter(pl.col("period_type") == "forecast_only")
-        elif (
-            "forecast_start" in sku_level.columns
-            and "forecast_end" in sku_level.columns
-        ):
+        elif "forecast_start" in sku_level.columns and "forecast_end" in sku_level.columns:
             sku_level = sku_level.filter(
                 (pl.col("ds").cast(pl.Date) >= pl.col("forecast_start").cast(pl.Date))
                 & (pl.col("ds").cast(pl.Date) <= pl.col("forecast_end").cast(pl.Date))
@@ -1786,16 +1878,14 @@ class RLSForecastPipeline:
             logger.warning("Sin filas forecast-only a nivel SKU para export Excel")
             return
 
-        # Parse unique_id → seccion, local, sku
+        # Parse unique_id → seccion, local, sku (esquema T:/S: — ver settings.split_unique_id)
+        uids = sku_level["unique_id"].to_list()
+        parsed = [settings.split_unique_id(u) for u in uids]
         parts = sku_level.with_columns(
-            pl.col("unique_id").str.split_exact("||", 2).alias("_p")
-        ).unnest("_p")
-        rename = {}
-        for i, name in enumerate(["SECCION", "Local", "SKU"]):
-            src = f"field_{i}"
-            if src in parts.columns:
-                rename[src] = name
-        parts = parts.rename(rename) if rename else parts
+            pl.Series("SECCION", [p["seccion"] for p in parsed]),
+            pl.Series("Local", [p["store"] for p in parsed]),
+            pl.Series("SKU", [p["sku"] for p in parsed]),
+        )
 
         for seccion in settings.FOCUS_SECTIONS:
             sec_df = parts.filter(pl.col("SECCION") == seccion)
@@ -1814,7 +1904,9 @@ class RLSForecastPipeline:
                 # fallback openpyxl / xlsxwriter no disponible → csv
                 csv_path = out_path.with_suffix(".csv")
                 summary.write_csv(csv_path)
-                logger.warning("write_excel falló; exportado CSV: %s", csv_path)
+                logger.warning(
+                    "write_excel falló; exportado CSV: %s", csv_path
+                )
                 continue
             logger.info(
                 "✓ Excel sección %s (%d filas): %s",
@@ -1841,23 +1933,12 @@ def _parse_args() -> argparse.Namespace:
             "sección/tienda) para iterar rápido. NO usar en producción."
         ),
     )
-    parser.add_argument(
-        "--rolling28",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Override de settings.COMPUTE_ROLLING28: --rolling28 habilita el "
-            "walk-forward yhat28/valuehat28; --no-rolling28 lo deshabilita."
-        ),
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     config = ForecastConfig.from_settings()
-    if args.rolling28 is not None:
-        config.compute_rolling28 = args.rolling28
     pipeline = RLSForecastPipeline(
         config, n_jobs=args.n_jobs, limit_series=args.limit_series
     )

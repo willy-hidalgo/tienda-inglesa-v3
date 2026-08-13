@@ -8,7 +8,6 @@ tests de abajo cubren: (1) las piezas que no cambiaron (helpers, métricas), y
 (2) que el nuevo algoritmo es causal (no usa información futura) y no
 lanza excepciones para series sintéticas pequeñas.
 """
-
 from __future__ import annotations
 
 import datetime as dt
@@ -23,9 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-from forecasts import ForecastConfig, RLSForecastPipeline, RLSForecastRunner
-
 import settings
+from forecasts import RLSForecastRunner
 
 try:
     from rls_opt import RecursiveLeastSquaresRegression
@@ -35,81 +33,6 @@ except ImportError:  # pragma: no cover
 
 def test_rolling_horizon_setting():
     assert settings.ROLLING_HORIZON_DAYS == 28
-
-
-def test_compute_rolling28_settings_off_by_default():
-    assert settings.COMPUTE_ROLLING28 is False
-
-
-def test_compute_rolling28_config_reads_settings():
-    cfg = ForecastConfig.from_settings()
-    assert cfg.compute_rolling28 is False
-
-
-def test_attach_rolling28_skipped_when_disabled(monkeypatch):
-    """COMPUTE_ROLLING28=False → `run_rolling_28` NO se invoca y res_df no
-    gana columnas yhat28/valuehat28."""
-    cfg = ForecastConfig.from_settings()
-    cfg.compute_rolling28 = False
-    pipeline = RLSForecastPipeline(cfg, n_jobs=1)
-    runner = RLSForecastRunner(driver_cols=["intercept"], rmse_error=0.2, n_jobs=1)
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("run_rolling_28 no debe llamarse con rolling desactivado")
-
-    monkeypatch.setattr(runner, "run_rolling_28", _boom)
-
-    res = pl.DataFrame({"unique_id": ["1"], "ds": [dt.date(2024, 1, 1)], "y": [1.0]})
-    wmapes = pl.DataFrame()
-    out, out_wm = pipeline._attach_rolling28(
-        runner, res, wmapes, pl.DataFrame(), pl.DataFrame(), pl.DataFrame()
-    )
-    assert out.height == res.height
-    assert out_wm.height == 0
-    assert "yhat28" not in out.columns
-    assert "valuehat28" not in out.columns
-
-
-def test_attach_rolling28_joins_when_enabled(monkeypatch):
-    """COMPUTE_ROLLING28=True → corre run_rolling_28 y une yhat28/valuehat28."""
-    cfg = ForecastConfig.from_settings()
-    cfg.compute_rolling28 = True
-    pipeline = RLSForecastPipeline(cfg, n_jobs=1)
-    runner = RLSForecastRunner(driver_cols=["intercept"], rmse_error=0.2, n_jobs=1)
-
-    roll_out = pl.DataFrame(
-        {
-            "unique_id": ["1"],
-            "ds": [dt.date(2024, 1, 1)],
-            "yhat28": [0.9],
-            "valuehat28": [9.0],
-        }
-    )
-    monkeypatch.setattr(runner, "run_rolling_28", lambda *a, **k: roll_out)
-
-    res = pl.DataFrame(
-        {
-            "unique_id": ["1"],
-            "ds": [dt.date(2024, 1, 1)],
-            "y": [1.0],
-            "yhat": [0.8],
-        }
-    )
-    dummy_wm = pl.DataFrame({"unique_id": ["1"], "wmape": [0.2]})
-    df_train = pl.DataFrame(
-        {
-            "unique_id": ["1"],
-            "ds": [dt.date(2024, 1, 1)],
-            "y": [1.0],
-            "value": [10.0],
-            "intercept": [1],
-        }
-    )
-    out, _ = pipeline._attach_rolling28(
-        runner, res, dummy_wm, df_train, pl.DataFrame(), pl.DataFrame()
-    )
-    assert "yhat28" in out.columns
-    assert out["yhat28"].drop_nulls().to_list() == [0.9]
 
 
 def test_first_monday_helper():
@@ -159,7 +82,9 @@ def test_metrics_rolling28_backend():
 
 def test_run_rolling_28_aligns_min_obs_28():
     """Fase 5: series con < 28 obs no deben entrar al rolling (antes: umbral 2)."""
-    runner = RLSForecastRunner(driver_cols=["intercept"], rmse_error=0.2, n_jobs=1)
+    runner = RLSForecastRunner(
+        driver_cols=["intercept"], rmse_error=0.2, n_jobs=1
+    )
     dates = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(10)]
     panel = pl.DataFrame(
         {
@@ -173,6 +98,101 @@ def test_run_rolling_28_aligns_min_obs_28():
     out = runner.run_rolling_28(panel, ["seccion", "store", "sku"])
     # con min_obs=28 esta serie (10 filas) queda excluida
     assert out.height == 0
+
+
+def test_compute_rolling_28_default_is_false():
+    """El cálculo de rolling28 es opcional y viene desactivado por defecto."""
+    assert settings.COMPUTE_ROLLING_28 is False
+
+
+@pytest.mark.skipif(
+    RecursiveLeastSquaresRegression is None, reason="rls_opt no disponible"
+)
+def test_run_section_skips_rolling28_when_disabled(monkeypatch):
+    """
+    Con settings.COMPUTE_ROLLING_28=False (default), `_run_section` no debe
+    agregar columnas yhat28/valuehat28 en absoluto (ni siquiera nulas) — el
+    dashboard detecta la disponibilidad del rolling28 por presencia de la
+    columna, así que una columna toda-nula rompería esa detección.
+    Con COMPUTE_ROLLING_28=True, las columnas sí deben estar presentes.
+    """
+    from forecasts import (
+        RLSForecastPipeline,
+        HolidayCalendar,
+        CalendarFeatureBuilder,
+        DataAggregator,
+    )
+
+    sec = "23"
+    hz = settings.section_horizons(sec, first_data=dt.date(2024, 5, 1))
+    all_days = []
+    d = hz["train_start"]
+    while d <= hz["test_end"]:
+        all_days.append(d)
+        d += dt.timedelta(days=1)
+
+    rng = np.random.default_rng(0)
+    rows = []
+    locales = settings.SECCIONES[sec]["locales"][:1]
+    for store in locales:
+        for sku in ["SKU_A"]:
+            for day in all_days:
+                qty = max(0.0, rng.normal(8, 3))
+                rows.append(
+                    {
+                        "SALES_DAY": day,
+                        "SECCION": sec,
+                        "SKU_ID": sku,
+                        "STORE_ID": store,
+                        "SLS_QTY": round(qty, 0),
+                        "SLS_VAL": round(qty * 12.5, 2),
+                        "DESCRIPCION": f"Desc {sku}",
+                    }
+                )
+    selected = pl.DataFrame(rows)
+
+    class FakeCfg:
+        date_column = "SALES_DAY"
+        quantity_column = "SLS_QTY"
+        price_column = "SLS_VAL"
+        aggregation_levels = settings.AGGREGATION_LEVELS
+        forecast_levels = settings.FORECAST_LEVELS
+        rmse_error = settings.RMSE_ERROR
+        forgetting_factor = settings.FORGETTING_FACTOR
+        min_y_to_update = settings.MIN_Y_TO_update
+        correction_factor = settings.CORRECTION_FACTOR
+        out_dir = None
+
+    def _build_pipeline():
+        pipeline = RLSForecastPipeline.__new__(RLSForecastPipeline)
+        pipeline._cfg = FakeCfg()
+        pipeline._n_jobs = 1
+        pipeline._limit_series = None
+        pipeline._calendar = HolidayCalendar(settings.HOLIDAYS, 2026)
+        pipeline._feature_builder = CalendarFeatureBuilder(pipeline._calendar)
+        pipeline._aggregator = DataAggregator(
+            FakeCfg.date_column,
+            FakeCfg.quantity_column,
+            FakeCfg.price_column,
+            FakeCfg.aggregation_levels,
+        )
+        return pipeline
+
+    # Desactivado (default)
+    monkeypatch.setattr(settings, "COMPUTE_ROLLING_28", False)
+    pipeline_off = _build_pipeline()
+    res_off, _, _ = pipeline_off._run_section(selected, sec, dt.date(2024, 5, 1), None)
+    assert res_off.height > 0
+    assert "yhat28" not in res_off.columns
+    assert "valuehat28" not in res_off.columns
+
+    # Activado
+    monkeypatch.setattr(settings, "COMPUTE_ROLLING_28", True)
+    pipeline_on = _build_pipeline()
+    res_on, _, _ = pipeline_on._run_section(selected, sec, dt.date(2024, 5, 1), None)
+    assert res_on.height > 0
+    assert "yhat28" in res_on.columns
+    assert "valuehat28" in res_on.columns
 
 
 @pytest.mark.skipif(

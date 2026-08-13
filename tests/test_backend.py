@@ -1,5 +1,4 @@
-"""Tests del backend y del dashboard (sin Streamlit)."""
-
+"""Tests del backend y dashboard_data (sin Streamlit)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -7,16 +6,23 @@ import sys
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
 import backend
-from backend import build_dashboard_context, prepare_dashboard_state
+import settings
+from dashboard_data import prepare_dashboard_state
 
 
 def _sample_forecast() -> pl.DataFrame:
+    """
+    Sección "23" con: nodo sección, tienda 00155, sku SKU1 (todas las
+    tiendas) y tienda 00155 + sku SKU1 — cubre los 4 tipos de nodo del
+    nuevo esquema de filtros independientes.
+    """
     rows = []
     base = dt.date(2025, 11, 1)
     for i in range(40):
@@ -27,31 +33,31 @@ def _sample_forecast() -> pl.DataFrame:
             y, yhat = 0.0, 12.0
         else:
             y, yhat = 10.0 + i % 5, 9.0 + i % 4
+        base_row = {
+            "ds": d,
+            "y": y,
+            "yhat": yhat,
+            "value": y * 10,
+            "valuehat": yhat * 10,
+            "period_type": period,
+            "sku_desc": "",
+            "store_name": "",
+            "seccion": "23",
+            "train_end": dt.date(2025, 11, 30),
+            "test_start": dt.date(2025, 12, 1),
+            "test_end": dt.date(2025, 12, 7),
+            "forecast_start": dt.date(2025, 12, 8),
+            "forecast_end": dt.date(2026, 2, 1),
+        }
+        rows.append({**base_row, "unique_id": "23"})
+        rows.append({**base_row, "unique_id": "23||T:00155", "store_name": "DELSOL"})
+        rows.append({**base_row, "unique_id": "23||S:SKU1", "sku_desc": "LECHE"})
         rows.append(
             {
-                "unique_id": "23",
-                "ds": d,
-                "y": y,
-                "yhat": yhat,
-                "value": y * 10,
-                "valuehat": yhat * 10,
-                "period_type": period,
-                "sku_desc": "",
-                "store_name": "",
-                "seccion": "23",
-                "train_end": dt.date(2025, 11, 30),
-                "test_start": dt.date(2025, 12, 1),
-                "test_end": dt.date(2025, 12, 7),
-                "forecast_start": dt.date(2025, 12, 8),
-                "forecast_end": dt.date(2026, 2, 1),
-            }
-        )
-        # child series for ranking
-        rows.append(
-            {
-                **{k: v for k, v in rows[-1].items() if k != "unique_id"},
-                "unique_id": "23||00155",
+                **base_row,
+                "unique_id": "23||T:00155||S:SKU1",
                 "store_name": "DELSOL",
+                "sku_desc": "LECHE",
             }
         )
     return pl.DataFrame(rows)
@@ -69,92 +75,139 @@ def test_detail_view_excludes_horizon_cols():
 def test_wmape_excluye_y_cero():
     df = pl.DataFrame(
         {
-            "unique_id": ["1||a", "1||a", "1||b"],
+            "unique_id": ["1||T:a", "1||T:a", "1||T:b"],
             "y": [10.0, 0.0, 20.0],
             "yhat": [8.0, 5.0, 18.0],
             "period_type": ["out_sample"] * 3,
         }
     )
-    w = backend.wmape_por_id(["1||a", "1||b"], df)
-    r = w.filter(pl.col("unique_id") == "1||a")
+    w = backend.wmape_por_id(["1||T:a", "1||T:b"], df)
+    r = w.filter(pl.col("unique_id") == "1||T:a")
     assert abs(r["wmape"][0] - 0.2) < 1e-9
-    # n_with_sales = puntos y≠0; n_points = spine (si no se pasa, n_unique ds)
     assert r["n_with_sales"][0] == 1
 
 
-def test_ranking_wmape_table_columns():
-    base = pl.DataFrame(
-        {
-            "unique_id": ["1||00122", "1||00154"],
-            "wmape": [0.1, 0.2],
-            "sum_y": [100.0, 50.0],
-            "n_with_sales": [3, 5],
-            "n_ds": [10, 10],
-        }
-    )
-    desc = {"1||00122": "CENTRAL", "1||00154": "HIPER"}
-    t = backend.ranking_wmape_table(base, "1", desc, n_points_total=10)
-    # tabla única con los nombres EXACTOS pedidos
-    assert list(t.columns) == [
-        "Código",
-        "Descripción",
-        "wMAPE (%)",
-        "Rotación",
-        "N puntos ≠0",
-        "% ≠0",
-        "unique_id",
-    ]
-    assert t.height == 2
-    # N puntos ≠0 = períodos con venta; % ≠0 sobre el total (spine)
-    assert t["N puntos ≠0"].to_list() == [3, 5]
-    assert t["% ≠0"].to_list() == ["30.0%", "50.0%"]
-    assert t["Rotación"].to_list() == ["100.00", "50.00"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtros cruzados (all_stores_in_section, skus_for_store, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+_ALL_IDS = [
+    "1",
+    "1||T:A",
+    "1||T:B",
+    "1||S:X",
+    "1||S:Y",
+    "1||T:A||S:X",
+    "1||T:B||S:X",
+    "23",
+    "23||T:C",
+]
 
 
-def test_ranking_wmape_excluye_cero_y_seleccionado():
-    base = pl.DataFrame(
-        {
-            "unique_id": ["1||a", "1||b", "1||c"],
-            "wmape": [0.0, 0.25, 0.3],
-            "sum_y": [0.0, 80.0, 60.0],
-            "n_with_sales": [0, 4, 3],
-            "n_ds": [10, 10, 10],
-        }
-    )
-    t = backend.ranking_wmape_table(base, "1||b", {}, 10)
-    # excluye el seleccionado y las series sin ventas (wmape=0)
-    assert t["unique_id"].to_list() == ["1||c"]
+def test_secciones_disponibles():
+    assert backend.secciones_disponibles(_ALL_IDS) == ["1", "23"]
 
 
-def test_ranking_wmape_hierarchical_only_direct_children():
-    """La tabla de ranking es JERÁRQUICA: solo los hijos directos del nivel
-    seleccionado; nunca series de otros niveles ni de otras secciones."""
-    base = pl.DataFrame(
+def test_all_stores_and_skus_in_section():
+    assert backend.all_stores_in_section(_ALL_IDS, "1") == ["A", "B"]
+    assert backend.all_skus_in_section(_ALL_IDS, "1") == ["X", "Y"]
+    assert backend.all_stores_in_section(_ALL_IDS, "23") == ["C"]
+    assert backend.all_skus_in_section(_ALL_IDS, "23") == []
+
+
+def test_stores_for_sku_and_skus_for_store():
+    # SKU X existe en tiendas A y B; Y no existe en ninguna combinación
+    assert backend.stores_for_sku(_ALL_IDS, "1", "X") == ["A", "B"]
+    assert backend.stores_for_sku(_ALL_IDS, "1", "Y") == []
+    # Tienda A solo tiene combinación con SKU X
+    assert backend.skus_for_store(_ALL_IDS, "1", "A") == ["X"]
+    assert backend.skus_for_store(_ALL_IDS, "1", "B") == ["X"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ranking_table (2 ejes, filtro cruzado)
+# ─────────────────────────────────────────────────────────────────────────────
+def _tabla_base_ranking() -> pl.DataFrame:
+    return pl.DataFrame(
         {
             "unique_id": [
-                "1",
-                "1||00122",
-                "1||00063",
-                "1||00122||SKU_A",
-                "23",
-                "23||00155",
+                "1||T:A", "1||T:B", "1||S:X", "1||S:Y", "1||T:A||S:X", "1||T:B||S:X",
             ],
-            "wmape": [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-            "sum_y": [1000.0, 500.0, 300.0, 50.0, 900.0, 400.0],
-            "n_with_sales": [10, 9, 8, 7, 10, 6],
-            "n_ds": [30, 30, 30, 30, 30, 30],
+            "wmape": [0.1, 0.2, 0.15, 0.3, 0.05, 0.25],
+            "sum_y": [100.0, 50.0, 80.0, 20.0, 60.0, 40.0],
+            "n_points": [10] * 6,
+            "n_with_sales": [8, 4, 7, 2, 6, 3],
         }
     )
-    # nivel Sección 1 → SOLO sus tiendas (nada de sección 23, ni SKUs)
-    t = backend.ranking_wmape_table(
-        base, "1", {}, 30, candidatos=["1||00122", "1||00063"]
+
+
+def test_ranking_table_columns():
+    t = backend.ranking_table(
+        _tabla_base_ranking(), seccion="1", axis="store", fixed_peer=None,
+        exclude=None, desc_map={}, unidad="Unidades",
     )
-    assert set(t["unique_id"].to_list()) == {"1||00122", "1||00063"}
-    # nivel tienda 00122 → SOLO sus SKUs
-    t2 = backend.ranking_wmape_table(
-        base, "1||00122", {}, 30, candidatos=["1||00122||SKU_A"]
+    assert list(t.columns) == [
+        "Código", "Descripción", "wMAPE (%)", "Rotación (unid.)",
+        "N puntos", "% ≠0", "unique_id",
+    ]
+
+
+def test_ranking_table_no_filtro_devuelve_nodos_puros():
+    tabla = _tabla_base_ranking()
+    t_store = backend.ranking_table(
+        tabla, seccion="1", axis="store", fixed_peer=None, exclude=None,
+        desc_map={}, unidad="Unidades",
     )
-    assert t2["unique_id"].to_list() == ["1||00122||SKU_A"]
+    assert sorted(t_store["Código"].to_list()) == ["A", "B"]
+    t_sku = backend.ranking_table(
+        tabla, seccion="1", axis="sku", fixed_peer=None, exclude=None,
+        desc_map={}, unidad="Unidades",
+    )
+    assert sorted(t_sku["Código"].to_list()) == ["X", "Y"]
+
+
+def test_ranking_table_fixed_peer_narrows_to_combo_nodes():
+    tabla = _tabla_base_ranking()
+    # SKU X fijo → tiendas donde existe X (nodos tienda+sku)
+    t = backend.ranking_table(
+        tabla, seccion="1", axis="store", fixed_peer="X", exclude=None,
+        desc_map={}, unidad="Unidades",
+    )
+    assert sorted(t["Código"].to_list()) == ["A", "B"]
+    # Tienda A fija → SKU en A (nodos tienda+sku)
+    t = backend.ranking_table(
+        tabla, seccion="1", axis="sku", fixed_peer="A", exclude=None,
+        desc_map={}, unidad="Unidades",
+    )
+    assert t["Código"].to_list() == ["X"]
+
+
+def test_ranking_table_exclude_omits_selected_node():
+    tabla = _tabla_base_ranking()
+    t = backend.ranking_table(
+        tabla, seccion="1", axis="store", fixed_peer=None, exclude="A",
+        desc_map={}, unidad="Unidades",
+    )
+    assert "A" not in t["Código"].to_list()
+    assert "B" in t["Código"].to_list()
+
+
+def test_ranking_table_pct_and_n_puntos():
+    tabla = _tabla_base_ranking()
+    t = backend.ranking_table(
+        tabla, seccion="1", axis="store", fixed_peer=None, exclude=None,
+        desc_map={}, unidad="Unidades",
+    )
+    row_a = t.filter(pl.col("Código") == "A")
+    assert row_a["N puntos"][0] == 8
+    assert row_a["% ≠0"][0] == "80.0"
+
+
+def test_ranking_table_valor_label():
+    t = backend.ranking_table(
+        _tabla_base_ranking(), seccion="1", axis="store", fixed_peer=None,
+        exclude=None, desc_map={}, unidad="Valor ($)",
+    )
+    assert "Rotación ($)" in t.columns
 
 
 def test_build_chart_series_keys():
@@ -171,118 +224,77 @@ def test_build_chart_series_keys():
     assert "cutoff" in ch
 
 
-def test_prepare_dashboard_state():
+# ─────────────────────────────────────────────────────────────────────────────
+# prepare_dashboard_state (filtros independientes seccion/store/sku)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_prepare_dashboard_state_seccion():
     df = _sample_forecast()
     view = prepare_dashboard_state(
-        df,
-        unidad="Unidades",
-        freq="Diario",
-        selected_id="23",
+        df, unidad="Unidades", freq="Diario", seccion="23", store=None, sku=None,
         cutoff_date=dt.date(2025, 11, 30),
-        candidatos=["23", "23||00155"],
-        nombre_nivel="seccion",
     )
     assert view.selected_id == "23"
+    assert view.node_kind == "seccion"
     assert "in" in view.metrics and "out" in view.metrics
     assert view.detail.height > 0
     assert "train_end" not in view.detail.columns
     assert view.chart["hist_ds"] is not None
-    # sin columnas de rolling → has_rolling False y métricas_28 en cero
-    assert view.has_rolling is False
-    assert view.metrics_28 == {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
-    assert view.ranking_total_points > 0
-    assert {
-        "Código",
-        "Descripción",
-        "wMAPE (%)",
-        "Rotación",
-        "N puntos ≠0",
-        "% ≠0",
-        "unique_id",
-    } <= set(view.ranking_wmape.columns)
-    # la API con contexto es equivalente a la de compatibilidad
-    ctx = build_dashboard_context(df, "Unidades")
-    view2 = prepare_dashboard_state(
-        df,
-        unidad="Unidades",
-        freq="Diario",
-        selected_id="23",
-        cutoff_date=dt.date(2025, 11, 30),
-        candidatos=["23", "23||00155"],
-        nombre_nivel="seccion",
-    )
-    assert view2.ranking_wmape.height == view.ranking_wmape.height
+    # _sample_forecast() no incluye yhat28 → rolling28 no calculado
+    assert view.has_rolling28 is False
+    assert view.store_context is None
+    assert view.n_spine > 0
 
 
-def test_build_dashboard_context_preagregado():
+def test_prepare_dashboard_state_tienda_y_sku_independientes():
     df = _sample_forecast()
-    ctx = build_dashboard_context(df, "Unidades")
-    # per_id: una fila por unique_id; wmape de la sección 23 (sin el child… ambos)
-    ids = ctx.per_id["unique_id"].to_list()
-    assert "23" in ids and "23||00155" in ids
-    assert {"wmape", "sum_y", "n_with_sales", "n_ds"} <= set(ctx.per_id.columns)
-    # all_ids ordenado
-    assert ctx.all_ids == sorted(ctx.all_ids)
-    assert ctx.all_ids == ["23", "23||00155"]
-    assert ctx.has_rolling is False
-    assert "23" in ctx.label_map
 
-
-def test_dashboard_context_has_rolling_when_columns_present():
-    df = _sample_forecast().with_columns(
-        (pl.col("yhat") * 0.9).alias("yhat28"),
-        (pl.col("valuehat") * 0.9).alias("valuehat28"),
-    )
-    ctx = build_dashboard_context(df, "Unidades")
-    assert ctx.has_rolling is True
-    view = prepare_dashboard_state(
-        df,
-        unidad="Unidades",
-        freq="Diario",
-        selected_id="23",
+    v_store = prepare_dashboard_state(
+        df, unidad="Unidades", freq="Diario", seccion="23", store="00155", sku=None,
         cutoff_date=dt.date(2025, 11, 30),
-        candidatos=["23", "23||00155"],
-        nombre_nivel="seccion",
     )
-    assert view.has_rolling is True
+    assert v_store.selected_id == "23||T:00155"
+    assert v_store.node_kind == "tienda"
+    assert v_store.store_context is None  # sin sku, no hay contexto de tienda
+
+    v_sku = prepare_dashboard_state(
+        df, unidad="Unidades", freq="Diario", seccion="23", store=None, sku="SKU1",
+        cutoff_date=dt.date(2025, 11, 30),
+    )
+    assert v_sku.selected_id == "23||S:SKU1"
+    assert v_sku.node_kind == "sku"
+    assert v_sku.store_context is None  # sku sin tienda = cross-tienda
+
+    v_both = prepare_dashboard_state(
+        df, unidad="Unidades", freq="Diario", seccion="23", store="00155", sku="SKU1",
+        cutoff_date=dt.date(2025, 11, 30),
+    )
+    assert v_both.selected_id == "23||T:00155||S:SKU1"
+    assert v_both.node_kind == "tienda_sku"
+    assert v_both.store_context is not None
+    assert "00155" in v_both.store_context
+    assert "DELSOL" in v_both.store_context
 
 
-def test_dashboard_sku_level_show_store():
-    """A nivel SKU (sec||store||sku) el view expone store_id / store_name."""
-    df = pl.DataFrame(
-        {
-            "unique_id": "1||00001||SKU_A",
-            "ds": [dt.date(2026, 3, 1) + dt.timedelta(days=i) for i in range(40)],
-            "y": [1.0] * 40,
-            "yhat": [0.9] * 40,
-            "value": [10.0] * 40,
-            "valuehat": [9.0] * 40,
-            "period_type": ["in_sample"] * 40,
-            "seccion": ["1"] * 40,
-        }
+def test_has_rolling28_true_when_column_present_with_data():
+    df = _sample_forecast().with_columns(
+        pl.when((pl.col("unique_id") == "23") & (pl.col("period_type") == "in_sample"))
+        .then(pl.col("yhat") * 1.05)
+        .otherwise(None)
+        .alias("yhat28")
     )
     view = prepare_dashboard_state(
-        df,
-        unidad="Unidades",
-        freq="Diario",
-        selected_id="1||00001||SKU_A",
-        cutoff_date=None,
-        candidatos=["1||00001||SKU_A"],
-        nombre_nivel="sku",
+        df, unidad="Unidades", freq="Diario", seccion="23", store=None, sku=None,
+        cutoff_date=dt.date(2025, 11, 30),
     )
-    assert view.store_id == "00001"
-    assert view.store_name == "CENTRAL"  # settings.SECCIONES['1']['local_names']
-    # sin nivel SKU no hay contexto de tienda
-    root = prepare_dashboard_state(
-        df,
-        unidad="Unidades",
-        freq="Diario",
-        selected_id="1||00001",
-        cutoff_date=None,
-        candidatos=["1||00001"],
-        nombre_nivel="store",
+    assert view.has_rolling28 is True
+
+    # Un nodo tienda sin yhat28 propio (columna presente globalmente pero
+    # nula para este nodo, tal como ocurre con rolling28 limitado a sección)
+    view_store = prepare_dashboard_state(
+        df, unidad="Unidades", freq="Diario", seccion="23", store="00155", sku=None,
+        cutoff_date=dt.date(2025, 11, 30),
     )
-    assert root.store_id is None and root.store_name is None
+    assert view_store.has_rolling28 is False
 
 
 def test_format_detail_display():

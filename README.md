@@ -1,6 +1,6 @@
 # Forecast RLS – Secciones 1 & 23
 
-Pipeline de forecasting jerárquico con **Recursive Least Squares (RLS)** para retail (Tienda Inglesa).
+Pipeline de forecasting jerárquico con **Recursive Least Squares (RLS)** para retail (Tienda Inglesa).  
 Niveles: **sección → tienda → SKU**.
 
 ## Arquitectura
@@ -15,75 +15,181 @@ app/
   categories_selector.py   → filtro secciones + locales de SECCIONES
   forecasts.py             → agregación 3 niveles + ventanas por sección + RLS
   dashboard.py             → Streamlit Explorer (paginación, sync, línea punteada)
-  backend.py               → cálculos de visualización (contexto pre-agregado)
 settings.py
 tests/
 ```
 
 **Principio de diseño (offline vs online):** todo el cómputo pesado (agregación,
-features, EDP, fits RLS, rolling 28d — este último **opt-in**) vive en
-`forecasts.py` y corre **offline**, una vez, escribiendo `forecast.parquet` /
-`wmape.parquet`. El dashboard (`dashboard.py` + `backend.py`) **nunca
-reajusta un modelo ni recalcula EDP/features en runtime**: solo lee esos
-Parquet precalculados y aplica selección de UI (unidad, frecuencia, nivel)
-sobre datos ya resueltos.
+features, EDP, fits RLS, rolling 28d) vive en `forecasts.py` y corre **offline**,
+una vez, escribiendo `forecast.parquet` / `wmape.parquet`. El dashboard
+(`dashboard.py` + `backend.py` + `dashboard_data.py`) **nunca reajusta un
+modelo ni recalcula EDP/features en runtime** — solo lee esos Parquet
+precalculados y aplica selección de UI (unidad, frecuencia, nivel) sobre
+datos ya resueltos. Esto es intencional y no cambió con esta optimización;
+lo que cambió es cuánto tarda la etapa offline en producir esos Parquet.
 
-`backend.py` es la **única capa de cálculo del dashboard** (`dashboard_data.py`
-se consolidó dentro de él). `build_dashboard_context` pre-agrega una vez por
-(archivo, unidad) los mapas de etiquetas y el wMAPE/rotación por `unique_id`:
-cada interacción del dashboard solo recorre **subconjuntos** (rankings = tabla
-de ~1 fila por serie; gráfico/métricas = la serie elegida) → respuesta
-sub-segunda, coherente con lo precalculado.
+## Filtros independientes y esquema de `unique_id`
 
-## Niveles y etiquetas
+**Sección** es obligatoria (un solo select). **Tienda** y **SKU** son dos
+filtros **independientes** al mismo nivel — reemplazan la navegación
+jerárquica anterior (sección → tienda → sku). Cualquiera de los dos puede
+estar vacío, uno solo, o ambos a la vez:
 
-Jerarquía: **sección → tienda → SKU**.
+| Filtro elegido | `unique_id` (`settings.make_unique_id`) | Significado |
+|---|---|---|
+| Sección | `1` | Total de la sección |
+| Sección + Tienda | `1\|\|T:00122` | Tienda, todos los SKU |
+| Sección + SKU | `1\|\|S:SKU123` | SKU, agregado sobre **todas** las tiendas |
+| Sección + Tienda + SKU | `1\|\|T:00122\|\|S:SKU123` | Combinación específica |
 
-| unique_id interno    | Código ranking | Descripción     |
-| -------------------- | --------------- | ---------------- |
-| `1`                | `1`           | Sección 1       |
-| `1\|\|00122`         | `00122`       | Nombre de tienda |
-| `1\|\|00122\|\|SKU123` | `SKU123`      | DESCRIPCION SKU  |
+El orden interno del id siempre es `T` antes de `S` (canónico), sin importar
+en qué orden el usuario haya elegido los filtros en la UI. `settings.
+split_unique_id` hace el parseo inverso; `settings.display_label` /
+`ranking_code` / `ranking_description` generan las etiquetas para cada uno
+de los 4 casos.
 
-Ranking: columnas **Código | Descripción | métrica | N puntos** (paginado de 5).
+**Orden de selección en el dashboard:** el filtro tocado más recientemente
+"ancla" y acota las opciones del otro (`st.session_state["_last_touched"]`
+en `dashboard.py`, actualizado vía `on_change` de cada `selectbox`):
+- Elegís Tienda → el select de SKU se acota a los SKU que existen en esa
+  tienda (`backend.skus_for_store`).
+- Elegís SKU → el select de Tienda se acota a las tiendas donde existe ese
+  SKU (`backend.stores_for_sku`).
+- Cambiar de Sección invalida cualquier Tienda/SKU elegido previamente.
 
 ## Ventanas por sección (`SECCIONES`)
 
 Cada sección tiene su propio `test_start`, `test_end` y lista de locales.
 
-| Concepto                | Regla                                                                |
-| ----------------------- | -------------------------------------------------------------------- |
-| **train_end**     | `SECCIONES[s].test_start`                                          |
-| **train_start**   | `max(S0, train_end − n·28d)` con `S0` = domingo ≥ primer dato |
-| **In-sample**     | `[train_start, train_end]` — modelo ajustado con toda esta data   |
-| **Out-of-sample** | lunes ≥`test_start` → `test_end`                               |
-| **Solo forecast** | `test_end+1` → `test_end+28` (sin actuals → línea punteada)   |
+| Concepto | Regla |
+|----------|--------|
+| **train_end** | `SECCIONES[s].test_start` |
+| **train_start** | `max(S0, train_end − n·28d)` con `S0` = domingo ≥ primer dato |
+| **In-sample** | `[train_start, train_end]` — modelo ajustado con toda esta data |
+| **Out-of-sample** | lunes ≥ `test_start` → `test_end` |
+| **Solo forecast** | `test_end+1` → `test_end+28` (sin actuals → línea punteada) |
 
-Ejemplo sección 23: `test_start=2025-11-30`, `test_end=2025-12-07`.
+Ejemplo sección 23: `test_start=2025-11-30`, `test_end=2025-12-07`.  
 Ejemplo sección 1: `test_start=2026-03-29`, `test_end=2026-04-26`.
+
+## Modelo jerárquico: RLS solo a nivel sección; tienda/sku derivado sin RLS
+
+Cambio de arquitectura (no solo de performance): **RLS se ajusta
+ÚNICAMENTE a nivel sección** (2 modelos por sección: variable `y`, variable
+`value`, exactamente igual que antes pero restringido a esos 1-2 ids). Los
+nodos de tienda, sku y tienda+sku **ya no se ajustan con RLS individual**
+— se derivan de los coeficientes de la sección con este procedimiento (por
+cada unidad, `y` o `value`, indistintamente):
+
+1. **Efecto de drivers**: `efecto(t) = drivers_propios_del_nodo(t) ·
+   coef_sección` (producto punto, **sin el intercepto**, con los drivers
+   propios del nodo — no los de la sección — multiplicados por los
+   coeficientes YA ajustados a nivel sección).
+2. **y_neto**: `y_neto(t) = y(t) − efecto(t)`.
+3. **SES causal**: suavización exponencial simple sobre `y_neto`, con
+   `alpha` fijo (`settings.SES_ALPHA`, default `0.1`). La predicción de
+   cada fecha usa el estado suavizado **hasta el día anterior**
+   (`s(t-1)`, nunca `s(t)`) — mismo principio de causalidad que el
+   rolling28: no hay look-ahead. Fuera de la muestra (OOS/forecast-only),
+   el estado se propaga **constante** en el último valor conocido
+   (propiedad estándar de una SES a cualquier horizonte).
+4. **yhat**: `yhat(t) = y_neto_hat(t) + efecto(t)`.
+
+Implementación: `RLSForecastRunner.compute_derived_forecasts` +
+`_apply_causal_ses`, con `pl.Expr.ewm_mean(alpha=..., adjust=False)`
+(nativo de Polars) para el paso 3 — **vectorizado sobre todas las series a
+la vez, sin loop en Python y sin numba** (ver § Rendimiento).
+
+**Se usó `pl.ewm_mean`, no `statsmodels`.** `statsmodels.
+SimpleExpSmoothing` ajusta una serie a la vez desde Python — con miles de
+series eso es el mismo patrón de loop-con-overhead-por-serie que ya se
+eliminó para RLS. `ewm_mean` con `alpha` fijo es una operación columnar
+pura en Rust sobre todas las series simultáneamente.
+
+**Persistencia**: `driver_effect` y `driver_effect_value` (el término
+"efecto" en cada unidad) se persisten en el parquet — útil para debug y
+auditoría. Para nodos de sección estos campos van `null` (no aplica, el
+`yhat` de sección es la predicción RLS directa, sin descomposición).
+`y_neto` no se persiste (se puede recalcular al vuelo: `y − driver_effect`).
+
+**Asunción explícita**: la SES se alimenta con `y_neto` de **todos los
+días del panel denso**, incluyendo días sin venta (`y=0`) — a diferencia
+del RLS, que excluye actualizaciones vía `min_y_to_update`. Un día sin
+venta es información real para la línea de base local del nodo.
+
+## Rendimiento del modelo jerárquico
+
+Este cambio de arquitectura es, en sí mismo, la optimización de
+performance más grande del proyecto — no un ajuste incremental:
+
+- **Antes**: 1 fit RLS por serie (miles: sección × tienda × sku × 2
+  variables).
+- **Ahora**: **2-4 fits RLS en total** (uno por sección × variable). Todo
+  lo demás (tienda/sku/tienda+sku) es una **única pasada vectorizada**
+  (matmul de drivers + `ewm_mean`), sin loop por serie y sin threads — no
+  hay nada que paralelizar por serie en ese camino.
+- Benchmark sintético (8 tiendas × 15 SKU parcial, 111 series, 561 días de
+  historia): pipeline completo de la sección en **~4s** (1.5s EDP + 0.1s
+  RLS sección + 1.2s derivado vectorizado + agregación/features), de los
+  cuales el cómputo de tienda/sku es <1.5s para 109 series simultáneas.
 
 ## Dashboard
 
 - Unidad por defecto: **Valor ($)**.
-- **Ranking único wMAPE + Rotación** (reemplaza los tabs "Mejor wMAPE" /
-  "Mayor rotación"): todas las filas, **5 por página**, ordenado por wMAPE asc.
-  Columnas `Código | Descripción | Rotación | wMAPE (%) | N puntos | % con venta`.
-  - `N puntos` = períodos con venta (**y≠0**).
-  - `% con venta` = proporción de esos puntos sobre el spine del nivel.
-  - La etiqueta **"Total de puntos"** indica el spine total del nivel (igual
-    para todas las series; alineado al panel real si es más largo que settings).
-- A nivel **SKU** se indica en qué tienda estamos
-  (`🏬 Tienda: 00122 — CENTRAL`). Cambiar de SKU mantiene la tienda (la
-  jerarquía del sidebar la fija).
-- Series de forecast visibles y **Métricas Rolling 28d** solo se muestran si el
-  parquet trae `yhat28`/`valuehat28` (es decir, si el rolling se calculó — ver
-  § Rolling 28d). Si no, el dashboard muestra solo `yhat`.
-- El gráfico muestra **todos** los períodos, incluidos los de `y=0` (los ceros
-  solo se excluyen de las métricas); línea punteada en zona solo-forecast.
-- Click en fila → sincroniza selectores de la sidebar.
-- El dashboard es **puramente de lectura**: consume `forecast.parquet` ya
-  calculado y cada interacción es **O(subconjunto)** sobre el contexto
-  pre-agregado (cacheado por archivo+unidad en `st.session_state`).
+- Filtros independientes Sección + Tienda + SKU (ver § Filtros
+  independientes) — reemplazan la navegación jerárquica anterior.
+- **Dos tablas de ranking** (Tiendas / SKU), cada una con filtro cruzado
+  según el otro eje — ver § Ranking.
+- Click en fila de cualquiera de las dos tablas → aplica ese filtro y lo
+  marca como "ancla" (mismo comportamiento que elegirlo manualmente en el
+  select correspondiente).
+- Gráfico: área con actuals (incluyendo períodos con `y=0`); **línea
+  punteada** en zona solo-forecast.
+- El dashboard es **puramente de lectura**: consume `forecast.parquet` /
+  `wmape.parquet` ya calculados (ver § Arquitectura).
+- El contexto de tienda (`📍 Tienda: {código} — {nombre}`) solo se muestra
+  cuando **ambos** filtros (Tienda y SKU) están activos a la vez — un SKU
+  sin tienda es, por diseño, un agregado cross-tienda y no tiene "una"
+  tienda que mostrar. Va **arriba** del encabezado del nodo. El
+  encabezado dice `SECCIÓN:` / `TIENDA:` / `SKU:` según qué combinación de
+  filtros esté activa (`view.node_kind`).
+- El control "Series de forecast visibles" (yhat vs yhat28) y la sección
+  "Métricas Rolling 28d" **solo se muestran si el nodo actualmente
+  seleccionado tiene rolling28 calculado** — desde el modelo jerárquico,
+  eso significa **solo el nodo de sección** (ver § Rolling 28d).
+- `prepare_dashboard_state` está envuelto en `st.cache_data` (ver
+  `_cached_dashboard_state` en `dashboard.py`): Streamlit re-ejecuta todo
+  el script en cada interacción, así que sin cache se recalculaban
+  agregación temporal y rankings en cada rerun aunque los datos de origen
+  no cambiaran. La clave de cache es la selección de filtros (unidad,
+  freq, sección, tienda, sku) — volver a un nodo ya visitado es
+  instantáneo.
+
+## Ranking
+
+**Dos tablas** (Tiendas / SKU), cada una con las mismas columnas:
+
+| Código | Descripción | wMAPE (%) | Rotación | N puntos | % ≠0 |
+|---|---|---|---|---|---|
+
+Filtro cruzado (`backend.ranking_table`, parámetro `axis`):
+- **Tabla de Tiendas**: si no hay SKU elegido, compara tiendas puras de la
+  sección; si hay un SKU elegido, compara **tienda+sku** entre tiendas
+  para ese SKU fijo (ranking cross-tienda para ese producto puntual).
+- **Tabla de SKU**: si no hay tienda elegida, compara SKU puros
+  (agregados sobre todas las tiendas); si hay una tienda elegida, compara
+  **tienda+sku** entre SKU para esa tienda fija (ranking cross-sku dentro
+  de esa tienda).
+- Ambas tablas excluyen el nodo actualmente seleccionado en su propio eje,
+  y las series sin ventas (`wmape == 0`, sin ningún punto scoreable).
+- **Rotación** = suma de `y` (o `value` según unidad).
+- **N puntos** = cantidad de puntos con venta (`y ≠ 0`), no la longitud
+  del spine (constante para todas las filas de la sección).
+- **% ≠0** = N puntos / longitud del spine — cobertura de venta.
+- La longitud del spine se muestra como una **etiqueta única** sobre las
+  tablas: `N puntos totales (spine): NNN`.
+- El gráfico **no cambió** — siempre incluyó los períodos con `y=0` (ver
+  `tests/test_densify.py::test_chart_series_includes_zeros`).
 
 ## Ejecución
 
@@ -119,22 +225,16 @@ pytest tests/ -q
 ## Tests
 
 Cubren helpers de fecha (domingo, lunes, bloques 28 días), horizontes por
-sección, etiquetas sin prefijo de sección, agregación con descripciones, y
-(desde esta optimización) equivalencia numérica de los refactors de
-rendimiento: fit único por serie, EDP batched, y conteo de fits del rolling
-28d. Además:
-
-- **Rolling 28d opt-in**: `settings.COMPUTE_ROLLING28` off por defecto,
-  leído por `ForecastConfig`; `_attach_rolling28` no invoca `run_rolling_28`
-  ni agrega columnas cuando está off.
-- **Backend/dashboard**: tabla única wMAPE+Rotación (`N puntos` y `% con venta`, total del spine), contexto pre-agregado estable, `has_rolling`
-  según columnas del parquet y contexto de tienda a nivel SKU.
-
-Ver § Rendimiento para el detalle de cada test.
+sección, las 4 combinaciones del esquema de `unique_id` (sección / tienda /
+sku / tienda+sku), agregación con descripciones, filtrado cruzado
+tienda↔sku, y equivalencia numérica del método derivado (efecto + SES
+causal) contra referencias calculadas a mano en Python puro — ver §
+Modelo jerárquico y § Rendimiento para el detalle de cada test.
 
 ## Dependencias
 
 `polars`, `numpy`, `plotly`, `streamlit`, `python-dateutil`, `tqdm`, `fastexcel`, y el módulo interno `rls_opt`.
+
 
 ## Métricas
 
@@ -182,18 +282,21 @@ Si aparece `program not found`, falta el paquete en el entorno:
 
 ## Rolling 28d (`yhat28` / `valuehat28`)
 
-> **Opt-in (default OFF).** El rolling 28d es el cómputo más costoso del
-> pipeline (walk-forward sobre toda la historia de todas las series). Por
-> defecto está desactivado: `settings.COMPUTE_ROLLING28 = False`. Para
-> habilitarlo, poner `True` en `settings.py` o ejecutar
-> `python -m app.forecasts --rolling28` (`--no-rolling28` para forzar off).
->
-> Con el flag **off**, el parquet de salida **no incluye** las columnas
-> `yhat28`/`valuehat28`; el dashboard oculta el selector de series de
-> forecast, la línea verde del rolling y las Métricas Rolling 28d. Con el
-> flag **on**, esos controles aparecen automáticamente (la detección es por
-> contenido del parquet, no por re-render: también funciona con archivos
-> subidos).
+**Opcional** vía `settings.COMPUTE_ROLLING_28` (default: `False`). Cuando está
+desactivado, `forecasts.py` no calcula nada de esto y **no agrega las
+columnas** `yhat28`/`valuehat28` al parquet (ni siquiera nulas) — el
+dashboard detecta si el rolling28 fue calculado por la sola presencia de
+estas columnas con datos, tanto a nivel de dataset completo (para decidir si
+mostrar el control "Series de forecast visibles") como a nivel del nodo
+puntual seleccionado (para decidir si dibujar la línea y mostrar las
+métricas).
+
+**Desde el modelo jerárquico (RLS solo a nivel sección), el rolling28
+también queda limitado al nivel sección** — es el único nivel con un RLS
+real que tenga sentido reajustar por bloques; tienda/sku/tienda+sku usan el
+método derivado (efecto + SES), que no tiene una noción de "reajuste por
+bloque" análoga. `_run_section` restringe el panel de entrada de
+`run_rolling_28` a `unique_id == seccion` antes de llamarlo.
 
 Walk-forward por bloques de 28 días sobre **toda la historia** (desde el primer lunes ≥ primera fecha de la serie):
 
@@ -201,12 +304,11 @@ Walk-forward por bloques de 28 días sobre **toda la historia** (desde el primer
 2. Para el bloque que empieza en la posición `pos`, se predice usando el vector de coeficientes tal como quedó tras el **último actual estrictamente anterior a `pos`** (leído de la trayectoria de coeficientes ya calculada en el fit único — sin reajustar nada).
 3. No modifica `yhat` / `valuehat`. Métricas `WMAPE₂₈` / `BIAS₂₈` en sección aparte del dashboard.
 
-⚠️ Esto reemplaza el walk-forward anterior, que reajustaba el modelo completo en cada bloque de 28 días (ver § Rendimiento, Fase 3). Los valores numéricos de `yhat28`/`wmape_28` **cambian levemente** respecto de versiones previas del pipeline por este motivo — es un cambio intencional y documentado, no un bug.
+⚠️ Esto reemplaza el walk-forward anterior, que reajustaba el modelo completo en cada bloque de 28 días. Los valores numéricos de `yhat28`/`wmape_28` **cambian levemente** respecto de versiones previas del pipeline por este motivo — es un cambio intencional y documentado, no un bug.
 
 ## Panel denso
 
 Por sección, el spine de fechas sale de `section_horizons` (settings):
-
 - train: `[train_start, train_end]`
 - OOS: `[test_start, test_end]`
 - forecast-only: `[forecast_start, forecast_end]`
@@ -227,12 +329,12 @@ miles de series reales).
 
 ### Causas raíz y fix
 
-| # | Causa                                                                                                                                                                                                                                                           | Antes                                                 | Ahora                                                                                                                                                                                                                                   |
-| - | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1 | **Triple fit redundante.** `_run_section` llamaba `runner.run(train, target)` una vez por cada `target` (in_sample / out_sample / forecast_only) sobre el **mismo** `train` → 3 fits idénticos (6 contando la variable precio) por serie. | 6 fits/serie                                          | **2 fits/serie** (`RLSForecastRunner.fit_and_predict_multi`: 1 fit por variable, N predicciones)                                                                                                                                |
-| 2 | **Rolling 28d O(n²).** `_rolling_28_one` reajustaba el modelo completo en cada bloque de 28 días sobre un prefijo creciente de la serie.                                                                                                              | O(n²/28) por serie,`min_obs=2` (procesaba de más) | **O(n) por serie**: 1 fit con `return_all_coefs=True`, walk-forward leyendo la trayectoria de coeficientes ya calculada (`np.searchsorted` sobre los índices de actuals). `min_obs=28` alineado con el resto del pipeline. |
-| 3 | **EDP no vectorizado.** `decompose_price` (numba) ya soportaba `indexors` para batchear múltiples series en una sola llamada, pero `_calculate_edp` hacía `partition_by` + 1 llamada numba por serie desde Python.                              | 1 llamada numba por serie                             | **1 sola llamada numba batched** (`indexors=[slice, ...]`) para todas las series del panel. Requirió un fix de tipado en `rls_opt/edp.py` (ver nota abajo).                                                                  |
-| 4 | **Paralelismo con procesos.** `ProcessPoolExecutor` serializa DataFrames Polars entre procesos; `run_rolling_28` ni siquiera paralelizaba. Los kernels numba (`_rls`, `decompose_price`) son `nopython=True` y **liberan el GIL**.        | Procesos (pickling) o secuencial                      | **`ThreadPoolExecutor`** en `fit_and_predict_multi` y `run_rolling_28`. `--n-jobs` ahora es Nº de threads.                                                                                                               |
+| # | Causa | Antes | Ahora |
+|---|-------|-------|-------|
+| 1 | **Triple fit redundante.** `_run_section` llamaba `runner.run(train, target)` una vez por cada `target` (in_sample / out_sample / forecast_only) sobre el **mismo** `train` → 3 fits idénticos (6 contando la variable precio) por serie. | 6 fits/serie | **2 fits/serie** (`RLSForecastRunner.fit_and_predict_multi`: 1 fit por variable, N predicciones) |
+| 2 | **Rolling 28d O(n²).** `_rolling_28_one` reajustaba el modelo completo en cada bloque de 28 días sobre un prefijo creciente de la serie. | O(n²/28) por serie, `min_obs=2` (procesaba de más) | **O(n) por serie**: 1 fit con `return_all_coefs=True`, walk-forward leyendo la trayectoria de coeficientes ya calculada (`np.searchsorted` sobre los índices de actuals). `min_obs=28` alineado con el resto del pipeline. |
+| 3 | **EDP no vectorizado.** `decompose_price` (numba) ya soportaba `indexors` para batchear múltiples series en una sola llamada, pero `_calculate_edp` hacía `partition_by` + 1 llamada numba por serie desde Python. | 1 llamada numba por serie | **1 sola llamada numba batched** (`indexors=[slice, ...]`) para todas las series del panel. Requirió un fix de tipado en `rls_opt/edp.py` (ver nota abajo). |
+| 4 | **Paralelismo con procesos.** `ProcessPoolExecutor` serializa DataFrames Polars entre procesos; `run_rolling_28` ni siquiera paralelizaba. Los kernels numba (`_rls`, `decompose_price`) son `nopython=True` y **liberan el GIL**. | Procesos (pickling) o secuencial | **`ThreadPoolExecutor`** en `fit_and_predict_multi` y `run_rolling_28`. `--n-jobs` ahora es Nº de threads. |
 
 ### Fix necesario en `rls_opt/edp.py`
 
@@ -290,7 +392,35 @@ pytest tests/test_forecasts_runner.py tests/test_edp_batch.py tests/test_rolling
 
 ### Tests de performance añadidos
 
-- `tests/test_forecasts_runner.py`: el fit único (Fase 1) produce predicciones **idénticas** a fitear por separado para cada target (referencia manual), y el número de llamadas a `.fit()` no escala con el número de targets.
-- `tests/test_edp_batch.py`: el EDP batched (Fase 2) produce `asp`/`edp`/`discount` **idénticos** al loop por serie; fallback automático verificado; modo rápido aproximado para >5000 series sin llamar a `decompose_price`.
-- `tests/test_rolling28.py`: `run_rolling_28` respeta `min_obs=28` (Fase 5); `_rolling_28_one` hace exactamente 2 llamadas a `.fit()` (y + precio) sin importar la longitud de la serie ni el número de bloques de 28 días (Fase 3); la trayectoria de coeficientes tiene tantos estados como actuals usados en el fit (precondición del walk-forward por bloques). Además: `COMPUTE_ROLLING28` es opt-in (off por defecto) y `_attach_rolling28` salta `run_rolling_28` y deja `res_df` sin columnas rolling cuando está desactivado.
-- `tests/test_backend.py`: tabla única de ranking (columnas `N puntos`/`% con venta`, total del spine, exclusión de series sin ventas y del id seleccionado), contexto pre-agregado `build_dashboard_context` estable, `has_rolling` según columnas del parquet, y contexto de tienda en nivel SKU.
+- `tests/test_forecasts_runner.py`: `_apply_causal_ses` coincide con una referencia de SES causal calculada a mano en Python puro (serie única, dos series independientes sin mezclar estado, continuación constante en forecast-only); `compute_derived_forecasts` coincide con la referencia manual completa del procedimiento (efecto + y_neto + SES + yhat) para un nodo tienda+sku con coeficientes de sección inyectados; ignora ids de sección; `fit_and_predict_sections` solo ajusta los ids pedidos, nunca otros presentes en el DataFrame.
+- `tests/test_edp_batch.py`: el EDP batched produce `asp`/`edp`/`discount` **idénticos** al loop por serie; fallback automático verificado; modo rápido aproximado para >5000 series sin llamar a `decompose_price`.
+- `tests/test_rolling28.py`: `run_rolling_28` respeta `min_obs=28`; `_rolling_28_one` hace exactamente 2 llamadas a `.fit()` (y + precio) sin importar la longitud de la serie ni el número de bloques de 28 días; `COMPUTE_ROLLING_28=False` (default) no agrega columnas `yhat28`/`valuehat28` para ningún nodo, `=True` las agrega solo para el nodo de sección.
+- `tests/test_aggregator.py`: las 4 combinaciones del esquema de id se generan correctamente; el nodo sección+sku suma sobre todas las tiendas; descripciones (sku_desc/store_name) atadas correctamente por tipo de nodo.
+- `tests/test_backend.py`: filtrado cruzado tienda↔sku (`all_stores_in_section`, `stores_for_sku`, `skus_for_store`, etc.); `ranking_table` con y sin `fixed_peer`/`exclude` en ambos ejes; `prepare_dashboard_state` con las 4 combinaciones de filtros (`node_kind`, `store_context` solo cuando ambos filtros están activos, `has_rolling28` por nodo).
+
+## Backend.py y dashboard_data.py — ¿por qué siguen separados de forecasts.py?
+
+Se evaluó explícitamente (a pedido) si tenía sentido consolidar estos
+módulos dado que todo el cómputo pesado ya vive en `forecasts.py`. La
+conclusión fue **mantener la separación**, porque son responsabilidades
+distintas:
+
+- `forecasts.py` = **fit del modelo, offline**, corre una vez y escribe Parquet.
+- `backend.py` / `dashboard_data.py` = **ensamblado de vista** a partir de esos Parquet ya calculados (agregación temporal para la UI, formateo de tablas, split hist/forecast para el gráfico) — nunca reajustan un modelo ni recalculan EDP/features.
+
+El síntoma real reportado ("tiempo de carga demasiado lento, lo cual no
+tiene sentido para datos precalculados") **no era un problema de
+arquitectura de módulos** sino de falta de cache: Streamlit re-ejecuta
+*todo* el script en cada interacción de UI, así que `prepare_dashboard_state` (agregación
+temporal + ranking) se recalculaba sobre el DataFrame completo en cada
+cambio de selección, aunque el archivo cargado no hubiera cambiado. Se
+resolvió con `st.cache_data` sobre `prepare_dashboard_state` (ver §
+Dashboard) — la clave de cache es la selección de UI, no el contenido del
+DataFrame, así que seleccionar un nodo ya visitado es instantáneo sin haber
+tocado la separación de módulos.
+
+Se descartó (por ahora) la alternativa más invasiva de precalcular las
+tablas de ranking por nodo dentro de `forecasts.py` y guardarlas en el
+parquet — agrega complejidad de storage sin necesidad, ya que el cache en
+el dashboard resuelve el síntoma real (recomputación innecesaria en cada
+rerun) sin tocar el pipeline offline.

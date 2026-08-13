@@ -1,23 +1,29 @@
 """
 Forecast Explorer – Streamlit (solo visualización)
-==================================================
-Cálculos: app.backend. El pipeline precalcula los parquet una sola vez; el
-dashboard construye un contexto pre-agregado por (archivo, unidad) —
-`backend.build_dashboard_context` — que se reutiliza en cada interacción.
-Cualquier cambio de selección solo recorre subconjuntos (rankings = tabla
-pre-agregada; gráfico/métricas = serie elegida) → respuesta inmediata y
-correcta, sin re-procesar el panel completo.
+=================================================
+Cálculos: app.backend + app.dashboard_data
+Este módulo solo: controles st, dataframes y Plotly.
+
+Modelo de filtros: Sección es obligatoria; Tienda y SKU son dos filtros
+INDEPENDIENTES (no jerárquicos) al mismo nivel — cualquiera puede estar
+vacío, uno solo, o ambos a la vez. El orden de selección importa: el filtro
+tocado más recientemente "ancla" y acota las opciones del otro (si elegís
+Tienda, el select de SKU se acota a los SKU de esa tienda; si elegís SKU
+primero, el select de Tienda se acota a las tiendas donde existe ese SKU).
+
+Nota de performance: `prepare_dashboard_state` se envuelve en
+`st.cache_data`. Streamlit re-ejecuta todo este script en cada interacción
+de UI; sin cache, cada cambio de selección recalculaba agregación temporal +
+rankings sobre el DataFrame completo aunque los datos de origen (el
+parquet) no hubieran cambiado.
 """
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
-import json
 import sys
 from pathlib import Path
 
 import plotly.graph_objects as go
-import polars as pl
 import streamlit as st
 
 st.set_page_config(page_title="Forecast Explorer", layout="wide")
@@ -31,137 +37,76 @@ import settings
 
 try:
     from app import backend
+    from app.dashboard_data import prepare_dashboard_state
 except ImportError:  # pragma: no cover
     import backend  # type: ignore
+    from dashboard_data import prepare_dashboard_state  # type: ignore
 
 _RANK_HEIGHT = 35 + 5 * 35  # ~5 filas visibles
+_SENTINEL_TIENDA = "— Todas las tiendas —"
+_SENTINEL_SKU = "— Todos los SKU —"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Carga / contexto (pre-agregado UNA vez por archivo + unidad + CACHE EN DISCO)
+# Carga (I/O de UI; parseo delegado al backend)
 # ─────────────────────────────────────────────────────────────────────────────
-# El contexto completo se arma en el PRIMER render y se persiste a disco por
-# (origen, tamaño, mtime, unidad); los arranques siguientes lo leen de cache
-# en vez de re-parsear el parquet y re-escandear el panel (arranque rápido).
-# En sesión se mantiene en st.session_state con clave escalar para que cada
-# interacción sea O(subconjunto) sobre el contexto ya armado.
-_CACHE_DIR = Path(settings.ROOT) / "data" / ".dashcache"
+@st.cache_data(show_spinner="Cargando forecasts…", ttl=3600)
+def _load_parquet(path_str: str, mtime: float):
+    return backend.load_forecast_parquet(path_str)
 
 
-def _cache_key(source: tuple) -> str:
-    raw = "|".join(str(x) for x in source)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+@st.cache_data(show_spinner=False)
+def _load_bytes(data: bytes, name: str):
+    return backend.load_forecast_bytes(data, name)
 
 
-def _save_context(key: str, ctx: backend.DashboardContext) -> None:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ctx.unit_df.write_parquet(_CACHE_DIR / f"{key}.unit.parquet", compression="zstd")
-    ctx.per_id.write_parquet(_CACHE_DIR / f"{key}.per.parquet", compression="zstd")
-    pl.DataFrame(
-        {
-            "unique_id": list(ctx.label_map.keys()),
-            "label": list(ctx.label_map.values()),
-            "desc": [ctx.desc_map.get(u, "") for u in ctx.label_map],
-        }
-    ).write_parquet(_CACHE_DIR / f"{key}.labels.parquet", compression="zstd")
-    (_CACHE_DIR / f"{key}.meta.json").write_text(
-        json.dumps(
-            {
-                "all_ids": ctx.all_ids,
-                "has_rolling": ctx.has_rolling,
-                "has_value_cols": ctx.has_value_cols,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+@st.cache_data(show_spinner=False)
+def _cached_dashboard_state(
+    _res_df,
+    unidad: str,
+    freq: str,
+    seccion: str,
+    store: str | None,
+    sku: str | None,
+    cutoff_date: dt.date,
+    all_ids_tuple: tuple[str, ...],
+    _label_map: dict[str, str],
+    _desc_map: dict[str, str],
+):
+    """Envoltorio cacheado de `prepare_dashboard_state`. Los argumentos
+    prefijados con `_` no se hashean (DataFrame/dicts grandes, estables
+    mientras no cambie el archivo cargado); la clave de cache es el resto:
+    exactamente lo que identifica una selección de filtros."""
+    return prepare_dashboard_state(
+        _res_df,
+        unidad=unidad,
+        freq=freq,
+        seccion=seccion,
+        store=store,
+        sku=sku,
+        cutoff_date=cutoff_date,
+        all_ids=list(all_ids_tuple),
+        label_map=_label_map,
+        desc_map=_desc_map,
     )
-
-
-def _load_cached(key: str) -> backend.DashboardContext | None:
-    try:
-        files = (
-            _CACHE_DIR / f"{key}.unit.parquet",
-            _CACHE_DIR / f"{key}.per.parquet",
-            _CACHE_DIR / f"{key}.labels.parquet",
-            _CACHE_DIR / f"{key}.meta.json",
-        )
-        if not all(p.exists() for p in files):
-            return None
-        unit_df = pl.read_parquet(files[0])
-        per_id = pl.read_parquet(files[1])
-        lbl = pl.read_parquet(files[2])
-        label_map = dict(zip(lbl["unique_id"].to_list(), lbl["label"].to_list()))
-        desc_map = dict(zip(lbl["unique_id"].to_list(), lbl["desc"].to_list()))
-        meta = json.loads(files[3].read_text(encoding="utf-8"))
-        return backend.DashboardContext(
-            unit_df=unit_df,
-            label_map=label_map,
-            desc_map=desc_map,
-            per_id=per_id,
-            all_ids=meta["all_ids"],
-            has_rolling=meta["has_rolling"],
-            has_value_cols=meta["has_value_cols"],
-        )
-    except Exception:
-        return None
-
-
-def _prune_cache(keep: int = 10) -> None:
-    """Mantiene acotado el dir de cache (descarta los keys más viejos)."""
-    try:
-        metas = sorted(
-            _CACHE_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime
-        )
-        for m in metas[:-keep]:
-            key = m.name[: -len(".meta.json")]
-            for suffix in (".meta.json", ".unit.parquet", ".per.parquet", ".labels.parquet"):
-                (_CACHE_DIR / f"{key}{suffix}").unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-def _load_context(uploaded_file, default_path, unidad):
-    """Devuelve (ctx, source_key). Arma el contexto solo si no está cacheado
-    (en disco o en sesión) o si cambió el archivo / la unidad."""
-    ss = st.session_state
-    if uploaded_file is not None:
-        data = uploaded_file.getvalue()
-        source = ("upload", uploaded_file.name, len(data), unidad)
-    else:
-        source = ("file", str(default_path), default_path.stat().st_mtime, unidad)
-
-    if ss.get("ctx_key") != source:
-        key = _cache_key(source)
-        ctx = _load_cached(key)
-        if ctx is None:
-            with st.spinner("Preparando datos (primera vez)…"):
-                if source[0] == "upload":
-                    res_df = backend.load_forecast_bytes(
-                        uploaded_file.getvalue(), uploaded_file.name
-                    )
-                else:
-                    res_df = backend.load_forecast_parquet(default_path)
-                ctx = backend.build_dashboard_context(res_df, unidad)
-                _save_context(key, ctx)
-                _prune_cache()
-        ss["ctx"] = ctx
-        ss["ctx_key"] = source
-    return ss["ctx"], source
 
 
 uploaded = st.sidebar.file_uploader(
     "Cargar forecasts (CSV o Parquet)", type=["csv", "parquet"]
 )
-default_path = Path(settings.FORECAST_PATH)
 if uploaded is not None:
+    res_df = _load_bytes(uploaded.getvalue(), uploaded.name)
     st.sidebar.success(f"Cargado: {uploaded.name}")
-elif default_path.exists():
-    st.sidebar.success(f"Cargado: {default_path.name}")
 else:
-    st.info(
-        "Sube un archivo CSV o Parquet, "
-        "o genera `data/output/forecast.parquet` con el pipeline."
-    )
-    st.stop()
+    default_path = Path(settings.FORECAST_PATH)
+    if default_path.exists():
+        res_df = _load_parquet(str(default_path), default_path.stat().st_mtime)
+        st.sidebar.success(f"Cargado: {default_path.name}")
+    else:
+        st.info(
+            "Sube un archivo CSV o Parquet, "
+            "o genera `data/output/forecast.parquet` con el pipeline."
+        )
+        st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Controles
@@ -181,18 +126,23 @@ freq = st.sidebar.radio(
     key="freq",
 )
 
-# Contexto pre-agregado (depende de archivo + unidad) — se cachea una sola vez.
-ctx, _source = _load_context(uploaded, default_path, unidad)
-has_rolling = ctx.has_rolling
-
 # Etiquetas según unidad (mapeo interno siempre yhat / yhat28)
 _is_valor = unidad.startswith("Valor")
 _opt_yhat = "valuehat" if _is_valor else "yhat"
 _opt_yhat28 = "valuehat28" if _is_valor else "yhat28"
 
-# El selector de series de forecast SOLO existe si el rolling 28d fue
-# calculado (COMPUTE_ROLLING28=True en el pipeline). Si no, solo yhat.
-if has_rolling:
+# El rolling28 es opcional (settings.COMPUTE_ROLLING_28) y, desde el modelo
+# jerárquico RLS-sección, SOLO existe para nodos de sección. Si el dataset
+# cargado no lo tiene en absoluto, el control no tiene sentido (1 sola
+# opción) y no se muestra.
+dataset_has_rolling28 = (
+    "yhat28" in res_df.columns and res_df.select("yhat28").drop_nulls().height > 0
+) or (
+    "valuehat28" in res_df.columns
+    and res_df.select("valuehat28").drop_nulls().height > 0
+)
+
+if dataset_has_rolling28:
     _forecast_opts = [_opt_yhat, _opt_yhat28]
     series_forecast = st.sidebar.multiselect(
         "Series de forecast visibles",
@@ -203,114 +153,168 @@ if has_rolling:
     )
     if not series_forecast:
         series_forecast = [_opt_yhat]
-        st.sidebar.warning(
-            f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}»."
-        )
+        st.sidebar.warning(f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}».")
     show_yhat = _opt_yhat in series_forecast
     show_yhat28 = _opt_yhat28 in series_forecast
 else:
-    series_forecast = [_opt_yhat]
-    show_yhat, show_yhat28 = True, False
+    show_yhat = True
+    show_yhat28 = False
 
-all_ids = ctx.all_ids
-label_map, desc_map = ctx.label_map, ctx.desc_map
-NOMBRES = settings.NOMBRES_NIVELES
+all_ids = sorted(res_df["unique_id"].unique().to_list())
+label_map, desc_map = backend.build_label_maps(res_df)
 
 
 def label_for(uid: str) -> str:
     return label_map.get(uid, settings.display_label(uid))
 
 
-st.sidebar.markdown("### Selección de nivel")
-if st.sidebar.button("🔄 Reiniciar niveles"):
-    for k in list(st.session_state.keys()):
-        if k.startswith("nivel_") or k.startswith("sel_"):
-            del st.session_state[k]
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtros: Sección (obligatoria) + Tienda / SKU (independientes, opcionales)
+# ─────────────────────────────────────────────────────────────────────────────
+st.sidebar.markdown("### Filtros")
+
+if st.sidebar.button("🔄 Reiniciar filtros"):
+    for k in ("sel_tienda", "sel_sku", "_last_touched", "_prev_seccion"):
+        st.session_state.pop(k, None)
     st.rerun()
 
-if "sel_from_table" in st.session_state:
-    target = st.session_state.pop("sel_from_table")
-    parts = target.split("||")
-    st.session_state["nivel_0"] = parts[0]
-    if len(parts) >= 2:
-        st.session_state[f"nivel_1__{parts[0]}"] = "||".join(parts[:2])
-    if len(parts) >= 3:
-        st.session_state[f"nivel_2__{'||'.join(parts[:2])}"] = target
-
-opciones_raiz = backend.opciones_nivel(all_ids, None)
-default_idx = opciones_raiz.index("1") if "1" in opciones_raiz else 0
-selected_id = st.sidebar.selectbox(
-    NOMBRES[0],
-    opciones_raiz,
-    index=default_idx if opciones_raiz else 0,
-    key="nivel_0",
+secciones_disp = backend.secciones_disponibles(all_ids)
+default_sec_idx = secciones_disp.index("1") if "1" in secciones_disp else 0
+seccion = st.sidebar.selectbox(
+    "Sección",
+    secciones_disp,
+    index=default_sec_idx if secciones_disp else 0,
+    key="sel_seccion",
     format_func=lambda x: f"Sección {x}",
 )
 
-niveles_recorridos: list[tuple[str, list[str]]] = [(NOMBRES[0], opciones_raiz)]
-nivel = 1
-while True:
-    hijos = backend.opciones_nivel(all_ids, selected_id)
-    if not hijos:
-        break
-    nombre_nivel = NOMBRES[nivel] if nivel < len(NOMBRES) else f"Nivel {nivel}"
-    niveles_recorridos.append((nombre_nivel, hijos))
-    opcion_mantener = f"— Quedarse en «{label_for(selected_id)}» —"
-    key = f"nivel_{nivel}__{selected_id}"
-    eleccion = st.sidebar.selectbox(
-        nombre_nivel,
-        [opcion_mantener] + hijos,
-        index=0,
-        key=key,
-        format_func=lambda x: x if x.startswith("—") else label_for(x),
-    )
-    if eleccion == opcion_mantener:
-        break
-    selected_id = eleccion
-    nivel += 1
+# Cambiar de sección invalida cualquier tienda/sku elegido previamente.
+if st.session_state.get("_prev_seccion") != seccion:
+    st.session_state["sel_tienda"] = _SENTINEL_TIENDA
+    st.session_state["sel_sku"] = _SENTINEL_SKU
+    st.session_state["_last_touched"] = None
+    st.session_state["_prev_seccion"] = seccion
 
-nombre_nivel_actual, candidatos = niveles_recorridos[-1]
+# Click en una fila de ranking: aplica el filtro correspondiente y ancla
+# ese eje (ver más abajo, tablas de ranking).
+if "_pending_tienda" in st.session_state:
+    st.session_state["sel_tienda"] = st.session_state.pop("_pending_tienda")
+    st.session_state["_last_touched"] = "tienda"
+if "_pending_sku" in st.session_state:
+    st.session_state["sel_sku"] = st.session_state.pop("_pending_sku")
+    st.session_state["_last_touched"] = "sku"
 
-# Corte in/out = train_end de la sección: lo resuelve backend dentro de
-# prepare_dashboard_state_from_context (sin duplicar filtros del sidebar).
-cutoff_date = None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ViewModel (solo subconjuntos sobre el contexto pre-agregado → rápido).
-# ─────────────────────────────────────────────────────────────────────────────
-ss = st.session_state
-view_key = (
-    "view",
-    *_source,
-    freq,
-    selected_id,
-    tuple(candidatos or []),
-    nombre_nivel_actual,
+def _touch_tienda() -> None:
+    st.session_state["_last_touched"] = "tienda"
+
+
+def _touch_sku() -> None:
+    st.session_state["_last_touched"] = "sku"
+
+
+last_touched = st.session_state.get("_last_touched")
+_raw_tienda = st.session_state.get("sel_tienda", _SENTINEL_TIENDA)
+_raw_sku = st.session_state.get("sel_sku", _SENTINEL_SKU)
+_sku_val = None if _raw_sku == _SENTINEL_SKU else _raw_sku
+_store_val = None if _raw_tienda == _SENTINEL_TIENDA else _raw_tienda
+
+# Tienda: si el ancla es SKU (y hay un SKU concreto elegido), acotar a las
+# tiendas donde ese SKU existe; si no, todas las tiendas de la sección.
+if last_touched == "sku" and _sku_val is not None:
+    tienda_opts = [_SENTINEL_TIENDA] + backend.stores_for_sku(all_ids, seccion, _sku_val)
+else:
+    tienda_opts = [_SENTINEL_TIENDA] + backend.all_stores_in_section(all_ids, seccion)
+if _raw_tienda not in tienda_opts:
+    st.session_state["sel_tienda"] = _SENTINEL_TIENDA
+    _raw_tienda = _SENTINEL_TIENDA
+
+store_sel = st.sidebar.selectbox(
+    "Tienda",
+    tienda_opts,
+    key="sel_tienda",
+    on_change=_touch_tienda,
+    format_func=lambda x: x if x == _SENTINEL_TIENDA else label_for(
+        settings.make_unique_id(seccion, store=x)
+    ),
 )
-if ss.get("view_key") != view_key:
-    ss["view"] = backend.prepare_dashboard_state_from_context(
-        ctx,
-        unidad=unidad,
-        freq=freq,
-        selected_id=selected_id,
-        cutoff_date=cutoff_date,
-        candidatos=candidatos,
-        nombre_nivel=nombre_nivel_actual,
-    )
-    ss["view_key"] = view_key
-view = ss["view"]
+store_sel_val = None if store_sel == _SENTINEL_TIENDA else store_sel
 
-st.subheader(f"NIVEL: **{view.label}**")
-if view.store_id:
-    store_lbl = (
-        f"{view.store_id} — {view.store_name}" if view.store_name else view.store_id
-    )
-    st.caption(f"🏬 Tienda: **{store_lbl}** · los SKUs listados pertenecen a esta tienda.")
+# SKU: si el ancla es Tienda (y hay una tienda concreta elegida), acotar a
+# los SKU de esa tienda; si no, todos los SKU de la sección.
+if last_touched == "tienda" and store_sel_val is not None:
+    sku_opts = [_SENTINEL_SKU] + backend.skus_for_store(all_ids, seccion, store_sel_val)
+else:
+    sku_opts = [_SENTINEL_SKU] + backend.all_skus_in_section(all_ids, seccion)
+if _raw_sku not in sku_opts:
+    st.session_state["sel_sku"] = _SENTINEL_SKU
+    _raw_sku = _SENTINEL_SKU
+
+sku_sel = st.sidebar.selectbox(
+    "SKU",
+    sku_opts,
+    key="sel_sku",
+    on_change=_touch_sku,
+    format_func=lambda x: x if x == _SENTINEL_SKU else label_for(
+        settings.make_unique_id(seccion, sku=x)
+    ),
+)
+sku_sel_val = None if sku_sel == _SENTINEL_SKU else sku_sel
+
+# Corte in/out = train_end de la sección (sin control en sidebar)
+selected_id_probe = settings.make_unique_id(seccion, store=store_sel_val, sku=sku_sel_val)
+_probe = backend.filter_series(
+    backend.prepare_unit_df(
+        res_df,
+        unidad,
+        "value" in res_df.columns and "valuehat" in res_df.columns,
+    ),
+    selected_id_probe,
+)
+_hz = backend.resolve_horizons(_probe, seccion, set(res_df.columns))
+cutoff_date = _hz.get("train_end") or backend.ds_range(_probe)[0] or dt.date.today()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rankings
+# ViewModel (todos los cálculos fuera de este módulo; cacheado por selección)
 # ─────────────────────────────────────────────────────────────────────────────
-def _show_ranking(display, key: str) -> None:
+view = _cached_dashboard_state(
+    res_df,
+    unidad,
+    freq,
+    seccion,
+    store_sel_val,
+    sku_sel_val,
+    cutoff_date,
+    tuple(all_ids),
+    label_map,
+    desc_map,
+)
+
+# Contexto de tienda (solo si Tienda Y SKU están ambos activos) va ARRIBA
+# del encabezado del nodo, para que sea lo primero que se lee.
+if view.store_context:
+    st.caption(f"📍 Tienda: {view.store_context}")
+
+_header_label = {
+    "seccion": "SECCIÓN",
+    "tienda": "TIENDA",
+    "sku": "SKU",
+    "tienda_sku": "SKU",
+}[view.node_kind]
+st.subheader(f"{_header_label}: **{view.label}**")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ranking: dos tablas (Tiendas / SKU), cada una respeta el filtro cruzado
+# activo (ver dashboard_data.prepare_dashboard_state y backend.ranking_table)
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("#### Ranking")
+st.caption(
+    f"Sección **{view.seccion}** · Unidad: **{view.unidad}** · "
+    f"N puntos totales (spine): **{view.n_spine}** (~5 filas visibles, scroll)."
+)
+
+
+def _show_ranking(display, key: str, pending_key: str, extract_field: str) -> None:
     if display.height == 0:
         st.caption("Sin datos suficientes.")
         return
@@ -326,38 +330,24 @@ def _show_ranking(display, key: str) -> None:
         column_config={
             "Código": st.column_config.TextColumn("Código"),
             "Descripción": st.column_config.TextColumn("Descripción"),
-            "wMAPE (%)": st.column_config.TextColumn("wMAPE (%)"),
-            "Rotación": st.column_config.TextColumn("Rotación"),
-            "N puntos ≠0": st.column_config.NumberColumn("N puntos ≠0"),
+            "N puntos": st.column_config.NumberColumn("N puntos (≠0)"),
             "% ≠0": st.column_config.TextColumn("% ≠0"),
         },
     )
     if event and event.selection and event.selection.rows:
-        st.session_state["sel_from_table"] = display["unique_id"][
-            event.selection.rows[0]
-        ]
+        clicked_uid = display["unique_id"][event.selection.rows[0]]
+        p = settings.split_unique_id(clicked_uid)
+        st.session_state[pending_key] = p[extract_field]
         st.rerun()
 
 
-st.markdown("#### Ranking wMAPE + Rotación")
-_seg = selected_id.split("||")
-_crumbs = [f"Sección {_seg[0]}"]
-_pref = _seg[0]
-for _i in range(1, len(_seg)):
-    _pref += f"||{_seg[_i]}"
-    _crumbs.append(label_map.get(_pref, _seg[_i]))
-st.caption(f"🧭 **Ruta:** " + " › ".join(_crumbs))
-st.caption(
-    f"Nivel actual: **{view.nombre_nivel}** · Unidad: **{view.unidad}** · "
-    f"Se muestran solo los **{view.ranking_n_series} hijos directos** del nivel "
-    f"seleccionado (sin series de otro nivel). ~5 filas visibles, scroll."
-)
-st.caption(
-    "🏷️ **Total de puntos (spine):** "
-    f"**{view.ranking_total_points}** · "
-    "`N puntos ≠0` = períodos con venta (y≠0) · `% ≠0` = proporción sobre el total."
-)
-_show_ranking(view.ranking_wmape, f"tabla_wmape_{view.selected_id}")
+col_t, col_s = st.columns(2)
+with col_t:
+    st.markdown("**Tiendas**")
+    _show_ranking(view.ranking_tiendas, f"tabla_tiendas_{view.selected_id}", "_pending_tienda", "store")
+with col_s:
+    st.markdown("**SKU**")
+    _show_ranking(view.ranking_skus, f"tabla_skus_{view.selected_id}", "_pending_sku", "sku")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Métricas
@@ -385,11 +375,13 @@ for col, title, key in (
         st.metric("BIAS", f"{m['bias']:+.2%}")
         st.caption(f"{m['n']} períodos")
 
-if has_rolling:
+# Rolling28: solo si este nodo tiene datos calculados (desde el modelo
+# jerárquico, solo el nodo de SECCIÓN los tiene — ver settings.COMPUTE_ROLLING_28).
+if view.has_rolling28:
     st.markdown("#### Métricas Rolling 28d (`yhat28`)")
     st.caption(
-        "Walk-forward por bloques de 28 días. Priors = modelo final (opción B). "
-        "WMAPE₂₈ = Σ|y−ŷ₂₈|/Σ|y| (excl. y=0)."
+        "Walk-forward por bloques de 28 días. Solo disponible a nivel sección "
+        "(único nivel con RLS real). WMAPE₂₈ = Σ|y−ŷ₂₈|/Σ|y| (excl. y=0)."
     )
     m28 = view.metrics_28
     c28a, c28b, c28c = st.columns(3)
@@ -442,7 +434,8 @@ if ch["fcst_ds"] and show_yhat:
             line=dict(color="rgba(255, 127, 14, 1)", dash="dot", width=2),
         )
     )
-if show_yhat28 and ch.get("hist_yhat28"):
+# yhat28: solo si (a) el checkbox lo pide Y (b) este nodo tiene rolling28.
+if view.has_rolling28 and show_yhat28 and ch.get("hist_yhat28"):
     fig.add_trace(
         go.Scatter(
             x=ch["hist_ds"],
@@ -452,7 +445,7 @@ if show_yhat28 and ch.get("hist_yhat28"):
             line=dict(color="rgba(44, 160, 44, 1)", width=2),
         )
     )
-if show_yhat28 and ch.get("fcst_yhat28"):
+if view.has_rolling28 and show_yhat28 and ch.get("fcst_yhat28"):
     fig.add_trace(
         go.Scatter(
             x=ch["fcst_ds"],
@@ -490,38 +483,20 @@ fig.update_layout(
     hovermode="x unified",
     margin=dict(l=40, r=40, t=50, b=40),
 )
-st.caption("Mostrando forecast: **" + ", ".join(series_forecast) + "**")
+_series_caption = [_opt_yhat] if show_yhat else []
+if view.has_rolling28 and show_yhat28:
+    _series_caption.append(_opt_yhat28)
+if _series_caption:
+    st.caption("Mostrando forecast: **" + ", ".join(_series_caption) + "**")
 st.plotly_chart(fig, width="stretch")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Detalle
 # ─────────────────────────────────────────────────────────────────────────────
-_DETAIL_LABELS = {
-    "ds": "Fecha",
-    "y": "Real",
-    "yhat": "Pronóstico",
-    "yhat28": "Rolling 28d",
-    "value": "Valor real",
-    "valuehat": "Valor pron.",
-    "valuehat28": "Valor rolling",
-    "period_type": "Período",
-    "unique_id": "ID",
-    "sku_desc": "SKU",
-    "store_name": "Tienda",
-    "seccion": "Sección",
-    "abs_error": "Error abs.",
-}
-
 with st.expander("Ver datos detallados"):
-    st.caption(
-        f"Agregación **{view.freq}** · Unidad **{view.unidad}** · "
-        f"Solo este elemento de la jerarquía: **{view.label}**"
-    )
-    detail = view.detail.rename(
-        {c: _DETAIL_LABELS[c] for c in view.detail.columns if c in _DETAIL_LABELS}
-    )
+    st.caption(f"Agregación **{view.freq}** · Unidad **{view.unidad}**")
     st.dataframe(
-        detail,
+        view.detail,
         width="stretch",
         hide_index=True,
         height=_RANK_HEIGHT,

@@ -1,23 +1,11 @@
 """
-Backend de cálculos de visualización (sin Streamlit / sin Plotly).
-
-El pipeline (app/forecasts.py) precalcula forecasts/wmape en parquet; este
-módulo es la ÚNICA capa de cálculo del dashboard:
-
-  - `build_dashboard_context`: pre-agregado por (archivo, unidad) — unit_df
-    (y/value alias-eados), mapas de etiquetas (vectorizados en polars) y
-    wmape/rotación/n puntos por unique_id. Se construye UNA vez por
-    archivo+unidad y se cachea; cada interacción del dashboard solo trabaja
-    sobre subconjuntos (O(candidatos) para rankings, O(serie seleccionada)
-    para gráfico/métricas) — no vuelve a tocar el panel completo.
-  - `prepare_dashboard_state` / `prepare_dashboard_state_from_context`:
-    ViewModel listo para renderizar.
+Backend de cálculos (sin Streamlit / sin Plotly).
+El dashboard solo visualiza lo que prepara dashboard_data.
 """
 from __future__ import annotations
 
 import datetime as dt
 import io
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +23,8 @@ DETAIL_COLUMNS = [
     "valuehat",
     "valuehat28",
     "period_type",
+    "driver_effect",
+    "driver_effect_value",
     "sku_desc",
     "store_name",
     "seccion",
@@ -130,101 +120,83 @@ def filter_series(df: pl.DataFrame, unique_id: str) -> pl.DataFrame:
     return df.filter(pl.col("unique_id") == unique_id).sort("ds")
 
 
-def opciones_nivel(all_ids: list[str], prefix: str | None) -> list[str]:
-    if prefix is None:
-        return sorted(i for i in all_ids if "||" not in i)
-    depth = prefix.count("||") + 1
-    pref = prefix + "||"
-    return sorted(
-        i for i in all_ids if i.startswith(pref) and i.count("||") == depth
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtros independientes (tienda / sku) — reemplaza la navegación jerárquica
+# ─────────────────────────────────────────────────────────────────────────────
+def secciones_disponibles(all_ids: list[str]) -> list[str]:
+    """Ids de nivel sección (sin tienda ni sku)."""
+    out = set()
+    for uid in all_ids:
+        p = settings.split_unique_id(uid)
+        if p["store"] is None and p["sku"] is None:
+            out.add(p["seccion"])
+    return sorted(out)
+
+
+def all_stores_in_section(all_ids: list[str], seccion: str) -> list[str]:
+    """Todas las tiendas de la sección (nodo tienda, sin filtro de sku)."""
+    out = set()
+    for uid in all_ids:
+        p = settings.split_unique_id(uid)
+        if p["seccion"] == seccion and p["store"] is not None and p["sku"] is None:
+            out.add(p["store"])
+    return sorted(out)
+
+
+def all_skus_in_section(all_ids: list[str], seccion: str) -> list[str]:
+    """Todos los SKU de la sección (nodo sku, sin filtro de tienda)."""
+    out = set()
+    for uid in all_ids:
+        p = settings.split_unique_id(uid)
+        if p["seccion"] == seccion and p["sku"] is not None and p["store"] is None:
+            out.add(p["sku"])
+    return sorted(out)
+
+
+def stores_for_sku(all_ids: list[str], seccion: str, sku: str) -> list[str]:
+    """Tiendas donde existe el SKU dado (nodo tienda+sku) — para acotar el
+    select de Tienda cuando el usuario elegió SKU primero."""
+    out = set()
+    for uid in all_ids:
+        p = settings.split_unique_id(uid)
+        if p["seccion"] == seccion and p["sku"] == sku and p["store"] is not None:
+            out.add(p["store"])
+    return sorted(out)
+
+
+def skus_for_store(all_ids: list[str], seccion: str, store: str) -> list[str]:
+    """SKU que existen en la tienda dada (nodo tienda+sku) — para acotar el
+    select de SKU cuando el usuario elegió Tienda primero."""
+    out = set()
+    for uid in all_ids:
+        p = settings.split_unique_id(uid)
+        if p["seccion"] == seccion and p["store"] == store and p["sku"] is not None:
+            out.add(p["sku"])
+    return sorted(out)
 
 
 def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
-    """
-    Mapas unique_id → (etiqueta, descripción) vectorizados en Polars.
-
-    Evita el loop Python previo sobre todas las series (costoso a nivel SKU
-    con miles de unique_ids). El contrato de salida es idéntico al de
-    `settings.display_label` / `settings.ranking_description`.
-    """
     cols = [c for c in ["unique_id", "sku_desc", "store_name"] if c in df.columns]
-    if not cols:
-        return {}, {}
     meta = df.select(cols).unique(subset=["unique_id"])
-
-    parts = meta.with_columns(
-        pl.col("unique_id").str.split_exact("||", 2).alias("_p")
-    ).unnest("_p")
-
-    has_desc = "sku_desc" in parts.columns
-    has_sname = "store_name" in parts.columns
-    if has_desc:
-        parts = parts.with_columns(
-            pl.col("sku_desc").replace("", None).alias("_desc")
-        )
-    if has_sname:
-        parts = parts.with_columns(
-            pl.col("store_name").replace("", None).alias("_sname")
-        )
-
-    # depth: 0 sección · 1 tienda · 2 SKU
-    parts = parts.with_columns(
-        pl.when(pl.col("field_1").is_null())
-        .then(0)
-        .when(pl.col("field_2").is_null())
-        .then(1)
-        .otherwise(2)
-        .alias("_depth")
+    uids = meta["unique_id"].to_list()
+    descs = (
+        meta["sku_desc"].to_list()
+        if "sku_desc" in meta.columns
+        else [""] * len(uids)
     )
-
-    label_expr = (
-        pl.when(pl.col("_depth") == 0).then(pl.format("Sección {}", pl.col("field_0")))
+    snames = (
+        meta["store_name"].to_list()
+        if "store_name" in meta.columns
+        else [""] * len(uids)
     )
-    if has_sname:
-        label_expr = label_expr.when(pl.col("_depth") == 1).then(
-            pl.when(pl.col("_sname").is_not_null())
-            .then(pl.format("{} — {}", pl.col("field_1"), pl.col("_sname")))
-            .otherwise(pl.col("field_1"))
-        )
-    else:
-        label_expr = label_expr.when(pl.col("_depth") == 1).then(pl.col("field_1"))
-    if has_desc:
-        label_expr = label_expr.when(pl.col("_depth") == 2).then(
-            pl.when(pl.col("_desc").is_not_null())
-            .then(pl.format("{} — {}", pl.col("field_2"), pl.col("_desc")))
-            .otherwise(pl.col("field_2"))
-        )
-    else:
-        label_expr = label_expr.when(pl.col("_depth") == 2).then(pl.col("field_2"))
-    label_expr = label_expr.otherwise(pl.col("unique_id"))
-
-    desc_expr = pl.when(pl.col("_depth") == 0).then(
-        pl.format("Sección {}", pl.col("field_0"))
-    )
-    if has_sname:
-        desc_expr = desc_expr.when(pl.col("_depth") == 1).then(
-            pl.col("_sname").fill_null("")
-        )
-    else:
-        desc_expr = desc_expr.when(pl.col("_depth") == 1).then(pl.lit(""))
-    if has_desc:
-        desc_expr = desc_expr.when(pl.col("_depth") == 2).then(
-            pl.col("_desc").fill_null("")
-        )
-    else:
-        desc_expr = desc_expr.when(pl.col("_depth") == 2).then(pl.lit(""))
-    desc_expr = desc_expr.otherwise(pl.lit(""))
-
-    parts = parts.with_columns(
-        label_expr.alias("_label"),
-        desc_expr.alias("_desc_rank"),
-    )
-    uids = parts["unique_id"].to_list()
-    return (
-        dict(zip(uids, parts["_label"].to_list())),
-        dict(zip(uids, parts["_desc_rank"].to_list())),
-    )
+    label_map: dict[str, str] = {}
+    desc_map: dict[str, str] = {}
+    for uid, desc, sname in zip(uids, descs, snames):
+        d = desc if desc else None
+        s = sname if sname else None
+        label_map[uid] = settings.display_label(uid, d, s)
+        desc_map[uid] = settings.ranking_description(uid, d, s)
+    return label_map, desc_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,66 +214,6 @@ def spine_n_fechas(df: pl.DataFrame, unique_ids: list[str] | None = None) -> int
     return int(sub["ds"].n_unique())
 
 
-def aggregate_wmape_by_id(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Pre-agregación por unique_id sobre el panel DIARIO (sin agregación
-    temporal): wmape, sum_y (rotación), n_with_sales (puntos y≠0) y n_ds
-    (días del spine por serie). Excluye y==0/nulos y forecast_only del
-    cálculo. Se ejecuta UNA vez por (archivo, unidad) → `build_dashboard_context`.
-    """
-    schema = {
-        "unique_id": pl.Utf8,
-        "wmape": pl.Float64,
-        "sum_y": pl.Float64,
-        "n_with_sales": pl.UInt32,
-        "n_ds": pl.UInt32,
-    }
-    if df.height == 0:
-        return pl.DataFrame(schema=schema)
-
-    has_ds = "ds" in df.columns
-    n_ds = None
-    if has_ds:
-        n_ds = (
-            df.select(["unique_id", "ds"])
-            .unique()
-            .group_by("unique_id")
-            .agg(pl.len().alias("n_ds"))
-        )
-
-    base = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
-    if "period_type" in base.columns:
-        base = base.filter(pl.col("period_type") != "forecast_only")
-
-    def _with_n_ds(frame: pl.DataFrame) -> pl.DataFrame:
-        if n_ds is None:
-            return frame.with_columns(pl.lit(0).cast(pl.UInt32).alias("n_ds"))
-        return frame.join(n_ds, on="unique_id", how="left").with_columns(
-            pl.col("n_ds").fill_null(0).cast(pl.UInt32)
-        )
-
-    if base.height == 0:
-        ids = _with_n_ds(df.select("unique_id").unique())
-        return ids.with_columns(
-            pl.lit(0.0).alias("wmape"),
-            pl.lit(0.0).alias("sum_y"),
-            pl.lit(0).cast(pl.UInt32).alias("n_with_sales"),
-        ).select(schema.keys())
-
-    agg = (
-        base.group_by("unique_id")
-        .agg(
-            pl.col("y").sum().alias("sum_y"),
-            (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
-            pl.len().alias("n_with_sales"),
-        )
-        .filter(pl.col("sum_y") != 0)
-        .with_columns((pl.col("sum_abs_error") / pl.col("sum_y")).alias("wmape"))
-        .select(["unique_id", "wmape", "sum_y", "n_with_sales"])
-    )
-    return _with_n_ds(agg).select(schema.keys())
-
-
 def wmape_por_id(
     ids: list[str],
     df: pl.DataFrame,
@@ -312,8 +224,6 @@ def wmape_por_id(
     WMAPE = Σ|y−ŷ|/Σ|y| (excluye y==0 y forecast_only del cálculo).
     n_points = longitud del spine (igual para todos si el panel está denso).
     n_with_sales = conteo y≠0 (informativo).
-
-    Implementado sobre `aggregate_wmape_by_id` (única fuente de la fórmula).
     """
     schema = {
         "unique_id": pl.Utf8,
@@ -325,91 +235,145 @@ def wmape_por_id(
     if not ids:
         return pl.DataFrame(schema=schema)
 
+    base = df.filter(pl.col("unique_id").is_in(ids))
+    if "period_type" in base.columns:
+        base_m = base.filter(pl.col("period_type") != "forecast_only")
+    else:
+        base_m = base
+
     if n_fechas_spine is None:
-        n_fechas_spine = spine_n_fechas(df, ids)
+        n_fechas_spine = spine_n_fechas(base_m if base_m.height else base, ids)
     n_fechas_spine = int(n_fechas_spine or 0)
 
-    agg = aggregate_wmape_by_id(df).filter(pl.col("unique_id").is_in(ids))
-    missing = [
-        i for i in ids if i not in set(agg["unique_id"].to_list())
-    ]
-    if missing:
-        agg = pl.concat(
-            [
-                agg,
-                pl.DataFrame(
-                    {
-                        "unique_id": missing,
-                        "wmape": [0.0] * len(missing),
-                        "sum_y": [0.0] * len(missing),
-                        "n_with_sales": [0] * len(missing),
-                        "n_ds": [0] * len(missing),
-                    }
-                ),
-            ],
-            how="diagonal_relaxed",
+    scored = base_m.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+    if scored.height == 0:
+        # devolver todos los ids con wmape null/0 y n_points = spine
+        return pl.DataFrame(
+            {
+                "unique_id": ids,
+                "wmape": [0.0] * len(ids),
+                "sum_y": [0.0] * len(ids),
+                "n_points": [n_fechas_spine] * len(ids),
+                "n_with_sales": [0] * len(ids),
+            }
+        ).filter(pl.col("unique_id").is_in(ids))
+
+    agg = (
+        scored.group_by("unique_id")
+        .agg(
+            pl.col("y").sum().alias("sum_y"),
+            (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
+            pl.len().alias("n_with_sales"),
         )
-    return (
-        agg.with_columns(pl.lit(n_fechas_spine).cast(pl.UInt32).alias("n_points"))
+        .filter(pl.col("sum_y") != 0)
+        .with_columns((pl.col("sum_abs_error") / pl.col("sum_y")).alias("wmape"))
+        .with_columns(pl.lit(n_fechas_spine).cast(pl.UInt32).alias("n_points"))
         .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
-        .filter(pl.col("unique_id").is_in(ids))
     )
+    # ids sin ventas: aún así n_points = spine
+    missing = [i for i in ids if i not in set(agg["unique_id"].to_list())]
+    if missing:
+        extra = pl.DataFrame(
+            {
+                "unique_id": missing,
+                "wmape": [0.0] * len(missing),
+                "sum_y": [0.0] * len(missing),
+                "n_points": [n_fechas_spine] * len(missing),
+                "n_with_sales": [0] * len(missing),
+            }
+        )
+        agg = pl.concat([agg, extra], how="diagonal_relaxed")
+    return agg
 
-
-def ranking_wmape_table(
-    per_id: pl.DataFrame,
-    selected_id: str,
+def ranking_table(
+    tabla_base: pl.DataFrame,
+    *,
+    seccion: str,
+    axis: str,
+    fixed_peer: str | None,
+    exclude: str | None,
     desc_map: dict[str, str],
-    n_points_total: int,
-    candidatos: list[str] | None = None,
+    unidad: str,
 ) -> pl.DataFrame:
     """
-    Tabla ÚNICA del dashboard (elimina 'Mayor rotación').
+    Tabla de ranking para UN eje (`axis="store"` o `axis="sku"`), con
+    filtro cruzado según el otro eje (`fixed_peer`):
 
-    Columnas exactas: Código | Descripción | wMAPE (%) | Rotación |
-    N puntos ≠0 | % ≠0 | unique_id.
+    - `axis="store"`, `fixed_peer=None`   → todas las tiendas de la sección.
+    - `axis="store"`, `fixed_peer=<sku>`  → tiendas donde existe ese SKU
+      (comparando tienda+sku entre tiendas, para ese SKU fijo).
+    - `axis="sku"`, `fixed_peer=None`     → todos los SKU de la sección.
+    - `axis="sku"`, `fixed_peer=<store>`  → SKU que existen en esa tienda
+      (comparando tienda+sku entre SKU, para esa tienda fija).
+    - `exclude`: código del nodo actualmente seleccionado en ESTE eje (se
+      omite de su propio ranking).
 
-    - **Jerárquica**: si se pasa `candidatos`, solo se rankean esos (hijos
-      directos del nivel seleccionado); nunca series de otro nivel/sección.
-    - `N puntos ≠0` = períodos con venta (y≠0).
-    - `% ≠0` = % de esos puntos respecto del spine total del nivel (etiqueta
-      "Total de puntos" arriba).
-    - Ordenada por wMAPE asc. Excluye el id seleccionado y las series sin
-      ventas (wmape=0 → sin error que rankear).
+    Columnas: Código | Descripción | wMAPE (%) | Rotación | N puntos | % ≠0
+    - "N puntos" = cantidad de puntos con venta (y≠0), no la longitud del
+      spine (que es igual para todas las filas y se muestra aparte como
+      una etiqueta única — ver `DashboardView.n_spine`).
+    - "% ≠0" = N puntos / longitud del spine, como cobertura de venta.
     """
-    tabla = per_id
-    if candidatos:
-        tabla = tabla.filter(pl.col("unique_id").is_in(candidatos))
-    tabla = tabla.filter(
-        (pl.col("unique_id") != selected_id) & (pl.col("wmape") != 0)
-    ).sort("wmape")
+    label_rot = "Rotación ($)" if unidad.startswith("Valor") else "Rotación (unid.)"
     empty = pl.DataFrame(
         schema={
             "Código": pl.Utf8,
             "Descripción": pl.Utf8,
             "wMAPE (%)": pl.Utf8,
-            "Rotación": pl.Utf8,
-            "N puntos ≠0": pl.UInt32,
+            label_rot: pl.Utf8,
+            "N puntos": pl.UInt32,
             "% ≠0": pl.Utf8,
             "unique_id": pl.Utf8,
         }
     )
+    if tabla_base.height == 0:
+        return empty
+
+    uids = tabla_base["unique_id"].to_list()
+    keep = []
+    for uid in uids:
+        p = settings.split_unique_id(uid)
+        if p["seccion"] != seccion:
+            keep.append(False)
+            continue
+        if axis == "store":
+            ok = p["store"] is not None
+            if ok:
+                ok = (p["sku"] == fixed_peer) if fixed_peer is not None else (p["sku"] is None)
+            if ok and exclude is not None and p["store"] == exclude:
+                ok = False
+        else:  # axis == "sku"
+            ok = p["sku"] is not None
+            if ok:
+                ok = (p["store"] == fixed_peer) if fixed_peer is not None else (p["store"] is None)
+            if ok and exclude is not None and p["sku"] == exclude:
+                ok = False
+        keep.append(ok)
+
+    tabla = tabla_base.filter(pl.Series(keep)).filter(pl.col("wmape") != 0).sort("wmape")
     if tabla.height == 0:
         return empty
-    uids = tabla["unique_id"].to_list()
-    n_pts = tabla["n_with_sales"].to_list()
+
+    uids2 = tabla["unique_id"].to_list()
+    codes = [
+        (settings.split_unique_id(u)["store"] if axis == "store" else settings.split_unique_id(u)["sku"])
+        for u in uids2
+    ]
+    n_points = tabla["n_points"].to_list()
+    n_with_sales = tabla["n_with_sales"].to_list()
     pct = [
-        (float(n) / n_points_total * 100.0) if n_points_total else 0.0 for n in n_pts
+        (nw / np_ * 100) if np_ else 0.0
+        for nw, np_ in zip(n_with_sales, n_points)
     ]
     return pl.DataFrame(
         {
-            "Código": [settings.ranking_code(u) for u in uids],
-            "Descripción": [desc_map.get(u, "") for u in uids],
+            "Código": codes,
+            "Descripción": [desc_map.get(u, "") for u in uids2],
             "wMAPE (%)": [f"{w * 100:,.2f}" for w in tabla["wmape"].to_list()],
-            "Rotación": [f"{v:,.2f}" for v in tabla["sum_y"].to_list()],
-            "N puntos ≠0": n_pts,
-            "% ≠0": [f"{p:.1f}%" for p in pct],
-            "unique_id": uids,
+            label_rot: [f"{v:,.2f}" for v in tabla["sum_y"].to_list()],
+            "N puntos": n_with_sales,
+            "% ≠0": [f"{p:,.1f}" for p in pct],
+            "unique_id": uids2,
         }
     )
 
@@ -586,7 +550,10 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
         return df
     num_cols = [
         c
-        for c in ("y", "yhat", "yhat28", "value", "valuehat", "valuehat28", "abs_error")
+        for c in (
+            "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
+            "driver_effect", "driver_effect_value", "abs_error",
+        )
         if c in df.columns
     ]
     if not num_cols:
@@ -628,215 +595,3 @@ def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:
     ae = float((scored["y"] - scored["yhat28"]).abs().sum())
     bias = float((scored["yhat28"] - scored["y"]).sum()) / sum_y
     return {"wmape_28": ae / abs(sum_y), "bias_28": bias, "n": scored.height}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Contexto de dashboard (pre-agregado UNA vez por archivo + unidad)
-# ─────────────────────────────────────────────────────────────────────────────
-@dataclass(slots=True)
-class DashboardContext:
-    """Pre-agregados que el dashboard reutiliza en cada interacción."""
-
-    unit_df: pl.DataFrame
-    label_map: dict[str, str]
-    desc_map: dict[str, str]
-    per_id: pl.DataFrame
-    all_ids: list[str]
-    has_rolling: bool
-    has_value_cols: bool
-
-
-@dataclass
-class DashboardView:
-    """Todo lo que el dashboard necesita pintar."""
-
-    selected_id: str
-    label: str
-    seccion: str
-    unidad: str
-    freq: str
-    horizons: dict[str, dt.date | None]
-    ranking_wmape: pl.DataFrame
-    ranking_n_series: int
-    ranking_total_points: int
-    metrics: dict[str, dict[str, float | int]]
-    metrics_28: dict[str, float | int]
-    chart: dict[str, Any]
-    detail: pl.DataFrame
-    ds_min: dt.date | None
-    ds_max: dt.date | None
-    cutoff: dt.date
-    nombre_nivel: str
-    has_value_cols: bool
-    has_rolling: bool
-    store_id: str | None = None
-    store_name: str | None = None
-
-
-def has_value_columns(df: pl.DataFrame) -> bool:
-    cols = set(df.columns)
-    return "value" in cols and "valuehat" in cols
-
-
-def build_dashboard_context(df: pl.DataFrame, unidad: str) -> DashboardContext:
-    """
-    Pre-agregado por (archivo, unidad). Construir esto UNA sola vez (y
-    cachearlo) es lo que hace rápido al dashboard: a partir de aquí cada
-    selección solo filtra subconjuntos → O(candidatos) + O(serie elegida).
-    """
-    has_value = has_value_columns(df)
-    has_rolling = "yhat28" in df.columns or "valuehat28" in df.columns
-    unit_df = prepare_unit_df(df, unidad, has_value)
-    label_map, desc_map = build_label_maps(df)
-    per_id = aggregate_wmape_by_id(unit_df)
-    all_ids = sorted(unit_df["unique_id"].unique().to_list())
-    return DashboardContext(
-        unit_df=unit_df,
-        label_map=label_map,
-        desc_map=desc_map,
-        per_id=per_id,
-        all_ids=all_ids,
-        has_rolling=has_rolling,
-        has_value_cols=has_value,
-    )
-
-
-def _store_context(selected_id: str) -> tuple[str | None, str | None]:
-    """contexto de tienda cuando se navega a nivel SKU (sec||store||sku)."""
-    parts = selected_id.split("||")
-    if len(parts) < 3:
-        return None, None
-    sec, store = parts[0], parts[1]
-    name = settings.SECCIONES.get(sec, {}).get("local_names", {}).get(store, "")
-    return (store, name) if store else (None, None)
-
-
-def _resolve_n_points(
-    ctx: DashboardContext, candidatos: list[str], seccion: str
-) -> int:
-    """Total de puntos del spine del nivel (settings alineado al panel real)."""
-    hz = settings.section_horizons(seccion)
-    n_spine = (hz["forecast_end"] - hz["train_start"]).days + 1
-    if ctx.per_id.height and candidatos:
-        sub = ctx.per_id.filter(pl.col("unique_id").is_in(candidatos))
-        if sub.height:
-            n_data = int(sub["n_ds"].max())
-            if n_data > n_spine:
-                n_spine = n_data
-    return int(n_spine or 0)
-
-
-def prepare_dashboard_state_from_context(
-    ctx: DashboardContext,
-    *,
-    unidad: str,
-    freq: str,
-    selected_id: str,
-    cutoff_date: dt.date | None,
-    candidatos: list[str] | None,
-    nombre_nivel: str,
-) -> DashboardView:
-    """
-    Construye el ViewModel a partir del contexto pre-agregado.
-
-    Por interacción solo toca: la serie seleccionada (gráfico, métricas,
-    detalle) y la tabla pre-agregada `per_id` filtrada por candidatos
-    (ranking). Sin re-procesar el panel completo.
-    """
-    unit_df = ctx.unit_df
-    df_daily = filter_series(unit_df, selected_id)
-    seccion = selected_id.split("||")[0]
-    horizons = resolve_horizons(df_daily, seccion, set(unit_df.columns))
-
-    train_end = horizons["train_end"]
-    test_end = horizons["test_end"]
-    fcst_start = horizons["forecast_start"]
-    fcst_end = horizons["forecast_end"]
-
-    ds_min, ds_max = ds_range(df_daily)
-    cutoff = cutoff_date or train_end or ds_min or dt.date.today()
-    if train_end and ds_min and ds_max and not (ds_min <= cutoff <= ds_max):
-        cutoff = ds_min
-
-    df_view = aggregate_temporal(df_daily, freq)
-
-    if candidatos is None:
-        candidatos = opciones_nivel(ctx.all_ids, selected_id)
-    n_points_total = _resolve_n_points(ctx, candidatos, seccion)
-    ranking_wmape = ranking_wmape_table(
-        ctx.per_id, selected_id, ctx.desc_map, n_points_total, candidatos=candidatos
-    )
-
-    metrics = metrics_in_out_total(df_view, cutoff, test_end or cutoff)
-    metrics_28 = (
-        metrics_rolling28(df_view)
-        if ctx.has_rolling
-        else {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
-    )
-    chart = build_chart_series(
-        df_view,
-        test_end or cutoff,
-        fcst_start or (cutoff + dt.timedelta(days=1)),
-        fcst_end or (cutoff + dt.timedelta(days=28)),
-        cutoff,
-        "period_type" in unit_df.columns,
-    )
-    detail = format_detail_display(detail_view(df_view))
-    label = ctx.label_map.get(selected_id, settings.display_label(selected_id))
-    store_id, store_name = _store_context(selected_id)
-
-    return DashboardView(
-        selected_id=selected_id,
-        label=label,
-        seccion=seccion,
-        unidad=unidad,
-        freq=freq,
-        horizons=horizons,
-        ranking_wmape=ranking_wmape,
-        ranking_n_series=len(candidatos),
-        ranking_total_points=n_points_total,
-        metrics=metrics,
-        metrics_28=metrics_28,
-        chart=chart,
-        detail=detail,
-        ds_min=ds_min,
-        ds_max=ds_max,
-        cutoff=cutoff,
-        nombre_nivel=nombre_nivel,
-        has_value_cols=ctx.has_value_cols,
-        has_rolling=ctx.has_rolling,
-        store_id=store_id,
-        store_name=store_name,
-    )
-
-
-def prepare_dashboard_state(
-    res_df: pl.DataFrame,
-    *,
-    unidad: str,
-    freq: str,
-    selected_id: str,
-    cutoff_date: dt.date | None = None,
-    candidatos: list[str] | None = None,
-    nombre_nivel: str,
-    label_map: dict[str, str] | None = None,
-    desc_map: dict[str, str] | None = None,
-) -> DashboardView:
-    """
-    API de compatibilidad / tests: construye el contexto desde `res_df` y
-    delega en `prepare_dashboard_state_from_context`. El dashboard productivo
-    usa el contexto cacheado (`build_dashboard_context` + `..._from_context`).
-    """
-    ctx = build_dashboard_context(res_df, unidad)
-    if label_map is not None and desc_map is not None:
-        ctx.label_map = label_map
-        ctx.desc_map = desc_map
-    return prepare_dashboard_state_from_context(
-        ctx,
-        unidad=unidad,
-        freq=freq,
-        selected_id=selected_id,
-        cutoff_date=cutoff_date,
-        candidatos=candidatos,
-        nombre_nivel=nombre_nivel,
-    )
