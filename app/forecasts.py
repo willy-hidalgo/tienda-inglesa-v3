@@ -1683,13 +1683,13 @@ class RLSForecastPipeline:
 
         # Recolectar datos lazy con streaming para reducir picos de memoria
         logger.info("Recolectando train con streaming para sección %s…", seccion)
-        raw_train = raw_train_lazy.collect(streaming=True)
+        raw_train = raw_train_lazy.collect(engine="streaming")
         logger.info("Recolectando OOS con streaming para sección %s…", seccion)
-        raw_oos = raw_oos_lazy.collect(streaming=True)
+        raw_oos = raw_oos_lazy.collect(engine="streaming")
         logger.info(
             "Recolectando forecast-only con streaming para sección %s…", seccion
         )
-        raw_fcst = raw_fcst_lazy.collect(streaming=True)
+        raw_fcst = raw_fcst_lazy.collect(engine="streaming")
 
         logger.info(
             "Sección %s raw train=%d filas | oos=%d filas | fcst=%d filas",
@@ -1735,6 +1735,7 @@ class RLSForecastPipeline:
             df_train = self._feature_builder.extract_drivers(
                 df_train, req_columns=driver_cols
             ).sort("ds")
+
         logger.info("Sección %s: features train OK shape=%s", seccion, df_train.shape)
 
         # Define df_oos from raw_oos
@@ -1743,6 +1744,7 @@ class RLSForecastPipeline:
         )
         del raw_oos
         gc.collect()
+
         if df_oos.height:
             with _stage_timer(f"{seccion}: agregación+densify OOS"):
                 # Densificar OOS al spine de la sección [test_start, test_end]
@@ -1795,6 +1797,7 @@ class RLSForecastPipeline:
                     df_oos, req_columns=driver_cols
                 ).sort("ds")
             logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
+
         if raw_fcst.height:
             # Frame de solo-forecast (calendario sintético)
             uids = df_train["unique_id"].unique().to_list()
@@ -1929,6 +1932,10 @@ class RLSForecastPipeline:
         preds_section = runner._predict_with_models(
             "dummy", sec_model_y, sec_model_p, train_section, df_train, meta=None
         )
+
+        preds_section.write_parquet(f"preds_section_{store_id}.parquet")
+        raise FileExistsError("escribió archivo intermedio")
+
         preds_section = preds_section.select(
             ["unique_id", "ds", "yhat", "valuehat"]
         ).rename({"yhat": "yhat_sec", "valuehat": "valuehat_sec"})
