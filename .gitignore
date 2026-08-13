@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 data/output/
+*.parquet
 
 
 # Virtual environments
