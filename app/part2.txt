@@ -1,0 +1,190 @@
+
+    def run(self) -> tuple[pl.DataFrame, pl.DataFrame]:
+        stages = tqdm(
+            total=3,
+            desc="Pipeline RLS",
+            unit="etapa",
+            bar_format="{l_bar}{bar}| {postfix}",
+        )
+
+        def _advance(label: str) -> None:
+            stages.set_postfix_str(label)
+            stages.update(1)
+
+        pipeline_t0 = time.perf_counter()
+
+        self._calendar = HolidayCalendar(self._cfg.holidays, self._cfg.now_year)
+        self._feature_builder = CalendarFeatureBuilder(self._calendar)
+
+        selected = self._load()
+        first_by_sec = self._first_data_by_section(selected)
+        _advance("datos cargados")
+
+        all_res, all_wm = [], []
+        driver_cols = None
+        for seccion in settings.FOCUS_SECTIONS:
+            if seccion not in first_by_sec:
+                logger.warning("Sin datos para sección %s; se omite.", seccion)
+                continue
+            sec_t0 = time.perf_counter()
+            res, wm, driver_cols = self._run_section(
+                selected, seccion, first_by_sec[seccion], driver_cols
+            )
+            logger.info(
+                "⏱ Sección %s: TOTAL %.1fs", seccion, time.perf_counter() - sec_t0
+            )
+            if res.height:
+                all_res.append(res)
+                # Checkpoint (Fase 5): no perder trabajo si el proceso se corta.
+                self._write_checkpoint(seccion, res)
+            if wm.height:
+                all_wm.append(wm)
+            # Liberar memoria explícitamente después de cada sección
+            gc.collect()
+        _advance("forecast por sección listo")
+
+        res_df = (
+            pl.concat(all_res, how="diagonal_relaxed") if all_res else pl.DataFrame()
+        )
+        wmapes_df = (
+            pl.concat(all_wm, how="diagonal_relaxed") if all_wm else pl.DataFrame()
+        )
+        _advance("resultados consolidados")
+        stages.close()
+        logger.info("⏱ Pipeline RLS: TOTAL %.1fs", time.perf_counter() - pipeline_t0)
+        return res_df, wmapes_df
+
+    def _write_checkpoint(self, seccion: str, res: pl.DataFrame) -> None:
+        try:
+            self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
+            partial_path = (
+                self._cfg.out_dir / f"forecast_seccion_{seccion}_partial.parquet"
+            )
+            res.write_parquet(
+                partial_path, compression="zstd", compression_level=3, statistics=True
+            )
+            logger.info("✓ Checkpoint sección %s: %s", seccion, partial_path)
+        except Exception:
+            logger.exception("No se pudo escribir checkpoint de sección %s", seccion)
+
+    def save(self, res_df: pl.DataFrame, wmapes_df: pl.DataFrame) -> None:
+        self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        forecast_path = self._cfg.out_dir / "forecast.parquet"
+        res_df.write_parquet(
+            forecast_path, compression="zstd", compression_level=3, statistics=True
+        )
+        logger.info("✓ Forecast guardado en: %s", forecast_path)
+        wmape_path = self._cfg.out_dir / "wmape.parquet"
+        wmapes_df.write_parquet(
+            wmape_path, compression="zstd", compression_level=3, statistics=True
+        )
+        logger.info("✓ WMAPE guardado en: %s", wmape_path)
+        self._export_forecast_excel(res_df)
+
+    def _export_forecast_excel(self, res_df: pl.DataFrame) -> None:
+        """
+        Por sección: Excel con SKU, Local, Forecast sumarizado
+        en [forecast_start, forecast_end] (sin actuals).
+        """
+        if res_df.height == 0:
+            return
+        # Solo nivel SKU (profundidad 2: sec||store||sku) y periodo forecast_only
+        sku_level = res_df.filter(
+            pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2
+        )
+        if "period_type" in sku_level.columns:
+            sku_level = sku_level.filter(pl.col("period_type") == "forecast_only")
+        elif (
+            "forecast_start" in sku_level.columns
+            and "forecast_end" in sku_level.columns
+        ):
+            sku_level = sku_level.filter(
+                (pl.col("ds").cast(pl.Date) >= pl.col("forecast_start").cast(pl.Date))
+                & (pl.col("ds").cast(pl.Date) <= pl.col("forecast_end").cast(pl.Date))
+            )
+        if sku_level.height == 0:
+            logger.warning("Sin filas forecast-only a nivel SKU para export Excel")
+            return
+
+        # Parse unique_id → seccion, local, sku
+        parts = sku_level.with_columns(
+            pl.col("unique_id").str.split_exact("||", 2).alias("_p")
+        ).unnest("_p")
+        rename = {}
+        for i, name in enumerate(["SECCION", "Local", "SKU"]):
+            src = f"field_{i}"
+            if src in parts.columns:
+                rename[src] = name
+        parts = parts.rename(rename) if rename else parts
+
+        for seccion in settings.FOCUS_SECTIONS:
+            sec_df = parts.filter(pl.col("SECCION") == seccion)
+            if sec_df.height == 0:
+                continue
+            summary = (
+                sec_df.group_by(["SKU", "Local"])
+                .agg(pl.col("yhat").sum().alias("Forecast sumarizado"))
+                .sort(["Local", "SKU"])
+                .select(["SKU", "Local", "Forecast sumarizado"])
+            )
+            out_path = self._cfg.out_dir / f"forecast_seccion_{seccion}.xlsx"
+            try:
+                summary.write_excel(out_path)
+            except Exception:
+                # fallback openpyxl / xlsxwriter no disponible → csv
+                csv_path = out_path.with_suffix(".csv")
+                summary.write_csv(csv_path)
+                logger.warning("write_excel falló; exportado CSV: %s", csv_path)
+                continue
+            logger.info(
+                "✓ Excel sección %s (%d filas): %s",
+                seccion,
+                summary.height,
+                out_path,
+            )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Pipeline RLS sección→SKU→local")
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=None,
+        help="Threads paralelos por unique_id (fit+predict y rolling28). Default: secuencial.",
+    )
+    parser.add_argument(
+        "--limit-series",
+        type=int,
+        default=None,
+        help=(
+            "Debug/benchmark: muestrea N SKUs por sección (conserva niveles "
+            "sección/tienda) para iterar rápido. NO usar en producción."
+        ),
+    )
+    parser.add_argument(
+        "--max-memory-mb",
+        type=int,
+        default=None,
+        help=(
+            "Máximo de memoria en MB para cada sección (recomendado: 50%% RAM disponible). "
+            "Si se excede, RLS usa menos threads y EDP usa fallback vectorizado. "
+            "Default: sin límite explícito (usa stream donde sea posible)."
+        ),
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    config = ForecastConfig.from_settings()
+    pipeline = RLSForecastPipeline(
+        config, n_jobs=args.n_jobs, limit_series=args.limit_series
+    )
+    res_df, wmapes_df = pipeline.run()
+    print(res_df.head())
+    print(wmapes_df.head())
+    pipeline.save(res_df, wmapes_df)
+
+
+if __name__ == "__main__":
+    main()

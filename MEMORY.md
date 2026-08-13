@@ -1,0 +1,1 @@
+- [Optimizations Summary](memory/optimizations-summary.md) — summary of optimizations applied to forecast.py and dashboard modifications

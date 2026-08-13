@@ -1,0 +1,633 @@
+def _run_section(
+        self,
+        selected: pl.DataFrame | pl.LazyFrame,
+        seccion: str,
+        first_data: dt.date,
+        driver_cols: list[str] | None,
+    ) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
+        """Ejecuta train / OOS / forecast-only para una sección con RLS en sección y tienda,
+        selección de modelo basada en WMAPE in-sample, y pronósticos OOS/forecast usando SES
+        con el modelo seleccionado."""
+        hz = settings.section_horizons(seccion, first_data)
+        logger.info(
+            "Sección %s | train [%s → %s] | OOS [%s → %s] | fcst [%s → %s]",
+            seccion,
+            hz["train_start"],
+            hz["train_end"],
+            hz["test_start"],
+            hz["test_end"],
+            hz["forecast_start"],
+            hz["forecast_end"],
+        )
+
+        date_col = self._cfg.date_column
+        # Filtrar por sección ANTES de collect para evitar cargar datos innecesarios
+        sec_df_lazy = (
+            selected if isinstance(selected, pl.LazyFrame) else selected.lazy()
+        )
+        sec_df_lazy = sec_df_lazy.filter(pl.col("SECCION") == seccion)
+
+        # Ahora filtramos por fecha y recolectamos solo los datos necesarios
+        raw_train_lazy = sec_df_lazy.filter(
+            (pl.col(date_col) >= hz["train_start"])
+            & (pl.col(date_col) <= hz["test_end"])
+        )
+        raw_oos_lazy = sec_df_lazy.filter(
+            (pl.col(date_col) >= hz["test_start"])
+            & (pl.col(date_col) <= hz["test_end"])
+        )
+        raw_fcst_lazy = sec_df_lazy.filter(
+            (pl.col(date_col) >= hz["forecast_start"])
+            & (pl.col(date_col) <= hz["forecast_end"])
+        )
+
+        # Recolectar datos lazy con streaming para reducir picos de memoria
+        logger.info("Recolectando train con streaming para sección %s…", seccion)
+        raw_train = raw_train_lazy.collect(streaming=True)
+        logger.info("Recolectando OOS con streaming para sección %s…", seccion)
+        raw_oos = raw_oos_lazy.collect(streaming=True)
+        logger.info("Recolectando forecast-only con streaming para sección %s…", seccion)
+        raw_fcst = raw_fcst_lazy.collect(streaming=True)
+
+        logger.info(
+            "Sección %s raw train=%d filas | oos=%d filas | fcst=%d filas",
+            seccion,
+            raw_train.height,
+            raw_oos.height,
+            raw_fcst.height,
+        )
+
+        with _stage_timer(f"{seccion}: agregación train"):
+            df_train = self._aggregator.aggregate(raw_train)
+        logger.info(
+            "Sección %s: train agregado shape=%s | series=%d",
+            seccion,
+            df_train.shape,
+            df_train["unique_id"].n_unique() if df_train.height else 0,
+        )
+
+        df_train = self._apply_limit_series(df_train)
+
+        # Panel denso train: spine settings [train_start, train_end]
+        n_before = df_train.height
+        with _stage_timer(f"{seccion}: densify train"):
+            df_train = densify_section_panel(
+                df_train, hz["train_start"], hz["train_end"]
+            )
+        logger.info(
+            "Sección %s: train densificado %d → %d filas (spine %s→%s)",
+            seccion,
+            n_before,
+            df_train.height,
+            hz["train_start"],
+            hz["test_end"],
+        )
+
+        with _stage_timer(f"{seccion}: EDP train"):
+            df_train = self._calculate_edp(df_train)
+            # Liberar memoria inmediatamente si la agregación fue muy grande
+            del raw_train
+            gc.collect()
+
+        with _stage_timer(f"{seccion}: features train"):
+            df_train = self._feature_builder.extract_drivers(
+                df_train, req_columns=driver_cols
+            ).sort("ds")
+        logger.info("Sección %s: features train OK shape=%s", seccion, df_train.shape)
+
+        if df_oos.height:
+            with _stage_timer(f"{seccion}: agregación+densify OOS"):
+                df_oos = (
+                    self._aggregator.aggregate(raw_oos)
+                    if raw_oos.height
+                    else pl.DataFrame()
+                )
+                del raw_oos
+                gc.collect()
+                if df_oos.height:
+                    # Densificar OOS al spine de la sección [test_start, test_end]
+                    # y alinear unique_ids con train (mismas series)
+                    train_uids = df_train.select("unique_id").unique()
+                    df_oos = densify_section_panel(df_oos, hz["test_start"], hz["test_end"])
+                    # asegurar todas las series de train también en OOS (ceros si no hubo venta)
+                    oos_uids = df_oos.select("unique_id").unique()
+                    missing = train_uids.join(oos_uids, on="unique_id", how="anti")
+                    if missing.height:
+                        spine_oos = pl.DataFrame(
+                            {
+                                "ds": pl.date_range(
+                                    hz["test_start"],
+                                    hz["test_end"],
+                                    interval="1d",
+                                    eager=True,
+                                )
+                            }
+                        )
+                        extra = missing.join(spine_oos, how="cross").with_columns(
+                            pl.lit(0.0).alias("y"),
+                            pl.lit(0.0).alias("value"),
+                        )
+                        # copiar meta desde train
+                        meta_cols = [
+                            c
+                            for c in ("sku_desc", "store_name", "seccion", "conteo_sku")
+                            if c in df_train.columns
+                        ]
+                        if meta_cols:
+                            meta = (
+                                df_train.select(["unique_id"] + meta_cols)
+                                .group_by("unique_id")
+                                .agg(
+                                    [
+                                        pl.col(c).drop_nulls().first().alias(c)
+                                        for c in meta_cols
+                                    ]
+                                )
+                            )
+                            extra = extra.join(meta, on="unique_id", how="left")
+                        df_oos = pl.concat([df_oos, extra], how="diagonal_relaxed")
+
+        if df_oos.height:
+            with _stage_timer(f"{seccion}: EDP OOS"):
+                df_oos = self._calculate_edp(df_oos)
+            with _stage_timer(f"{seccion}: features OOS"):
+                df_oos = self._feature_builder.extract_drivers(
+                    df_oos, req_columns=driver_cols
+                ).sort("ds")
+            logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
+
+        if raw_fcst.height:
+            # Frame de solo-forecast (calendario sintético)
+            uids = df_train["unique_id"].unique().to_list()
+            # Solo-forecast: día siguiente a test_end → forecast_end (settings)
+            fcst_start = hz["forecast_start"]
+            fcst_end = hz["forecast_end"]
+            logger.info(
+                "Sección %s: calendario forecast-only (%d series × %d días)…",
+                seccion,
+                len(uids),
+                (fcst_end - fcst_start).days + 1,
+            )
+            with _stage_timer(f"{seccion}: forecast-only build+features"):
+                df_fcst_raw = self._build_calendar_frame(
+                    uids, fcst_start, fcst_end, df_train
+                )
+                if df_fcst_raw.height:
+                    df_fcst = self._feature_builder.extract_drivers(
+                        df_fcst_raw.with_columns(pl.lit(1).alias("intercept")),
+                        req_columns=driver_cols,
+                    ).sort("ds")
+                    logger.info(
+                        "Sección %s: forecast-only shape=%s", seccion, df_fcst.shape
+                    )
+                else:
+                    df_fcst = pl.DataFrame()
+        else:
+            df_fcst = pl.DataFrame()
+
+        with _stage_timer(f"{seccion}: features forecast"):
+            if df_fcst.height:
+                df_fcst = self._feature_builder.extract_drivers(
+                    df_fcst, req_columns=driver_cols
+                ).sort("ds")
+
+        if driver_cols is None:
+            driver_cols = [
+                c
+                for c in df_train.columns
+                if c
+                not in (
+                    "ds",
+                    "y",
+                    "value",
+                    "valuehat",
+                    "unique_id",
+                    "conteo_sku",
+                    "sku_desc",
+                    "store_name",
+                    "seccion",
+                )
+            ]
+
+        # Prepare meta dict for later use
+        meta = {
+            "train_start": hz["train_start"],
+            "train_end": hz["train_end"],
+            "test_start": hz["test_start"],
+            "test_end": hz["test_end"],
+            "forecast_start": hz["forecast_start"],
+            "forecast_end": hz["forecast_end"],
+        }
+
+        # Build panel with period_type
+        panel_parts = [
+            df_train.with_columns(pl.lit("in_sample").alias("period_type")),
+        ]
+        if df_oos.height:
+            panel_parts.append(df_oos.with_columns(pl.lit("out_sample").alias("period_type")))
+        if df_fcst.height:
+            panel_parts.append(df_fcst.with_columns(pl.lit("forecast_only").alias("period_type")))
+        panel_all = pl.concat(panel_parts, how="diagonal_relaxed").sort(["unique_id", "ds"])
+        if meta:
+            panel_all = panel_all.with_columns(
+                [pl.lit(v).alias(k) for k, v in meta.items()]
+            )
+
+        # Determine driver columns for price (exclude asp, edp, discount)
+        _price_exclude = {"asp", "edp", "discount"}
+        driver_cols_price = [c for c in driver_cols if c not in _price_exclude]
+
+        # ---------- Fit RLS models ----------
+        runner = RLSForecastRunner(
+            driver_cols=driver_cols,
+            rmse_error=self._cfg.rmse_error,
+            forgetting_factor=self._cfg.forgetting_factor,
+            min_y_to_update=self._cfg.min_y_to_update,
+            use_correction_factor=self._cfg.correction_factor,
+            n_jobs=self._n_jobs,
+        )
+
+        # Section model
+        train_section = df_train.filter(pl.col("unique_id") == seccion)
+        if train_section.height == 0:
+            logger.warning(
+                "Sección %s: no hay datos de sección para ajustar RLS", seccion
+            )
+            # Return empty results
+            return pl.DataFrame(), pl.DataFrame(), driver_cols
+        sec_model_y, sec_model_p = runner._fit_models(train_section)
+        sec_coef_y = sec_model_y.final_coef_.tolist()
+        sec_coef_p = sec_model_p.final_coef_.tolist()
+
+        # Store models
+        store_models_y = {}
+        store_models_p = {}
+        store_coefs_y = {}
+        store_coefs_p = {}
+        stores = settings.SECCIONES[seccion]["locales"]
+        for store_id in stores:
+            store_train = df_train.filter(
+                pl.col("unique_id").str.starts_with(f"{seccion}||{store_id}")
+            )
+            if store_train.height == 0:
+                continue
+            m_y, m_p = runner._fit_models(store_train)
+            store_models_y[store_id] = m_y
+            store_models_p[store_id] = m_p
+            store_coefs_y[store_id] = m_y.final_coef_.tolist()
+            store_coefs_p[store_id] = m_p.final_coef_.tolist()
+
+        # ---------- Compute RLS pure predictions (in-sample) ----------
+        # Section predictions for all rows
+        preds_section = runner._predict_with_models(
+            "dummy", sec_model_y, sec_model_p, train_section, df_train, meta=None
+        )
+        preds_section = preds_section.select(
+            ["unique_id", "ds", "yhat", "valuehat"]
+        ).rename({"yhat": "yhat_sec", "valuehat": "valuehat_sec"})
+
+        # Store predictions per store (only for rows belonging to that store)
+        store_pred_frames = []
+        for store_id, m_y in store_models_y.items():
+            m_p = store_models_p[store_id]
+            store_train = df_train.filter(
+                pl.col("unique_id").str.starts_with(f"{seccion}||{store_id}")
+            )
+            if store_train.height == 0:
+                continue
+            pred = runner._predict_with_models(
+                "dummy", m_y, m_p, store_train, store_train, meta=None
+            )
+            pred = pred.select(
+                ["unique_id", "ds", "yhat", "valuehat"]
+            ).rename(
+                {
+                    "yhat": f"yhat_store_{store_id}",
+                    "valuehat": f"valuehat_store_{store_id}",
+                }
+            )
+            store_pred_frames.append(pred)
+
+        if store_pred_frames:
+            preds_store_all = pl.concat(store_pred_frames, how="diagonal_relaxed")
+        else:
+            preds_store_all = pl.DataFrame(
+                schema={"unique_id": pl.Utf8, "ds": pl.Date}
+            )
+
+        # Join predictions
+        preds = preds_section.join(preds_store_all, on=["unique_id", "ds"], how="left")
+
+        # ---------- Compute WMAPE/BIAS per unique_id for section and store models ----------
+        # Use only non-zero y for denominator
+        df_nz = df_train.filter(pl.col("y") != 0)
+        # Denominator per unique_id
+        denom = df_nz.groupby("unique_id").agg(
+            [
+                pl.col("y").abs().sum().alias("sum_abs_y"),
+                pl.col("y").sum().alias("sum_y"),
+            ]
+        )
+
+        # Section errors
+        err_sec_df = df_nz.join(
+            preds_section.select(["unique_id", "ds", "yhat"]),
+            on=["unique_id", "ds"],
+        ).with_columns((pl.col("y") - pl.col("yhat")).alias("err"))
+        sec_err_agg = err_sec_df.groupby("unique_id").agg(
+            [
+                pl.col("err").abs().sum().alias("sum_abs_err_sec"),
+                pl.col("err").sum().alias("sum_err_sec"),
+            ]
+        )
+        sec_agg = sec_err_agg.join(denom, on="unique_id").with_columns(
+            [
+                (pl.col("sum_abs_err_sec") / pl.col("sum_abs_y")).alias("wmape_sec"),
+                (pl.col("sum_err_sec") / pl.col("sum_y")).alias("bias_sec"),
+            ]
+        )
+
+        # Store errors per store, then combine per unique_id (we only care about the store that each unique_id belongs to)
+        # We'll compute per store and then join later
+        store_err_frames = []
+        for store_id in stores:
+            store_train_nz = df_nz.filter(
+                pl.col("unique_id").str.starts_with(f"{seccion}||{store_id}")
+            )
+            if store_train_nz.height == 0:
+                continue
+            # Get predictions for this store
+            pred_store = preds.select(
+                ["unique_id", "ds", f"yhat_store_{store_id}", f"valuehat_store_{store_id}"]
+            ).rename(
+                {
+                    f"yhat_store_{store_id}": "yhat_store",
+                    f"valuehat_store_{store_id}": "valuehat_store",
+                }
+            )
+            err_store_df = store_train_nz.join(
+                pred_store.select(["unique_id", "ds", "yhat_store"]),
+                on=["unique_id", "ds"],
+            ).with_columns((pl.col("y") - pl.col("yhat_store")).alias("err"))
+            store_err_agg = err_store_df.groupby("unique_id").agg(
+                [
+                    pl.col("err").abs().sum().alias(f"sum_abs_err_store_{store_id}"),
+                    pl.col("err").sum().alias(f"sum_err_store_{store_id}"),
+                ]
+            )
+            store_err_frames.append(store_err_agg)
+
+        if store_err_frames:
+            store_err_all = pl.concat(store_err_frames, how="align")
+        else:
+            store_err_all = pl.DataFrame(
+                schema={"unique_id": pl.Utf8}
+            )
+
+        # Join errors and denom to compute wmape and bias per store per unique_id
+        store_err_all = store_err_all.join(denom, on="unique_id", how="left")
+        # For each store, compute wmape and bias columns
+        store_wm_frames = []
+        for store_id in stores:
+            col_abs = f"sum_abs_err_store_{store_id}"
+            col_sum = f"sum_err_store_{store_id}"
+            if col_abs in store_err_all.columns:
+                wm_col = f"wmape_store_{store_id}"
+                bias_col = f"bias_store_{store_id}"
+                store_wm_frames.append(
+                    store_err_all.select(
+                        ["unique_id", pl.col(col_abs).alias("sum_abs_err"), pl.col(col_sum).alias("sum_err")]
+                    )
+                    .with_columns(
+                        [
+                            (pl.col("sum_abs_err") / pl.col("sum_abs_y")).alias(wm_col),
+                            (pl.col("sum_err") / pl.col("sum_y")).alias(bias_col),
+                        ]
+                    )
+                    .select(["unique_id", wm_col, bias_col])
+                )
+        if store_wm_frames:
+            store_wm_all = pl.concat(store_wm_frames, how="align")
+        else:
+            store_wm_all = pl.DataFrame(schema={"unique_id": pl.Utf8})
+
+        # Combine section and store metrics
+        metrics = sec_agg.join(store_wm_all, on="unique_id", how="left")
+        # For each unique_id, we have wmape_sec, bias_sec, and for each store wmape_store_<id>, bias_store_<id>
+        # Determine best model per unique_id
+        # Build array of store ids from settings
+        store_ids = stores
+        # Build condition for choosing section vs each store
+        # We'll compute a column `model_source` initially as "section"
+        # Then for each store, if store's wmape < section's wmape (or equal and bias better) we switch to that store
+        # We'll do this iteratively.
+        metrics = metrics.with_columns(
+            [
+                pl.lit("section").alias("model_source"),
+                pl.lit(0.0).alias("best_wmape"),  # placeholder
+                pl.lit(0.0).alias("best_bias"),
+            ]
+        )
+        # Initialize best values with section's
+        metrics = metrics.with_columns(
+            [
+                pl.col("wmape_sec").alias("best_wmape"),
+                pl.col("bias_sec").alias("best_bias"),
+            ]
+        )
+        for store_id in store_ids:
+            wmape_col = f"wmape_store_{store_id}"
+            bias_col = f"bias_store_{store_id}"
+            if wmape_col in metrics.columns:
+                # Condition: store wmape < section wmape  OR (abs diff < eps and |store bias| < |section bias|)
+                cond_better = (
+                    (pl.col(wmape_col) < pl.col("wmape_sec"))
+                    | (
+                        (pl.col(wmape_col) - pl.col("wmape_sec")).abs() < 1e-9
+                        & (pl.col(bias_col).abs() < pl.col("bias_sec").abs())
+                    )
+                )
+                metrics = metrics.with_columns(
+                    [
+                        pl.when(cond_better)
+                        .then(pl.lit(store_id))
+                        .otherwise(pl.col("model_source"))
+                        .alias("model_source"),
+                        pl.when(cond_better)
+                        .then(pl.col(wmape_col))
+                        .otherwise(pl.col("wmape_sec"))
+                        .alias("best_wmape"),
+                        pl.when(cond_better)
+                        .then(pl.col(bias_col))
+                        .otherwise(pl.col("bias_sec"))
+                        .alias("best_bias"),
+                    ]
+                )
+        # Now we have model_source (either "section" or store_id) and best_wmape/bias (not needed further)
+
+        # ---------- Prepare predictions (final yhat, valuehat) ----------
+        # Compute store_id column for each row (null for section)
+        # Join model_source back to panel_all
+        lookup = metrics.select(["unique_id", "model_source"])
+        panel_all = panel_all.join(lookup, on="unique_id", how="left")
+        panel_all = panel_all.with_columns(
+            pl.coalesce([pl.col("model_source"), pl.lit("section")]).alias("model_source")
+        )
+
+        # Compute store_id column (second part of unique_id) for use in selecting store-specific effects
+        panel_all = panel_all.with_columns(
+            pl.when(pl.col("unique_id").str.count_matches(r"\|\|") == 2)
+            .then(pl.col("unique_id").str.split_exact("||", 2).arr.get(1))
+            .otherwise(pl.lit(None))
+            .alias("store_id")
+        )
+
+        # ---------- Compute effects (drivers * coefficients) ----------
+        # Section effects
+        expr_y_sec = [
+            pl.col(c) * coeff for c, coeff in zip(driver_cols, sec_coef_y)
+        ]
+        effect_y_section = sum(expr_y_sec) if expr_y_sec else pl.lit(0.0)
+        expr_v_sec = [
+            pl.col(c) * coeff for c, coeff in zip(driver_cols_price, sec_coef_p)
+        ]
+        effect_v_section = sum(expr_v_sec) if expr_v_sec else pl.lit(0.0)
+
+        # Store effects per store
+        store_effect_exprs_y = {}
+        store_effect_exprs_v = {}
+        for store_id in stores:
+            coeff_y = store_coefs_y.get(store_id)
+            coeff_p = store_coefs_p.get(store_id)
+            if coeff_y is None or coeff_p is None:
+                continue
+            expr_y = [pl.col(c) * coeff for c, coeff in zip(driver_cols, coeff_y)]
+            expr_v = [pl.col(c) * coeff for c, coeff in zip(driver_cols_price, coeff_p)]
+            store_effect_exprs_y[store_id] = sum(expr_y) if expr_y else pl.lit(0.0)
+            store_effect_exprs_v[store_id] = sum(expr_v) if expr_v else pl.lit(0.0)
+
+        # Add effect columns to panel_all
+        panel_all = panel_all.with_columns(
+            [
+                effect_y_section.alias("effect_y_section"),
+                effect_v_section.alias("effect_v_section"),
+            ]
+        )
+        for store_id in stores:
+            if store_id in store_effect_exprs_y:
+                panel_all = panel_all.with_columns(
+                    store_effect_exprs_y[store_id].alias(f"effect_y_store_{store_id}")
+                )
+                panel_all = panel_all.with_columns(
+                    store_effect_exprs_v[store_id].alias(f"effect_v_store_{store_id}")
+                )
+
+        # ---------- Select effect based on model_source ----------
+        # Selected effect y
+        panel_all = panel_all.with_columns(
+            pl.when(pl.col("model_source") == pl.lit("section"))
+            .then(pl.col("effect_y_section"))
+            .otherwise(pl.col(pl.format("effect_y_store_{}", pl.col("store_id"))))
+            .alias("selected_effect_y")
+        )
+        # Selected effect value
+        panel_all = panel_all.with_columns(
+            pl.when(pl.col("model_source") == pl.lit("section"))
+            .then(pl.col("effect_v_section"))
+            .otherwise(pl.col(pl.format("effect_v_store_{}", pl.col("store_id"))))
+            .alias("selected_effect_v")
+        )
+
+        # ---------- Compute residuals ----------
+        panel_all = panel_all.with_columns(
+            (pl.col("y") - pl.col("selected_effect_y")).alias("resid_y"),
+            (pl.col("value") - pl.col("selected_effect_v")).alias("resid_v"),
+        )
+
+        # ---------- Apply causal SES to residuals ----------
+        # Use alpha settings
+        alpha_q = getattr(settings, "SES_ALPHA_QUANTITY", 0.1)
+        alpha_v = getattr(settings, "SES_ALPHA_VALUE", 0.1)
+        # Prepare DF for SES
+        resid_df = panel_all.select(
+            ["unique_id", "ds", "resid_y", "resid_v"]
+        )
+        # Apply SES for quantity
+        resid_df = RLSForecastRunner._apply_causal_ses(
+            resid_df, src_col="resid_y", out_col="resid_y_hat", alpha=alpha_q
+        )
+        # Apply SES for value
+        resid_df = RLSForecastRunner._apply_causal_ses(
+            resid_df, src_col="resid_v", out_col="resid_v_hat", alpha=alpha_v
+        )
+        # Join back predicted residuals
+        panel_all = panel_all.join(
+            resid_df.select(["unique_id", "ds", "resid_y_hat", "resid_v_hat"]),
+            on=["unique_id", "ds"],
+            how="left",
+        )
+
+        # ---------- Final predictions ----------
+        panel_all = panel_all.with_columns(
+            (pl.col("selected_effect_y") + pl.col("resid_y_hat")).alias("yhat"),
+            (pl.col("selected_effect_v") + pl.col("resid_v_hat")).alias("valuehat"),
+        )
+
+        # ---------- Clean up intermediate columns ----------
+        # We may keep them; not necessary to delete.
+
+        # ---------- Compute wmape and bias metrics (using final yhat) ----------
+        wmapes_df = RLSForecastRunner._compute_wmape(panel_all)
+
+        # ---------- Rolling 28d (unchanged) ----------
+        if getattr(settings, "COMPUTE_ROLLING_28", False):
+            panel_section = panel_all.filter(pl.col("unique_id") == seccion)
+            logger.info(
+                "Sección %s: rolling 28d (solo nivel sección) sobre panel shape=%s…",
+                seccion,
+                panel_section.shape,
+            )
+            with _stage_timer(f"{seccion}: rolling28 sección (O(n))"):
+                roll = runner.run_rolling_28(
+                    panel_section,
+                    self._cfg.forecast_levels,
+                    desc=f"{seccion} rolling28",
+                )
+            if roll.height and panel_all.height:
+                # alinear tipos de ds
+                if panel_all["ds"].dtype != roll["ds"].dtype:
+                    roll = roll.with_columns(
+                        pl.col("ds").cast(panel_all["ds"].dtype)
+                    )
+                panel_all = panel_all.join(
+                    roll.select(["unique_id", "ds", "yhat28", "valuehat28"]),
+                    on=["unique_id", "ds"],
+                    how="left",
+                )
+            wm28 = RLSForecastRunner.compute_wmape28(
+                panel_all.filter(
+                    pl.col("y").is_not_null() & pl.col("yhat28").is_not_null()
+                )
+            )
+            if wm28.height:
+                if (
+                    "wmape" in wmapes_df.columns
+                    and "unique_id" in wmapes_df.columns
+                ):
+                    wmapes_df = wmapes_df.join(wm28, on="unique_id", how="left")
+                else:
+                    wmapes_df = wm28
+            logger.info(
+                "Sección %s: yhat28 unido (%d filas roll, %d series wm28)",
+                seccion,
+                roll.height if roll.height else 0,
+                wm28.height if wm28.height else 0,
+            )
+        else:
+            logger.info(
+                "Sección %s: rolling28 desactivado (settings.COMPUTE_ROLLING_28=False)",
+                seccion,
+            )
+
+        # ---------- Return ----------
+        return panel_all, wmapes_df, driver_cols

@@ -417,13 +417,98 @@ st.caption(
 st.caption(
     "🏷️ **Total de puntos (spine):** "
     f"**{view.ranking_total_points}** · "
-    "`N puntos ≠0` = períodos con venta (y≠0) · `% ≠0` = proporción sobre el total."
+    "`N puntos ��� � � ≠0$ = períodos con venta (y���≠0) · `% ��� ��� � � � ≠0$ = proporción sobre el total."
 )
-_show_ranking(view.ranking_tiendas, f"tabla_tiendas_{view.selected_id}")
+st.markdown("#### Rankings")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("#### Ranking de Tiendas")
+    _show_ranking(view.ranking_tiendas, f"tabla_tiendas_1_{view.selected_id}")
+with col2:
+    st.markdown("#### Ranking de SKUs")
+    _show_ranking(view.ranking_skus, f"tabla_skus_1_{view.selected_id}")
 
-st.markdown("#### Ranking de SKUs")
-st.caption("Rankeado por wMAPE ascendente (mejor performance primero)")
-_show_ranking(view.ranking_skus, f"tabla_skus_{view.selected_id}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Métricas
+# ─────────────────────────────────────────────────────────────────────────────
+hz = view.horizons
+st.markdown("#### Métricas")
+st.caption(
+    f"Agregación: **{view.freq}** · Unidad: **{view.unidad}** · "
+    f"Sección **{view.seccion}** · Train → {hz.get('train_end')} · "
+    f"OOS [{hz.get('test_start')} → {hz.get('test_end')}] · "
+    f"Solo-forecast [{hz.get('forecast_start')} → {hz.get('forecast_end')}]. "
+    "WMAPE = Σ|y−ŷ|/Σ|y| (excl. y=0)."
+)
+
+c1, c2, c3 = st.columns(3)
+for col, title, key in (
+    (c1, "In-sample", "in"),
+    (c2, "Out-sample", "out"),
+    (c3, "Total (hasta test_end)", "total"),
+):
+    m = view.metrics[key]
+    with col:
+        st.markdown(f"**{title}**")
+        st.metric("wMAPE", f"{m['wmape']:.2%}")
+        st.metric("BIAS", f"{m['bias']:+.2%}")
+        st.caption(f"{m['n']} períodos")
+
+if has_rolling:
+    st.markdown("#### Métricas Rolling 28d (`yhat28`)")
+    st.caption(
+        "Walk-forward por bloques de 28 días. Priors = modelo final (opción B). "
+        "WMAPE₂₈ = Σ|y−ŷ₂₈|/Σ|y| (excl. y=0)."
+    )
+    m28 = view.metrics_28
+    c28a, c28b, c28c = st.columns(3)
+    with c28a:
+        st.metric("wMAPE 28", f"{m28['wmape_28']:.2%}")
+    with c28b:
+        st.metric("BIAS 28", f"{m28['bias_28']:+.2%}")
+    with c28c:
+        st.metric("N períodos", f"{m28['n']}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gráfico (solo mapeo de series ya calculadas)
+# ─────────────────────────────────────────────────────────────────────────────
+unidad_label = "Valor ($)" if view.unidad.startswith("Valor") else "Unidades"
+freq_label = {"Diario": "día", "Semanal": "semana", "Mensual": "mes"}[view.freq]
+ch = view.chart
+
+fig = go.Figure()
+if ch["hist_ds"]:
+    fig.add_trace(
+        go.Scatter(
+            x=ch["hist_ds"],
+            y=ch["hist_y"],
+            name="y (real)",
+            fill="tozeroy",
+            mode="lines",
+            line=dict(color="rgba(31, 119, 180, 1)"),
+            fillcolor="rgba(31, 119, 180, 0.25)",
+        )
+    )
+    if show_yhat:
+        fig.add_trace(
+            go.Scatter(
+                x=ch["hist_ds"],
+                y=ch["hist_yhat"],
+                name=f"{_opt_yhat} (predicción)",
+                fill="tozeroy",
+                mode="lines",
+                line=dict(color="rgba(255, 127, 14, 1)"),
+                fillcolor="rgba(255, 127, 14, 0.25)",
+            )
+        )
+st.markdown("#### Rankings")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("#### Ranking de Tiendas")
+    _show_ranking(view.ranking_tiendas, f"tabla_tiendas_{view.selected_id}")
+with col2:
+    st.markdown("#### Ranking de SKUs")
+    _show_ranking(view.ranking_skus, f"tabla_skus_{view.selected_id}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Métricas
