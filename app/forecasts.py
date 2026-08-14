@@ -101,7 +101,7 @@ def _collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     except TypeError:
         try:
             return lf.collect(streaming=True)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return lf.collect()
 
 
@@ -149,7 +149,7 @@ class ForecastConfig:
             rmse_error=settings.RMSE_ERROR,
             correction_factor=settings.CORRECTION_FACTOR,
             forgetting_factor=getattr(settings, "FORGETTING_FACTOR", 0.995),
-            min_y_to_update=getattr(settings, "MIN_Y_TO_update", 1.0),
+            min_y_to_update=getattr(settings, "MIN_Y_TO_UPDATE", 1.0),
             out_dir=Path(settings.OUT_DIR),
             date_column=settings.DATE_COLUMN,
             quantity_column=settings.QUANTITY_COLUMN,
@@ -277,7 +277,9 @@ class CalendarFeatureBuilder:
         if rename:
             df = df.rename(rename)
         # Quitar categorías base (Mon / Jan) y columnas numéricas intermedias
-        drop = [c for c in ("weekday_1", "month_1", "weekday", "month") if c in df.columns]
+        drop = [
+            c for c in ("weekday_1", "month_1", "weekday", "month") if c in df.columns
+        ]
         if drop:
             df = df.drop(drop)
         return df
@@ -576,8 +578,11 @@ class RLSForecastRunner:
     RLS a nivel sección y tienda; deriva SKU+tienda sin re-fit.
 
       - `fit_and_predict_sections`: RLS real (sección o tienda) en train/OOS/fcst.
+        El RLS se ajusta sobre log1p(y); las predicciones se reconstruyen con
+        `expm1()`.
       - `derive_sku_store_forecasts`: selección sección vs tienda por WMAPE
-        in-sample; yhat RLS en train; efecto+SES no causal en OOS/fcst.
+        in-sample; yhat RLS en train; en OOS/fcst reconstruye en log-space
+        `expm1(intercept + efecto + SES(log-residuo))`.
     """
 
     def __init__(
@@ -648,9 +653,7 @@ class RLSForecastRunner:
 
         # Parse store_uid / seccion desde unique_id
         leaves = leaves.with_columns(
-            pl.col("unique_id")
-            .str.replace(r"\|\|S:.*$", "")
-            .alias("_store_uid"),
+            pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
             pl.col("unique_id").str.split("||").list.first().alias("_seccion"),
             (pl.col("y") - pl.col("yhat")).abs().alias("_abs_error"),
             pl.col("y").abs().alias("_abs_y"),
@@ -689,23 +692,31 @@ class RLSForecastRunner:
         out_leaf = _finalize(leaf_agg, "sku_tienda")
 
         # ── Tienda (bottom-up desde hojas) ─────────────────────────────────
-        store_agg = leaves.group_by(["_store_uid", "period_type"]).agg(
-            pl.col("_abs_error").sum().alias("sum_abs_error"),
-            pl.col("_abs_y").sum().alias("sum_abs_y"),
-            pl.col("y").sum().alias("sum_y"),
-            pl.col("yhat").sum().alias("sum_yhat"),
-            pl.len().alias("n_points"),
-        ).rename({"_store_uid": "unique_id"})
+        store_agg = (
+            leaves.group_by(["_store_uid", "period_type"])
+            .agg(
+                pl.col("_abs_error").sum().alias("sum_abs_error"),
+                pl.col("_abs_y").sum().alias("sum_abs_y"),
+                pl.col("y").sum().alias("sum_y"),
+                pl.col("yhat").sum().alias("sum_yhat"),
+                pl.len().alias("n_points"),
+            )
+            .rename({"_store_uid": "unique_id"})
+        )
         out_store = _finalize(store_agg, "tienda")
 
         # ── Sección (bottom-up desde hojas) ────────────────────────────────
-        sec_agg = leaves.group_by(["_seccion", "period_type"]).agg(
-            pl.col("_abs_error").sum().alias("sum_abs_error"),
-            pl.col("_abs_y").sum().alias("sum_abs_y"),
-            pl.col("y").sum().alias("sum_y"),
-            pl.col("yhat").sum().alias("sum_yhat"),
-            pl.len().alias("n_points"),
-        ).rename({"_seccion": "unique_id"})
+        sec_agg = (
+            leaves.group_by(["_seccion", "period_type"])
+            .agg(
+                pl.col("_abs_error").sum().alias("sum_abs_error"),
+                pl.col("_abs_y").sum().alias("sum_abs_y"),
+                pl.col("y").sum().alias("sum_y"),
+                pl.col("yhat").sum().alias("sum_yhat"),
+                pl.len().alias("n_points"),
+            )
+            .rename({"_seccion": "unique_id"})
+        )
         out_sec = _finalize(sec_agg, "seccion")
 
         return pl.concat([out_leaf, out_store, out_sec], how="vertical")
@@ -999,8 +1010,33 @@ class RLSForecastRunner:
         """
         Derivación SKU+tienda **tienda a tienda** (bajo uso de memoria).
 
-        - In-sample: RLS del modelo seleccionado (WMAPE in-sample).
-        - OOS / forecast_only: efecto(coefs) + SES no causal del residuo.
+        El modelo RLS se ajusta sobre log1p(y) (ver `_fit_models`), por lo que
+        la reconstrucción del pronóstico ocurre EN LOG-SPACE:
+
+          - Todos los períodos (in_sample / out_sample / forecast_only):
+              yhat = expm1(intercept + efecto + SES(log-residuo))
+
+        donde `residuo_log = log1p(y) − (intercept + efecto)`, e `intercept` +
+        `efecto` provienen del modelo (sección o tienda) elegido por
+        `_select_model_wmape`. `_apply_ses` calcula el SES sobre TODO el
+        período con actuals (in_sample + out_sample) como una única serie
+        continua, así que `_y_neto_hat`/`_v_neto_hat` ya son válidos también
+        para in_sample: no hace falta (ni es correcto) usar la predicción
+        cruda `_yhat_rls`/`_valuehat_rls` del RLS de sección/tienda para esas
+        filas. Esa predicción cruda vive en la escala del AGREGADO (sección o
+        tienda), no en la de la hoja SKU+tienda, y usarla directamente en
+        in_sample producía un salto de escala de varios órdenes de magnitud
+        entre in_sample y OOS/forecast (yhat/valuehat in-sample en la escala
+        del agregado, OOS ya corregido por el SES). `_yhat_rls`/
+        `_valuehat_rls` se conservan solo como entrada de
+        `_select_model_wmape` (comparación sección vs. tienda), no como
+        salida final.
+
+        Nota histórica: antes se restaba `efecto` (log-space) de `y`
+        (lineal), produciendo un residuo incoherente y pronósticos 0/negativos
+        en OOS/forecast_only (causa del ranking SKU+tienda vacío). ya
+        corregido junto con el punto anterior.
+
         No materializa el panel completo con columnas intermedias duplicadas.
         """
         import gc
@@ -1017,21 +1053,21 @@ class RLSForecastRunner:
 
         driver_cols = self._driver_cols
         driver_cols_price = self._driver_cols_price
-        missing = [
-            c
-            for c in driver_cols + driver_cols_price
-            if c not in panel.columns
-        ]
+        missing = [c for c in driver_cols + driver_cols_price if c not in panel.columns]
         if missing:
-            logger.warning(
-                "derive_sku_store_forecasts: faltan drivers %s", missing[:8]
-            )
+            logger.warning("derive_sku_store_forecasts: faltan drivers %s", missing[:8])
             return pl.DataFrame()
 
         idx_y = [i for i, c in enumerate(driver_cols) if c != "intercept"]
         cols_y = [driver_cols[i] for i in idx_y]
         idx_p = [i for i, c in enumerate(driver_cols_price) if c != "intercept"]
         cols_p = [driver_cols_price[i] for i in idx_p]
+        # Índice del término constante (columna "intercept") dentro del vector
+        # de coeficientes. El modelo RLS se ajusta sobre log1p(y), así que
+        # log(y) = intercept + efecto(drivers). El intercept depende de dónde
+        # aparezca "intercept" en driver_cols (no se asume posición 0).
+        intercept_idx_y = driver_cols.index("intercept")
+        intercept_idx_p = driver_cols_price.index("intercept")
 
         # Solo columnas necesarias (reduce pico de RAM)
         meta_keep = [
@@ -1107,9 +1143,7 @@ class RLSForecastRunner:
             valuehat_sec = np.round(np.expm1(X_p @ coef_p_sec), 2).ravel()
             valuehat_sto = np.round(np.expm1(X_p @ coef_p_sto), 2).ravel()
 
-            selection = self._select_model_wmape(
-                y, yhat_sec, yhat_sto, uids, is_train
-            )
+            selection = self._select_model_wmape(y, yhat_sec, yhat_sto, uids, is_train)
             use_sto = np.fromiter(
                 (selection.get(str(u), "seccion") == "tienda" for u in uids),
                 dtype=bool,
@@ -1129,15 +1163,35 @@ class RLSForecastRunner:
                 X_p[:, idx_p] @ coef_p_sto[idx_p],
                 X_p[:, idx_p] @ coef_p_sec_fx,
             )
+            # Interceptos del modelo log seccionado por serie (uno por fila).
+            intercept_y = np.where(
+                use_sto,
+                coef_y_sto[intercept_idx_y],
+                coef_y_sec[intercept_idx_y],
+            )
+            intercept_v = np.where(
+                use_sto,
+                coef_p_sto[intercept_idx_p],
+                coef_p_sec[intercept_idx_p],
+            )
             del X_y, X_p
 
-            y_neto = y - effect_y
-            v_neto = value - effect_v
+            # Residuo EN LOG-SPACE (modelo RLS ajustado sobre log1p):
+            #   log1p(y) − (intercept + efecto de drivers)
+            # Antes se restaba effect (log-space) de y (lineal), lo que producía
+            # un "y_neto" incoherente y pronósticos 0/negativos en OOS/fcst.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_y = np.log1p(np.clip(y, 0.0, None))
+                log_v = np.log1p(np.clip(value, 0.0, None))
+            log_resid_y = np.where(
+                np.isfinite(log_y), log_y - (intercept_y + effect_y), np.nan
+            )
+            log_resid_v = np.where(
+                np.isfinite(log_v), log_v - (intercept_v + effect_v), np.nan
+            )
             modelo = np.where(use_sto, "tienda", "seccion")
 
-            block = sub.select(
-                [c for c in meta_keep if c in sub.columns]
-            ).with_columns(
+            block = sub.select([c for c in meta_keep if c in sub.columns]).with_columns(
                 pl.Series("yhat_seccion", yhat_sec),
                 pl.Series("valuehat_seccion", valuehat_sec),
                 pl.Series("yhat_tienda", yhat_sto),
@@ -1145,32 +1199,56 @@ class RLSForecastRunner:
                 pl.Series("modelo_seleccionado", modelo),
                 pl.Series("driver_effect", effect_y),
                 pl.Series("driver_effect_value", effect_v),
-                pl.Series("_y_neto", y_neto),
-                pl.Series("_v_neto", v_neto),
+                pl.Series("_intercept_y", intercept_y),
+                pl.Series("_intercept_v", intercept_v),
+                pl.Series("_y_neto", log_resid_y),
+                pl.Series("_v_neto", log_resid_v),
                 pl.Series("_yhat_rls", yhat_rls),
                 pl.Series("_valuehat_rls", valuehat_rls),
             )
             del yhat_sec, yhat_sto, valuehat_sec, valuehat_sto
-            del yhat_rls, valuehat_rls, effect_y, effect_v, y_neto, v_neto
+            del yhat_rls, valuehat_rls, effect_y, effect_v, intercept_y, intercept_v
 
             block = self._apply_ses(block, "_y_neto", "_y_neto_hat", alpha)
             block = self._apply_ses(block, "_v_neto", "_v_neto_hat", alpha)
 
             if has_period:
+                # Reconstrucción en log-space: expm1(intercept + efecto + SES(residuo)).
+                # Se aplica IGUAL para in_sample/out_sample/forecast_only.
+                #
+                # Antes, in_sample usaba directamente `_yhat_rls` (predicción cruda
+                # del RLS de sección/tienda, ajustado sobre el y/value AGREGADO de
+                # ese nivel). Esa predicción vive en la escala del agregado
+                # (sección o tienda), no en la escala de la hoja SKU+tienda, y por
+                # eso el gráfico mostraba yhat/valuehat in-sample varios órdenes de
+                # magnitud por encima de los actuals, con un salto abrupto al pasar
+                # a OOS (que sí usaba la reconstrucción con SES).
+                # `_y_neto_hat`/`_v_neto_hat` ya están definidos para in_sample y
+                # out_sample por igual (`_apply_ses` trata todo el período con
+                # actuals como una sola serie continua), así que no hace falta
+                # ninguna rama especial: usar la misma fórmula corrige la escala.
                 block = block.with_columns(
-                    pl.when(pl.col("period_type") == "in_sample")
-                    .then(pl.col("_yhat_rls"))
-                    .otherwise(
-                        (pl.col("driver_effect") + pl.col("_y_neto_hat")).round(0)
+                    (
+                        (
+                            pl.col("_intercept_y")
+                            + pl.col("driver_effect")
+                            + pl.col("_y_neto_hat")
+                        ).exp()
+                        - 1
                     )
+                    .clip(lower_bound=0.0)
+                    .round(0)
                     .alias("yhat"),
-                    pl.when(pl.col("period_type") == "in_sample")
-                    .then(pl.col("_valuehat_rls"))
-                    .otherwise(
-                        (pl.col("driver_effect_value") + pl.col("_v_neto_hat")).round(
-                            2
-                        )
+                    (
+                        (
+                            pl.col("_intercept_v")
+                            + pl.col("driver_effect_value")
+                            + pl.col("_v_neto_hat")
+                        ).exp()
+                        - 1
                     )
+                    .clip(lower_bound=0.0)
+                    .round(2)
                     .alias("valuehat"),
                 )
             else:
@@ -1186,6 +1264,8 @@ class RLSForecastRunner:
                     "_v_neto",
                     "_y_neto_hat",
                     "_v_neto_hat",
+                    "_intercept_y",
+                    "_intercept_v",
                     "_yhat_rls",
                     "_valuehat_rls",
                     "_store_uid",
@@ -1358,7 +1438,9 @@ class RLSForecastPipeline:
         )
         return lf
 
-    def _first_data_by_section(self, selected: pl.LazyFrame | pl.DataFrame) -> dict[str, dt.date]:
+    def _first_data_by_section(
+        self, selected: pl.LazyFrame | pl.DataFrame
+    ) -> dict[str, dt.date]:
         col = self._cfg.date_column
         lf = selected.lazy() if isinstance(selected, pl.DataFrame) else selected
         summary = _collect_streaming(
@@ -1442,7 +1524,14 @@ class RLSForecastPipeline:
         groups = df.sort(["unique_id", "ds"]).partition_by(
             "unique_id", maintain_order=True
         )
-        for part in tqdm(groups, desc="EDP (loop)", unit="serie"):
+        for part in tqdm(
+            groups,
+            desc="EDP (loop)",
+            unit="serie",
+            ncols=50,  # Controla el ancho total
+            ascii="░█",  # Define los caracteres de llenado (vacío/lleno)
+            bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",  # Estructura del texto
+        ):
             uid = part["unique_id"][0]
             asp, edp, discount = decompose_price(
                 sales_dollars=part["value"].to_numpy(),
@@ -1649,7 +1738,9 @@ class RLSForecastPipeline:
                     meta = (
                         df_train.select(["unique_id"] + meta_cols)
                         .group_by("unique_id")
-                        .agg([pl.col(c).drop_nulls().first().alias(c) for c in meta_cols])
+                        .agg(
+                            [pl.col(c).drop_nulls().first().alias(c) for c in meta_cols]
+                        )
                     )
                     existing_meta = [c for c in meta_cols if c in df_oos.columns]
                     if existing_meta:
@@ -1826,6 +1917,9 @@ class RLSForecastPipeline:
                     desc=f"{seccion} procesando tiendas",
                     unit="tienda",
                     leave=False,
+                    ncols=50,  # Controla el ancho total
+                    ascii="░█",  # Define los caracteres de llenado (vacío/lleno)
+                    bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",  # Estructura del texto
                 ):
                     res_df, coefs_dict = fut.result()
                     if res_df is not None:
@@ -1860,9 +1954,7 @@ class RLSForecastPipeline:
         parts_sku: list[pl.DataFrame] = []
         tr = df_train.filter(is_sku_store)
         if tr.height:
-            parts_sku.append(
-                tr.with_columns(pl.lit("in_sample").alias("period_type"))
-            )
+            parts_sku.append(tr.with_columns(pl.lit("in_sample").alias("period_type")))
         if df_oos.height:
             oo = df_oos.filter(is_sku_store)
             if oo.height:
@@ -1920,7 +2012,9 @@ class RLSForecastPipeline:
             total=3,
             desc="Pipeline RLS",
             unit="etapa",
-            bar_format="{l_bar}{bar}| {postfix}",
+            bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",  # Estructura del texto
+            ncols=50,  # Controla el ancho total
+            ascii="░█",  # Define los caracteres de llenado (vacío/lleno)
         )
 
         def _advance(label: str) -> None:

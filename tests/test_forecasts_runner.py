@@ -33,24 +33,20 @@ except ImportError:  # pragma: no cover
     RecursiveLeastSquaresRegression = None
 
 
-def _manual_causal_ses(values: list[float], alpha: float) -> list[float]:
-    """Referencia en Python puro de la SES causal: s(t)=alpha*x(t)+(1-alpha)*s(t-1);
-    yhat(t) = s(t-1), yhat(0) = s(0) (sin historia previa)."""
+def _manual_ses(values: list[float], alpha: float) -> list[float]:
+    """Referencia en Python puro de la SES no causal (ewm_mean adjust=False):
+    s_t = alpha*x_t + (1-alpha)*s_{t-1}, con s_0 = x_0. El pronóstico es s_t
+    (incluye la observación actual; la causalidad del pipeline la aportan los
+    coeficientes RLS ajustados solo en train, no el suavizado del residuo)."""
     s = []
-    out = []
     prev = None
     for x in values:
-        if prev is None:
-            s_t = x
-        else:
-            s_t = alpha * x + (1 - alpha) * prev
-        out.append(prev if prev is not None else s_t)
-        s.append(s_t)
-        prev = s_t
-    return out
+        prev = x if prev is None else alpha * x + (1 - alpha) * prev
+        s.append(prev)
+    return s
 
 
-def test_apply_causal_ses_matches_manual_recursion():
+def test_apply_ses_matches_manual_recursion():
     values = [10.0, 12.0, 8.0, 15.0, 9.0, 11.0]
     alpha = 0.3
     df = pl.DataFrame(
@@ -60,12 +56,12 @@ def test_apply_causal_ses_matches_manual_recursion():
             "_x": values,
         }
     )
-    out = RLSForecastRunner._apply_causal_ses(df, "_x", "_x_hat", alpha)
-    expected = _manual_causal_ses(values, alpha)
+    out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", alpha)
+    expected = _manual_ses(values, alpha)
     assert out.sort("ds")["_x_hat"].to_list() == pytest.approx(expected, rel=1e-9, abs=1e-9)
 
 
-def test_apply_causal_ses_two_series_independent():
+def test_apply_ses_two_series_independent():
     """El estado de una serie no debe mezclarse con el de otra."""
     vals_a = [10.0, 20.0, 5.0]
     vals_b = [100.0, 50.0, 80.0]
@@ -77,14 +73,14 @@ def test_apply_causal_ses_two_series_independent():
             "_x": vals_a + vals_b,
         }
     )
-    out = RLSForecastRunner._apply_causal_ses(df, "_x", "_x_hat", 0.2)
+    out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", 0.2)
     got_a = out.filter(pl.col("unique_id") == "a").sort("ds")["_x_hat"].to_list()
     got_b = out.filter(pl.col("unique_id") == "b").sort("ds")["_x_hat"].to_list()
-    assert got_a == pytest.approx(_manual_causal_ses(vals_a, 0.2))
-    assert got_b == pytest.approx(_manual_causal_ses(vals_b, 0.2))
+    assert got_a == pytest.approx(_manual_ses(vals_a, 0.2))
+    assert got_b == pytest.approx(_manual_ses(vals_b, 0.2))
 
 
-def test_apply_causal_ses_forecast_only_holds_state_constant():
+def test_apply_ses_forecast_only_holds_state_constant():
     """Los períodos forecast_only no actualizan el estado; se les asigna
     constante el último estado suavizado de la parte 'actual'."""
     actual_vals = [10.0, 12.0, 8.0, 15.0]
@@ -97,26 +93,26 @@ def test_apply_causal_ses_forecast_only_holds_state_constant():
     values = actual_vals + [999.0, -999.0, 0.0]
 
     df = pl.DataFrame({"unique_id": ["a"] * len(dates), "ds": dates, "_x": values, "period_type": period_types})
-    out = RLSForecastRunner._apply_causal_ses(df, "_x", "_x_hat", alpha).sort("ds")
+    out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", alpha).sort("ds")
 
-    # estado final tras la última observación actual (recursión completa, no shifteada)
-    s = None
-    for x in actual_vals:
-        s = x if s is None else alpha * x + (1 - alpha) * s
+    s = _manual_ses(actual_vals, alpha)
     forecast_hat = out.filter(pl.col("period_type") == "forecast_only")["_x_hat"].to_list()
-    assert forecast_hat == pytest.approx([s] * n_forecast, rel=1e-9, abs=1e-9)
+    assert forecast_hat == pytest.approx([s[-1]] * n_forecast, rel=1e-9, abs=1e-9)
 
-    # y la parte actual coincide con la referencia causal de siempre
     actual_hat = out.filter(pl.col("period_type") != "forecast_only")["_x_hat"].to_list()
-    assert actual_hat == pytest.approx(_manual_causal_ses(actual_vals, alpha), rel=1e-9, abs=1e-9)
+    assert actual_hat == pytest.approx(s, rel=1e-9, abs=1e-9)
 
 
-def test_compute_derived_forecasts_matches_manual_reference():
+def test_derive_sku_store_matches_manual_reference():
     """
-    Referencia manual completa del procedimiento (efecto + SES) para un
-    nodo tienda+sku, con coeficientes de sección inyectados directamente
-    (no requiere ajustar RLS real): confirma que `compute_derived_forecasts`
-    hace exactamente lo descripto en README § Modelo jerárquico.
+    Referencia manual completa del procedimiento en LOG-SPACE para un nodo
+    tienda+sku, con coeficientes de sección/tienda inyectados directamente:
+
+      - in_sample:  yhat  = expm1(intercept + efecto)   (RLS, sin SES)
+      - OOS/fcst:   yhat  = expm1(intercept + efecto + SES(log-residuo))
+
+    Confirma que `derive_sku_store_forecasts` reconstruye el pronóstico en el
+    mismo espacio que el fit RLS (log1p) y NO mezcla log-space con unidades.
     """
     runner = RLSForecastRunner(
         driver_cols=["intercept", "driver_a", "driver_b"],
@@ -147,28 +143,39 @@ def test_compute_derived_forecasts_matches_manual_reference():
 
     coef_y = np.array([5.0, 2.0, -1.5])  # [intercept, driver_a, driver_b]
     coef_p = np.array([50.0, 20.0, -15.0])
-    coefs = {"1": (coef_y, coef_p)}
+    section_coefs = {"1": (coef_y, coef_p)}
+    store_coefs = {"1||T:X": (coef_y, coef_p)}
 
     alpha = 0.1
-    out = runner.compute_derived_forecasts(panel, coefs, alpha=alpha).sort("ds")
+    out = runner.derive_sku_store_forecasts(
+        panel, "1", section_coefs, store_coefs, alpha=alpha
+    ).sort("ds")
 
-    # Referencia manual
+    # Referencia manual EN LOG-SPACE
     effect_y = [2.0 * a + -1.5 * b for a, b in zip(driver_a, driver_b)]
     effect_v = [20.0 * a + -15.0 * b for a, b in zip(driver_a, driver_b)]
-    y_neto = [yy - e for yy, e in zip(y, effect_y)]
-    v_neto = [vv - e for vv, e in zip(value, effect_v)]
-    y_neto_hat = _manual_causal_ses(y_neto, alpha)
-    v_neto_hat = _manual_causal_ses(v_neto, alpha)
-    expected_yhat = [round(h + e) for h, e in zip(y_neto_hat, effect_y)]
-    expected_valuehat = [round(h + e, 2) for h, e in zip(v_neto_hat, effect_v)]
-    expected_effect_y = effect_y
+    log_resid_y = [
+        np.log1p(yy) - (5.0 + e) for yy, e in zip(y, effect_y)
+    ]
+    log_resid_v = [
+        np.log1p(vv) - (50.0 + e) for vv, e in zip(value, effect_v)
+    ]
+    # in-sample usa RLS puro (sin SES): expm1(intercept + efecto)
+    expected_yhat = [
+        round(float(np.expm1(5.0 + e))) for e in effect_y
+    ]
+    expected_valuehat = [
+        round(float(np.expm1(50.0 + e)), 2) for e in effect_v
+    ]
 
     assert out["yhat"].to_list() == pytest.approx(expected_yhat, rel=1e-6, abs=1e-6)
     assert out["valuehat"].to_list() == pytest.approx(expected_valuehat, rel=1e-6, abs=1e-6)
-    assert out["driver_effect"].to_list() == pytest.approx(expected_effect_y, rel=1e-9, abs=1e-9)
+    assert out["driver_effect"].to_list() == pytest.approx(effect_y, rel=1e-9, abs=1e-9)
+    # El residuo SES en log-space no debe colapsar el pronóstico a 0.
+    assert all(v > 0 for v in out["yhat"].to_list())
 
 
-def test_compute_derived_forecasts_ignores_section_only_ids():
+def test_derive_sku_store_ignores_section_only_ids():
     runner = RLSForecastRunner(driver_cols=["intercept", "driver_a"], rmse_error=0.2)
     runner._driver_cols_price = ["intercept", "driver_a"]
     panel = pl.DataFrame(
@@ -182,7 +189,13 @@ def test_compute_derived_forecasts_ignores_section_only_ids():
             "period_type": ["in_sample", "in_sample"],
         }
     )
-    out = runner.compute_derived_forecasts(panel, {"1": (np.array([1.0, 1.0]), np.array([1.0, 1.0]))}, alpha=0.1)
+    out = runner.derive_sku_store_forecasts(
+        panel,
+        "1",
+        {"1": (np.array([1.0, 1.0]), np.array([1.0, 1.0]))},
+        {"1||T:00001": (np.array([1.0, 1.0]), np.array([1.0, 1.0]))},
+        alpha=0.1,
+    )
     assert out.height == 0
 
 

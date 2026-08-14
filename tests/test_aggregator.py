@@ -43,8 +43,9 @@ def _agg():
     return DataAggregator("SALES_DAY", "SLS_QTY", "SLS_VAL", settings.AGGREGATION_LEVELS)
 
 
-def test_aggregate_four_levels(sample_sales):
-    """sección, sección+tienda, sección+sku, sección+tienda+sku."""
+def test_aggregate_three_levels(sample_sales):
+    """sección, sección+tienda, sección+tienda+sku (el SKU puro NO se
+    materializa en el pipeline; el dashboard lo sintetiza en vuelo)."""
     out = _agg().aggregate(sample_sales)
     kinds = set()
     for uid in out["unique_id"].unique().to_list():
@@ -57,7 +58,7 @@ def test_aggregate_four_levels(sample_sales):
             kinds.add("sku")
         else:
             kinds.add("tienda_sku")
-    assert kinds == {"seccion", "tienda", "sku", "tienda_sku"}
+    assert kinds == {"seccion", "tienda", "tienda_sku"}
 
 
 def test_section_ids(sample_sales):
@@ -75,24 +76,31 @@ def test_id_format_uses_prefixes(sample_sales):
     """unique_id: sección||T:tienda||S:sku (ver settings.make_unique_id)."""
     out = _agg().aggregate(sample_sales)
     store = settings.SECCIONES["1"]["locales"][0]
-    assert f"1||T:{store}" in out["unique_id"].to_list()
-    assert "1||S:SKU_A" in out["unique_id"].to_list()
-    assert f"1||T:{store}||S:SKU_A" in out["unique_id"].to_list()
+    uids = out["unique_id"].to_list()
+    assert f"1||T:{store}" in uids
+    assert f"1||T:{store}||S:SKU_A" in uids
+    # El pipeline no materializa nodos «SKU puro» (sin tienda)
+    assert "1||S:SKU_A" not in uids
     # no debe existir el formato viejo sin prefijos
-    assert f"1||{store}" not in out["unique_id"].to_list()
+    assert f"1||{store}" not in uids
 
 
-def test_sku_aggregated_across_stores(sample_sales):
-    """El nodo sección+sku (sin tienda) suma TODAS las tiendas de la sección."""
+def test_sku_aggregated_across_stores_via_dashboard(sample_sales):
+    """El nodo sección+sku (sin tienda) NO existe en el parquet; el dashboard
+    lo sintetiza sumando las hojas sku+tienda (dashboard_data._aggregate_pure_sku)."""
+    from dashboard_data import _aggregate_pure_sku
+
     out = _agg().aggregate(sample_sales)
     store = settings.SECCIONES["1"]["locales"][0]
     day0 = dt.date(2024, 5, 1)
     per_store = out.filter(
         (pl.col("unique_id") == f"1||T:{store}||S:SKU_A") & (pl.col("ds") == day0)
     )["y"][0]
-    across_stores = out.filter(
-        (pl.col("unique_id") == "1||S:SKU_A") & (pl.col("ds") == day0)
-    )["y"][0]
+
+    pure = _aggregate_pure_sku(
+        out.with_columns(pl.lit(1.0).alias("yhat")), "1", "SKU_A"
+    )
+    across_stores = pure.filter(pl.col("ds") == day0)["y"][0]
     # 2 tiendas configuradas en el fixture, cada una con 10 unidades → 20
     assert across_stores == pytest.approx(2 * per_store)
 
@@ -111,10 +119,6 @@ def test_descriptions_attached(sample_sales):
     sku_row = out.filter(pl.col("unique_id") == f"1||T:{store}||S:SKU_A")
     assert sku_row["sku_desc"][0] == "Desc SKU_A"
     assert sku_row["store_name"][0] == expected_name
-
-    sku_only_row = out.filter(pl.col("unique_id") == "1||S:SKU_A")
-    assert sku_only_row["sku_desc"][0] == "Desc SKU_A"
-    assert sku_only_row["store_name"][0] == ""
 
 
 def test_y_sum_section(sample_sales):

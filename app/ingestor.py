@@ -3,6 +3,7 @@ Ingesta de datos maestros (mercadológico) y de ventas
 ======================================================
 100% Polars. Secciones 1 y 23.
 """
+
 from __future__ import annotations
 
 import logging
@@ -171,7 +172,9 @@ class MasterCatalogIngestor:
     def save(self, df: pl.DataFrame) -> Path:
         self._cfg.output_dir.mkdir(parents=True, exist_ok=True)
         out_path = self._cfg.output_dir / "master.parquet"
-        df.write_parquet(out_path, compression="zstd", compression_level=3, statistics=True)
+        df.write_parquet(
+            out_path, compression="zstd", compression_level=3, statistics=True
+        )
         logger.info("✓ Archivo guardado en: %s", out_path)
         return out_path
 
@@ -240,7 +243,14 @@ class SalesIngestor:
             return self._empty_frame()
         lazy_frames = [
             self._scan_one(path)
-            for path in tqdm(files, desc="Escaneando ventas", unit="archivo")
+            for path in tqdm(
+                files,
+                desc="Escaneando ventas",
+                unit="archivo",
+                ncols=50,  # Controla el ancho total
+                ascii="░█",  # Define los caracteres de llenado (vacío/lleno)
+                bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",  # Estructura del texto
+            )
         ]
         sales_df = (
             pl.concat(lazy_frames, how="vertical_relaxed")
@@ -253,7 +263,9 @@ class SalesIngestor:
     def save(self, df: pl.DataFrame) -> Path:
         self._cfg.output_dir.mkdir(parents=True, exist_ok=True)
         out_path = self._cfg.output_dir / "sales.parquet"
-        df.write_parquet(out_path, compression="zstd", compression_level=3, statistics=True)
+        df.write_parquet(
+            out_path, compression="zstd", compression_level=3, statistics=True
+        )
         logger.info("✓ Archivo guardado en: %s", out_path)
         return out_path
 

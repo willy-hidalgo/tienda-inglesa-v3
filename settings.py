@@ -141,7 +141,8 @@ NOMBRES_NIVELES = ["seccion", "store", "sku"]
 RMSE_ERROR = 0.2
 CORRECTION_FACTOR = False
 FORGETTING_FACTOR = 0.995
-MIN_Y_TO_update = 1.0
+MIN_Y_TO_UPDATE = 1.0  # umbral mínimo de y para actualizar el RLS (0 => no filtra)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Columnas canónicas

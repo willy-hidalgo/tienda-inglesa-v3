@@ -20,14 +20,18 @@ parquet) no hubieran cambiado.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import sys
 from pathlib import Path
 
 import plotly.graph_objects as go
+import polars as pl
 import streamlit as st
 
 st.set_page_config(page_title="Forecast Explorer", layout="wide")
 st.title("📈 Forecast Explorer · Secciones 1 & 23")
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -60,6 +64,68 @@ def _load_bytes(data: bytes, name: str):
 
 
 @st.cache_data(show_spinner=False)
+def _cached_label_maps(_res_df, mtime_key: float):
+    """Label/desc maps solo dependen del parquet cargado."""
+    return backend.build_label_maps(_res_df)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_all_ids(_res_df, mtime_key: float) -> tuple[str, ...]:
+    return tuple(sorted(_res_df["unique_id"].unique().to_list()))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_section_metrics(
+    _res_df,
+    unidad: str,
+    seccion: str,
+    all_ids_tuple: tuple[str, ...],
+    mtime_key: float,
+):
+    """WMAPE por unique_id a nivel sección — independiente de tienda/SKU.
+
+    Es el coste dominante del dashboard (filtra ~23k unique_ids sobre el
+    panel completo de ~27M filas y tarda 1-3 min). Se cachea doblemente:
+
+      1. en memoria (`st.cache_data`) por (unidad, sección) — reuso dentro
+         de una sesión en cada cambio de filtro fino;
+      2. en disco (`data/output/.dashcache/tabla_base_*`) por (mtime del
+         parquet, unidad, sección) — reuso entre sesiones / cold-start y al
+         cambiar de sección sin volver a calcular en caliente.
+    """
+    cache_dir = settings.OUT_DIR / ".dashcache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _unit_slug = "valor" if unidad.startswith("Valor") else "unidades"
+    tb_path = cache_dir / f"tabla_base_{mtime_key:.3f}_{_unit_slug}_{seccion}.parquet"
+    nsp_path = cache_dir / f"tabla_base_{mtime_key:.3f}_{_unit_slug}_{seccion}.nsp"
+    if tb_path.exists() and nsp_path.exists():
+        try:
+            return pl.read_parquet(tb_path), int(nsp_path.read_text().strip())
+        except Exception:  # pragma: no cover
+            logger.warning("Caché tabla_base corrupta; se recalcula: %s", tb_path)
+
+    cols = set(_res_df.columns)
+    has_value = "value" in cols and "valuehat" in cols
+    unit_df = backend.prepare_unit_df(_res_df, unidad, has_value)
+    hz_spine = settings.section_horizons(seccion)
+    n_spine = (hz_spine["forecast_end"] - hz_spine["train_start"]).days + 1
+    candidatos = [
+        uid for uid in all_ids_tuple if uid == seccion or uid.startswith(f"{seccion}||")
+    ]
+    n_data = backend.spine_n_fechas(unit_df, candidatos)
+    if n_data > n_spine:
+        n_spine = n_data
+    tabla_base = backend.wmape_por_id(candidatos, unit_df, n_fechas_spine=n_spine)
+    try:
+        tabla_base.write_parquet(tb_path)
+        nsp_path.write_text(str(n_spine))
+        logger.info("✓ tabla_base cacheada en disco: %s", tb_path.name)
+    except Exception:  # pragma: no cover
+        logger.warning("No se pudo escribir caché tabla_base: %s", tb_path)
+    return tabla_base, n_spine
+
+
+@st.cache_data(show_spinner=False)
 def _cached_dashboard_state(
     _res_df,
     unidad: str,
@@ -71,6 +137,8 @@ def _cached_dashboard_state(
     all_ids_tuple: tuple[str, ...],
     _label_map: dict[str, str],
     _desc_map: dict[str, str],
+    _tabla_base,
+    n_spine: int,
 ):
     """Envoltorio cacheado de `prepare_dashboard_state`. Los argumentos
     prefijados con `_` no se hashean (DataFrame/dicts grandes, estables
@@ -87,6 +155,8 @@ def _cached_dashboard_state(
         all_ids=list(all_ids_tuple),
         label_map=_label_map,
         desc_map=_desc_map,
+        tabla_base=_tabla_base,
+        n_spine=n_spine,
     )
 
 
@@ -160,8 +230,14 @@ else:
     show_yhat = True
     show_yhat28 = False
 
-all_ids = sorted(res_df["unique_id"].unique().to_list())
-label_map, desc_map = backend.build_label_maps(res_df)
+# Clave de invalidación de caches ligadas al parquet (mtime o nombre upload).
+_mtime_key = (
+    float(Path(settings.FORECAST_PATH).stat().st_mtime)
+    if uploaded is None and Path(settings.FORECAST_PATH).exists()
+    else hash(uploaded.name if uploaded is not None else "none")
+)
+all_ids = list(_cached_all_ids(res_df, _mtime_key))
+label_map, desc_map = _cached_label_maps(res_df, _mtime_key)
 
 
 def label_for(uid: str) -> str:
@@ -261,18 +337,16 @@ sku_sel = st.sidebar.selectbox(
 )
 sku_sel_val = None if sku_sel == _SENTINEL_SKU else sku_sel
 
-# Corte in/out = train_end de la sección (sin control en sidebar)
-selected_id_probe = settings.make_unique_id(seccion, store=store_sel_val, sku=sku_sel_val)
-_probe = backend.filter_series(
-    backend.prepare_unit_df(
-        res_df,
-        unidad,
-        "value" in res_df.columns and "valuehat" in res_df.columns,
-    ),
-    selected_id_probe,
+# Corte in/out = train_end de la sección (settings; sin re-escanear el DF).
+# Si el nodo seleccionado no existe aún, section_horizons sigue siendo válido.
+_hz_sec = settings.section_horizons(seccion)
+cutoff_date = _hz_sec.get("train_end") or dt.date.today()
+
+# Métricas de ranking a nivel sección (cacheadas; no se recalculan al
+# cambiar tienda/SKU dentro de la misma sección+unidad).
+_tabla_base, _n_spine = _cached_section_metrics(
+    res_df, unidad, seccion, tuple(all_ids), _mtime_key
 )
-_hz = backend.resolve_horizons(_probe, seccion, set(res_df.columns))
-cutoff_date = _hz.get("train_end") or backend.ds_range(_probe)[0] or dt.date.today()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ViewModel (todos los cálculos fuera de este módulo; cacheado por selección)
@@ -288,6 +362,8 @@ view = _cached_dashboard_state(
     tuple(all_ids),
     label_map,
     desc_map,
+    _tabla_base,
+    _n_spine,
 )
 
 # Contexto de tienda (solo si Tienda Y SKU están ambos activos) va ARRIBA
@@ -316,7 +392,11 @@ st.caption(
 
 def _show_ranking(display, key: str, pending_key: str, extract_field: str) -> None:
     if display.height == 0:
-        st.caption("Sin datos suficientes.")
+        st.caption(
+            "Sin datos suficientes para ranking "
+            "(no hay hojas sku+tienda con rotación > 0 en esta selección, "
+            "o el parquet no incluye ese nivel)."
+        )
         return
     visible = [c for c in display.columns if c != "unique_id"]
     event = st.dataframe(

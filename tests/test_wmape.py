@@ -85,51 +85,66 @@ def test_compute_wmape_all_zero_y():
 def test_runner_wmape_matches_formula():
     import polars as pl
 
+    # Formato actual: "sec||T:local||S:sku"
     rows = []
     for sku, local, yhat, y, _ in EJEMPLO:
         rows.append(
             {
-                "unique_id": f"1||{local:05d}||{sku}",
+                "unique_id": f"1||T:{local:05d}||S:{sku}",
                 "y": float(y),
                 "yhat": float(yhat),
                 "period_type": "out_sample",
             }
         )
     df = pl.DataFrame(rows)
-    # agregar nivel local
-    for local in (1, 2):
-        sub = [r for r in EJEMPLO if r[1] == local]
-        df = pl.concat(
-            [
-                df,
-                pl.DataFrame(
-                    {
-                        "unique_id": [f"1||{local:05d}"],
-                        "y": [float(sum(r[3] for r in sub))],
-                        "yhat": [float(sum(r[2] for r in sub))],
-                        "period_type": ["out_sample"],
-                    }
-                ),
-            ],
-            how="diagonal_relaxed",
-        )
     w = RLSForecastRunner._compute_wmape(df)
-    # local 1
-    row1 = w.filter(pl.col("unique_id") == "1||00001")
-    # wait we used 1||00001 style - actually f"1||{local:05d}" → 1||00001 and 1||00002
-    r1 = w.filter(pl.col("unique_id") == "1||00001")
-    r2 = w.filter(pl.col("unique_id") == "1||00002")
-    assert r1.height == 1
-    # At local level we summed including y=0 row for local1: yhat includes 5, y includes 0
-    # But _compute_wmape filters y!=0 at row level before group - for local aggregate
-    # we already summed. Better test only sku-level rows.
-    sku_w = RLSForecastRunner._compute_wmape(
-        df.filter(pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2)
-    )
-    # total of all sku rows
-    y = [r[3] for r in EJEMPLO]
-    yhat = [r[2] for r in EJEMPLO]
-    # recompute from sku groups is not same as total - verify one sku
-    sku11_l1 = sku_w.filter(pl.col("unique_id") == "1||00001||11")
+
+    # Hoja: local 1 sku 11 → e=|13-10|=3, sum_y=13
+    sku11_l1 = w.filter(pl.col("unique_id") == "1||T:00001||S:11")
     assert sku11_l1.height == 1
     assert abs(sku11_l1["wmape"][0] - abs(13 - 10) / 13) < 1e-9
+
+    # Tienda 00001 (bottom-up, excluye y=0): |3+6+7|/(13+9+10)=16/32=0.5
+    store1 = w.filter(pl.col("unique_id") == "1||T:00001")
+    assert store1.height == 1
+    assert store1["nivel"][0] == "tienda"
+    assert abs(store1["wmape"][0] - 16 / 32) < 1e-9
+
+    # Sección 1 (bottom-up sobre hojas con y != 0)
+    sec = w.filter(pl.col("unique_id") == "1")
+    assert sec.height == 1
+    assert sec["nivel"][0] == "seccion"
+    y = [r[3] for r in EJEMPLO if r[3] != 0]
+    yhat = [r[2] for r in EJEMPLO if r[3] != 0]
+    expected_sec = sum(abs(a - b) for a, b in zip(y, yhat)) / sum(y)
+    assert abs(sec["wmape"][0] - expected_sec) < 1e-9
+
+
+
+def test_wmape_por_id_excludes_nan_yhat():
+    """Regresión: yhat NaN (p. ej. parquet stale en in_sample) no debe contagiar
+    el WMAPE. Las filas con yhat no finito se ignoran; el resto se calcula
+    normalmente (no sale wmape = NaN)."""
+    import polars as pl
+    import math
+    import backend
+
+    rows = [
+        {"unique_id": "1||T:00001||S:11", "y": 13.0, "yhat": 10.0,
+         "period_type": "in_sample"},
+        {"unique_id": "1||T:00001||S:11", "y": 9.0, "yhat": float("nan"),
+         "period_type": "in_sample"},   # NaN → excluir del cálculo
+        {"unique_id": "1||T:00001||S:11", "y": 10.0, "yhat": 3.0,
+         "period_type": "in_sample"},
+    ]
+    df = pl.DataFrame(rows)
+    res = backend.wmape_por_id(["1||T:00001||S:11"], df, n_fechas_spine=3)
+    row = res.filter(pl.col("unique_id") == "1||T:00001||S:11")
+    assert row.height == 1
+    wm = row["wmape"][0]
+    assert isinstance(wm, float)
+    assert not math.isnan(wm)                      # no se propaga NaN
+    # abs_error = |13-10| + |10-3| = 10 ; sum_y = 13+10 = 23
+    assert abs(wm - (10 / 23)) < 1e-9
+    assert row["sum_y"][0] == 23.0                # solo filas finitas
+    assert row["n_with_sales"][0] == 2            # NaN yhat descartado

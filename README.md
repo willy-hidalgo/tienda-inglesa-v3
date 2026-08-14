@@ -72,62 +72,63 @@ Cada sección tiene su propio `test_start`, `test_end` y lista de locales.
 Ejemplo sección 23: `test_start=2025-11-30`, `test_end=2025-12-07`.  
 Ejemplo sección 1: `test_start=2026-03-29`, `test_end=2026-04-26`.
 
-## Modelo jerárquico: RLS solo a nivel sección; tienda/sku derivado sin RLS
+## Modelo jerárquico: RLS a nivel sección y tienda; SKU+tienda derivado
 
-Cambio de arquitectura (no solo de performance): **RLS se ajusta
-ÚNICAMENTE a nivel sección** (2 modelos por sección: variable `y`, variable
-`value`, exactamente igual que antes pero restringido a esos 1-2 ids). Los
-nodos de tienda, sku y tienda+sku **ya no se ajustan con RLS individual**
-— se derivan de los coeficientes de la sección con este procedimiento (por
-cada unidad, `y` o `value`, indistintamente):
+El modelo RLS se ajusta sobre **`log1p(y)`** (y sobre `log1p(value)` para la
+variable de precio). El efecto de drivers y el residuo están en **log-space**,
+por lo que la reconstrucción del pronóstico debe hacerse con
+`expm1(intercept + efecto + residuo)`. Esta coherencia fue el núcleo del fix
+de pronósticos (ver `tests/test_forecasts_logspace.py`): restar el efecto
+(log-space) de `y` (lineal) producía residuos incoherentes y `yhat = 0` en
+OOS/forecast, lo que dejaba vacío el ranking SKU+tienda. Los niveles:
 
-1. **Efecto de drivers**: `efecto(t) = drivers_propios_del_nodo(t) ·
-   coef_sección` (producto punto, **sin el intercepto**, con los drivers
-   propios del nodo — no los de la sección — multiplicados por los
-   coeficientes YA ajustados a nivel sección).
-2. **y_neto**: `y_neto(t) = y(t) − efecto(t)`.
-3. **SES causal**: suavización exponencial simple sobre `y_neto`, con
-   `alpha` fijo (`settings.SES_ALPHA`, default `0.1`). La predicción de
-   cada fecha usa el estado suavizado **hasta el día anterior**
-   (`s(t-1)`, nunca `s(t)`) — mismo principio de causalidad que el
-   rolling28: no hay look-ahead. Fuera de la muestra (OOS/forecast-only),
-   el estado se propaga **constante** en el último valor conocido
-   (propiedad estándar de una SES a cualquier horizonte).
-4. **yhat**: `yhat(t) = y_neto_hat(t) + efecto(t)`.
+### 1) Niveles con RLS real: sección y tienda
 
-Implementación: `RLSForecastRunner.compute_derived_forecasts` +
-`_apply_causal_ses`, con `pl.Expr.ewm_mean(alpha=..., adjust=False)`
-(nativo de Polars) para el paso 3 — **vectorizado sobre todas las series a
-la vez, sin loop en Python y sin numba** (ver § Rendimiento).
+- **Sección** (`1`): ajusta RLS con `RecursiveLeastSquaresRegression` sobre
+  `log1p(y)` / `log1p(value)` mediante `fit_and_predict_sections`.
+- **Tienda** (`1||T:00063`): aplica la **misma lógica RLS** a la serie de la
+  tienda — se ajusta un RLS por tienda y variable.
 
-**Se usó `pl.ewm_mean`, no `statsmodels`.** `statsmodels.
-SimpleExpSmoothing` ajusta una serie a la vez desde Python — con miles de
-series eso es el mismo patrón de loop-con-overhead-por-serie que ya se
-eliminó para RLS. `ewm_mean` con `alpha` fijo es una operación columnar
-pura en Rust sobre todas las series simultáneamente.
+Los coeficientes finales de sección y de cada tienda se reutilizan para derivar
+el nivel inferior (SKU+tienda) **sin re-fit**.
 
-**Persistencia**: `driver_effect` y `driver_effect_value` (el término
-"efecto" en cada unidad) se persisten en el parquet — útil para debug y
-auditoría. Para nodos de sección estos campos van `null` (no aplica, el
-`yhat` de sección es la predicción RLS directa, sin descomposición).
-`y_neto` no se persiste (se puede recalcular al vuelo: `y − driver_effect`).
+### 2) Nivel derivado: SKU+tienda (sin RLS, log-space)
 
-**Asunción explícita**: la SES se alimenta con `y_neto` de **todos los
-días del panel denso**, incluyendo días sin venta (`y=0`) — a diferencia
-del RLS, que excluye actualizaciones vía `min_y_to_update`. Un día sin
-venta es información real para la línea de base local del nodo.
+`RLSForecastRunner.derive_sku_store_forecasts`, por cada `store_uid` y fecha:
+
+1. **Selección de modelo**: coeficientes de sección o de tienda con menor WMAPE
+   in-sample; en empate, el de menor |BIAS| (`_select_model_wmape`). Se persiste
+   en `modelo_seleccionado`.
+2. **Efecto de drivers (log-space, sin intercepto)**:
+   `efecto(t) = drivers_propios(t) . coef_seleccionado[drivers]`.
+3. **Residuo en log-space**:
+   `residuo_log(t) = log1p(y(t)) - (intercepto + efecto(t))`.
+4. **SES no causal** sobre el residuo (`_apply_ses`, `alpha = SES_ALPHA`):
+   `s(t) = a*r(t) + (1-a)*s(t-1)`; `forecast_only` propaga `s` constante.
+5. **Reconstrucción** (log-space):
+   - In-sample:  `yhat = expm1(intercepto + efecto)` (RLS puro, sin SES).
+   - OOS / forecast-only: `yhat = expm1(intercepto + efecto + s)`, recortado a >= 0
+     (`valuehat` a 2 decimales).
+
+Se persisten `driver_effect`, `driver_effect_value`, `yhat_seccion`,
+`yhat_tienda`, `modelo_seleccionado`. No existe nodo SKU puro (`sec||S:sku`) en
+el pipeline; el dashboard lo sintetiza en vuelo sumando las hojas
+`sec||T:store||S:sku` (`dashboard_data._aggregate_pure_sku`).
 
 ## Rendimiento del modelo jerárquico
 
 Este cambio de arquitectura es, en sí mismo, la optimización de
 performance más grande del proyecto — no un ajuste incremental:
 
-- **Antes**: 1 fit RLS por serie (miles: sección × tienda × sku × 2
-  variables).
-- **Ahora**: **2-4 fits RLS en total** (uno por sección × variable). Todo
-  lo demás (tienda/sku/tienda+sku) es una **única pasada vectorizada**
-  (matmul de drivers + `ewm_mean`), sin loop por serie y sin threads — no
-  hay nada que paralelizar por serie en ese camino.
+- **RLS real (fits)**: `n_secciones` (~2) + `n_tiendas` (~8) por variable.
+  Sección y tienda se ajustan con `RecursiveLeastSquaresRegression` en
+  log-space; SKU+tienda se deriva (no se ajusta).
+- **Derivación SKU+tienda**: una pasada vectorizada por `store_uid` (matmul de
+  drivers + `expm1` + `ewm_mean` sobre el residuo log), sin loop por serie ni numba.
+- **Densify**: grid con `np.repeat/tile` (más barato que cross-join de Polars).
+- **EDP**: un `decompose_price` batched sobre todo el panel ordenado.
+- **Checkpoint** `forecast_seccion_<n>_partial.parquet` para reanudir sin perder
+  trabajo; `--limit-series` para debug rápido.
 - Benchmark sintético (8 tiendas × 15 SKU parcial, 111 series, 561 días de
   historia): pipeline completo de la sección en **~4s** (1.5s EDP + 0.1s
   RLS sección + 1.2s derivado vectorizado + agregación/features), de los
@@ -164,6 +165,10 @@ performance más grande del proyecto — no un ajuste incremental:
   no cambiaran. La clave de cache es la selección de filtros (unidad,
   freq, sección, tienda, sku) — volver a un nodo ya visitado es
   instantáneo.
+Además, `wmape_por_id` y las métricas por sección se cachean en **disco**
+(`data/output/.dashcache/tabla_base_*`) con clave `(mtime, unidad, sección)`,
+invalidándose al recargar el parquet: cold start cae de ~60-180s a casi 0 en
+recargas posteriores (ver `DashboardService` en `dashboard_data.py`).
 
 ## Ranking
 
@@ -224,12 +229,19 @@ pytest tests/ -q
 
 ## Tests
 
-Cubren helpers de fecha (domingo, lunes, bloques 28 días), horizontes por
-sección, las 4 combinaciones del esquema de `unique_id` (sección / tienda /
-sku / tienda+sku), agregación con descripciones, filtrado cruzado
-tienda↔sku, y equivalencia numérica del método derivado (efecto + SES
-causal) contra referencias calculadas a mano en Python puro — ver §
-Modelo jerárquico y § Rendimiento para el detalle de cada test.
+Cubren: helpers de fecha (domingo, lunes, bloques 28 días), horizontes por
+sección, las 4 combinaciones del esquema de `unique_id` (sección / tienda / sku /
+tienda+sku), agregación con descripciones, filtrado cruzado tienda<->sku,
+derivación SKU+tienda y equivalencia numérica contra referencias en Python puro.
+
+Test suites incluidas esta sesión:
+- `tests/test_aggregator.py` — 3 niveles de agregación (dashboard_data, incl. SKU puro).
+- `tests/test_wmape.py` — fórmula WMAPE + BIAS y cobertura del cálculo de rankings.
+- `tests/test_rolling28.py` — estado actual (rolling28 suprimido).
+- `tests/test_forecasts_runner.py` — `_apply_ses` y `derive_sku_store_forecasts`.
+- `tests/test_forecasts_logspace.py` — **nuevo** — valida que `yhat =
+  expm1(intercepto + efecto + SES(log-residuo))` reconstruye la escala, y que
+  `forecast.parquet` derivado tiene `sum_y > 0` en el ranking SKU+tienda.
 
 ## Dependencias
 
@@ -280,31 +292,20 @@ uv run pytest tests/ -q
 Si aparece `program not found`, falta el paquete en el entorno:
 `uv add --dev pytest` y volver a intentar.
 
-## Rolling 28d (`yhat28` / `valuehat28`)
+## Rolling 28d (`yhat28` / `valuehat28`) — *reemplazado*
 
-**Opcional** vía `settings.COMPUTE_ROLLING_28` (default: `False`). Cuando está
-desactivado, `forecasts.py` no calcula nada de esto y **no agrega las
-columnas** `yhat28`/`valuehat28` al parquet (ni siquiera nulas) — el
-dashboard detecta si el rolling28 fue calculado por la sola presencia de
-estas columnas con datos, tanto a nivel de dataset completo (para decidir si
-mostrar el control "Series de forecast visibles") como a nivel del nodo
-puntual seleccionado (para decidir si dibujar la línea y mostrar las
-métricas).
+**OBSOLETO / eliminado** en este refactor.** La funcionalidad de rolling28 y las
+columnas `yhat28`/`valuehat28` fueron **suprimidas** del pipeline (ya no existen
+en `forecast.parquet`). `settings.COMPUTE_ROLLING_28` y `run_rolling_28` fueron
+removidos; `min_y_to_update` pasó a `MIN_Y_TO_UPDATE`. En consecuencia:
 
-**Desde el modelo jerárquico (RLS solo a nivel sección), el rolling28
-también queda limitado al nivel sección** — es el único nivel con un RLS
-real que tenga sentido reajustar por bloques; tienda/sku/tienda+sku usan el
-método derivado (efecto + SES), que no tiene una noción de "reajuste por
-bloque" análoga. `_run_section` restringe el panel de entrada de
-`run_rolling_28` a `unique_id == seccion` antes de llamarlo.
+- El dashboard **no muestra** el control "Series de forecast visibles" ni la
+  sección "Métricas Rolling 28d" (ambos detectaban la presencia de esas
+  columnas; hoy no existen → se ocultan por diseño).
+- No hay reajuste por bloques de 28 días; el modelo jerárquico (RLS a nivel
+  sección y tienda + derivación log-space) es el único forecast.
 
-Walk-forward por bloques de 28 días sobre **toda la historia** (desde el primer lunes ≥ primera fecha de la serie):
-
-1. Se ajusta el modelo RLS **una sola vez** con todos los actuals disponibles, con `return_all_coefs=True` (opción B: el seed de coeficientes usa todo el historial de actuals, igual que antes).
-2. Para el bloque que empieza en la posición `pos`, se predice usando el vector de coeficientes tal como quedó tras el **último actual estrictamente anterior a `pos`** (leído de la trayectoria de coeficientes ya calculada en el fit único — sin reajustar nada).
-3. No modifica `yhat` / `valuehat`. Métricas `WMAPE₂₈` / `BIAS₂₈` en sección aparte del dashboard.
-
-⚠️ Esto reemplaza el walk-forward anterior, que reajustaba el modelo completo en cada bloque de 28 días. Los valores numéricos de `yhat28`/`wmape_28` **cambian levemente** respecto de versiones previas del pipeline por este motivo — es un cambio intencional y documentado, no un bug.
+(El texto histórico de este apartado fue reemplazado por esta nota.)
 
 ## Panel denso
 

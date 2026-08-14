@@ -144,11 +144,16 @@ def all_stores_in_section(all_ids: list[str], seccion: str) -> list[str]:
 
 
 def all_skus_in_section(all_ids: list[str], seccion: str) -> list[str]:
-    """Todos los SKU de la sección (nodo sku, sin filtro de tienda)."""
+    """Todos los SKU de la sección.
+
+    El pipeline solo materializa hojas sku+tienda (y nodos sección/tienda).
+    No existen nodos «SKU puro»; se recolectan los SKU desde cualquier
+    unique_id que los contenga (típicamente profundidad 2).
+    """
     out = set()
     for uid in all_ids:
         p = settings.split_unique_id(uid)
-        if p["seccion"] == seccion and p["sku"] is not None and p["store"] is None:
+        if p["seccion"] == seccion and p["sku"] is not None:
             out.add(p["sku"])
     return sorted(out)
 
@@ -245,7 +250,10 @@ def wmape_por_id(
         n_fechas_spine = spine_n_fechas(base_m if base_m.height else base, ids)
     n_fechas_spine = int(n_fechas_spine or 0)
 
-    scored = base_m.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+    scored = base_m.filter(
+        pl.col("y").is_not_null()
+        & (pl.col("y") != 0)  & pl.col("yhat").is_finite()  # defiende contra NaN/inf en yhat (parquet stale)
+    )
     if scored.height == 0:
         # devolver todos los ids con wmape null/0 y n_points = spine
         return pl.DataFrame(
@@ -299,12 +307,14 @@ def ranking_table(
     Tabla de ranking para UN eje (`axis="store"` o `axis="sku"`), con
     filtro cruzado según el otro eje (`fixed_peer`):
 
-    - `axis="store"`, `fixed_peer=None`   → todas las tiendas de la sección.
+    - `axis="store"`, `fixed_peer=None`   → todas las tiendas de la sección
+      (nodos tienda puros, que sí materializa el pipeline).
     - `axis="store"`, `fixed_peer=<sku>`  → tiendas donde existe ese SKU
-      (comparando tienda+sku entre tiendas, para ese SKU fijo).
-    - `axis="sku"`, `fixed_peer=None`     → todos los SKU de la sección.
+      (comparando hojas tienda+sku entre tiendas, para ese SKU fijo).
+    - `axis="sku"`, `fixed_peer=None`     → SKU de la sección agregando las
+      hojas sku+tienda (el pipeline NO genera nodos SKU puro).
     - `axis="sku"`, `fixed_peer=<store>`  → SKU que existen en esa tienda
-      (comparando tienda+sku entre SKU, para esa tienda fija).
+      (hojas tienda+sku de esa tienda).
     - `exclude`: código del nodo actualmente seleccionado en ESTE eje (se
       omite de su propio ranking).
 
@@ -329,49 +339,118 @@ def ranking_table(
     if tabla_base.height == 0:
         return empty
 
-    uids = tabla_base["unique_id"].to_list()
-    keep = []
-    for uid in uids:
-        p = settings.split_unique_id(uid)
-        if p["seccion"] != seccion:
-            keep.append(False)
-            continue
-        if axis == "store":
-            ok = p["store"] is not None
-            if ok:
-                ok = (p["sku"] == fixed_peer) if fixed_peer is not None else (p["sku"] is None)
-            if ok and exclude is not None and p["store"] == exclude:
-                ok = False
-        else:  # axis == "sku"
-            ok = p["sku"] is not None
-            if ok:
-                ok = (p["store"] == fixed_peer) if fixed_peer is not None else (p["store"] is None)
-            if ok and exclude is not None and p["sku"] == exclude:
-                ok = False
-        keep.append(ok)
+    # Parseo vectorizado del unique_id (evita loop Python por fila).
+    # Formato: "sec" | "sec||T:store" | "sec||S:sku" | "sec||T:store||S:sku"
+    enriched = tabla_base.with_columns(
+        pl.col("unique_id").str.split("||").list.get(0).alias("_sec"),
+        pl.when(pl.col("unique_id").str.contains(r"\|\|T:", literal=False))
+        .then(pl.col("unique_id").str.extract(r"\|\|T:([^|]+)", 1))
+        .otherwise(None)
+        .alias("_store"),
+        pl.when(pl.col("unique_id").str.contains(r"\|\|S:", literal=False))
+        .then(pl.col("unique_id").str.extract(r"\|\|S:([^|]+)", 1))
+        .otherwise(None)
+        .alias("_sku"),
+    ).filter(pl.col("_sec") == seccion)
 
-    tabla = tabla_base.filter(pl.Series(keep)).filter(pl.col("wmape") != 0).sort("wmape")
+    if axis == "store":
+        if fixed_peer is not None:
+            # Hojas tienda+sku del SKU fijo
+            tabla = enriched.filter(
+                (pl.col("_sku") == fixed_peer) & pl.col("_store").is_not_null()
+            )
+            if exclude is not None:
+                tabla = tabla.filter(pl.col("_store") != exclude)
+            code_expr = pl.col("_store")
+            uid_expr = pl.col("unique_id")
+        else:
+            # Nodos tienda puros (depth 1, sin SKU)
+            tabla = enriched.filter(
+                pl.col("_store").is_not_null() & pl.col("_sku").is_null()
+            )
+            if exclude is not None:
+                tabla = tabla.filter(pl.col("_store") != exclude)
+            code_expr = pl.col("_store")
+            uid_expr = pl.col("unique_id")
+    else:  # axis == "sku"
+        if fixed_peer is not None:
+            # Hojas tienda+sku de la tienda fija
+            tabla = enriched.filter(
+                (pl.col("_store") == fixed_peer) & pl.col("_sku").is_not_null()
+            )
+            if exclude is not None:
+                tabla = tabla.filter(pl.col("_sku") != exclude)
+            code_expr = pl.col("_sku")
+            uid_expr = pl.col("unique_id")
+        else:
+            # Agregar hojas sku+tienda → ranking por SKU (no hay nodos SKU puro)
+            leaves = enriched.filter(
+                pl.col("_store").is_not_null() & pl.col("_sku").is_not_null()
+            )
+            if exclude is not None:
+                leaves = leaves.filter(pl.col("_sku") != exclude)
+            if leaves.height == 0:
+                return empty
+            # WMAPE agregado ≈ Σ(wmape_i * sum_y_i) / Σ sum_y_i
+            tabla = (
+                leaves.group_by("_sku")
+                .agg(
+                    (pl.col("wmape") * pl.col("sum_y")).sum().alias("_sum_abs"),
+                    pl.col("sum_y").sum().alias("sum_y"),
+                    pl.col("n_with_sales").sum().alias("n_with_sales"),
+                    pl.col("n_points").first().alias("n_points"),
+                )
+                .with_columns(
+                    pl.when(pl.col("sum_y") != 0)
+                    .then(pl.col("_sum_abs") / pl.col("sum_y"))
+                    .otherwise(0.0)
+                    .alias("wmape"),
+                    # unique_id virtual de SKU puro (para click → filtro SKU)
+                    pl.concat_str(
+                        [pl.lit(seccion), pl.lit("||S:"), pl.col("_sku")]
+                    ).alias("unique_id"),
+                )
+                .drop("_sum_abs")
+            )
+            code_expr = pl.col("_sku")
+            uid_expr = pl.col("unique_id")
+
+    # Mostrar filas con ventas (sum_y>0); wmape==0 se mantiene al final
+    # (antes se filtraba wmape!=0 y desaparecían series con error nulo o
+    # sin ventas que igual interesan para rotación).
+    tabla = tabla.filter(pl.col("sum_y") > 0).sort("wmape")
     if tabla.height == 0:
         return empty
 
-    uids2 = tabla["unique_id"].to_list()
-    codes = [
-        (settings.split_unique_id(u)["store"] if axis == "store" else settings.split_unique_id(u)["sku"])
-        for u in uids2
-    ]
+    codes = tabla.select(code_expr.alias("Código"))["Código"].to_list()
+    uids2 = tabla.select(uid_expr.alias("unique_id"))["unique_id"].to_list()
     n_points = tabla["n_points"].to_list()
     n_with_sales = tabla["n_with_sales"].to_list()
     pct = [
-        (nw / np_ * 100) if np_ else 0.0
+        (float(nw) / float(np_) * 100) if np_ else 0.0
         for nw, np_ in zip(n_with_sales, n_points)
     ]
+    # Descripción: preferir la del unique_id; si es SKU virtual, buscar
+    # cualquier hoja con ese SKU en desc_map.
+    descriptions: list[str] = []
+    for u, code in zip(uids2, codes):
+        d = desc_map.get(u, "")
+        if not d and axis == "sku" and fixed_peer is None:
+            # Buscar primera hoja que contenga este SKU
+            prefix_hit = next(
+                (desc_map[k] for k in desc_map if f"||S:{code}" in k and desc_map[k]),
+                "",
+            )
+            d = prefix_hit
+        descriptions.append(d)
+
     return pl.DataFrame(
         {
             "Código": codes,
-            "Descripción": [desc_map.get(u, "") for u in uids2],
+            "Descripción": descriptions,
             "wMAPE (%)": [f"{w * 100:,.2f}" for w in tabla["wmape"].to_list()],
             label_rot: [f"{v:,.2f}" for v in tabla["sum_y"].to_list()],
-            "N puntos": n_with_sales,
+            "N puntos": [int(x) for x in n_with_sales],
             "% ≠0": [f"{p:,.1f}" for p in pct],
             "unique_id": uids2,
         }
@@ -381,7 +460,10 @@ def ranking_table(
 def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
     if df.height == 0:
         return 0.0, 0.0, 0
-    scored = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+    scored = df.filter(
+        pl.col("y").is_not_null()
+        & (pl.col("y") != 0)  & pl.col("yhat").is_finite()  # defiende contra NaN/inf en yhat (parquet stale)
+    )
     if scored.height == 0:
         return 0.0, 0.0, 0
     if "abs_error" not in scored.columns:
