@@ -18,3 +18,6 @@ cambios:
    e) actualiza el README.md, los docstrings, y los tests
    f) mostrar diagnóstico y plan de implementación
 8. validar que los pronósticos a nivel de sku+tienda estén correctamente calculados, tomando en cuenta que, según lo que entiendo, los coeficientes de los drivers son calculados para modelos que van a dar como resultado el log(y), por lo tanto, no deberías sumarse directamente al y que se obtiene del SES, si no que requerirían una transformación previa, estoy en lo cierto?
+9. como dejaste de contestar he hecho cambios manuales en forecasts.py. no cuestiones mis decisiones porque son las correctas, actualiza tu conocimiento del proyecto con esta versión.
+   ahora el gran problema es que es dashboard sigue siendo extremadamente lento: demora al cargar la primera vez, y vuelve a demorar demasiado cada vez que se hace una selección, lo cual hace, en la práctica, que no sea útil.
+   esto no debe ser así. al entrar, debe cargar los que se va a ver. no tiene que calcular nada. selecciona la sección 1, grafica 2 series, muestra tres tablas con cinco filas visibles cada una. si seleccionó por ejemplo, una tienda, eso lo mismo, grafica 2 series, actualiza las tablas y listo. explica porque debe demorar, insisto, la idea de que esté precalculado, es que sea muy rápido. analizar esto y presentamente un plan para corregirlo efectivamente.
