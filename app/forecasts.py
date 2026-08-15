@@ -727,12 +727,18 @@ class RLSForecastRunner:
         return float(np.exp(sigma2 / 2))
 
     def _default_priors(self, n_features: int):
+        if RLSConstantPrior is None or RLSPrior is None:
+            raise RuntimeError("rls_opt no disponible")
+
         return [RLSConstantPrior(standard_error=0.5, rmse_error=self._rmse_error)] + [
             RLSPrior(coefficient=0, standard_error=0.5, rmse_error=self._rmse_error)
             for _ in range(max(0, n_features - 1))
         ]
 
     def _new_rls(self, min_y: float, return_all_coefs: bool = False):
+        if RecursiveLeastSquaresRegression is None:
+            raise RuntimeError("rls_opt no disponible")
+
         return RecursiveLeastSquaresRegression(
             forgetting_factor=self._forgetting_factor,
             min_y_to_update=min_y,
@@ -746,6 +752,7 @@ class RLSForecastRunner:
             raise RuntimeError("rls_opt no disponible")
 
         X_y = train_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
+        # X_y = train_g.select(self._driver_cols).to_numpy().astype(np.float32, order="C")
         y = train_g["y"].to_numpy()
         log_y = np.log1p(y)
         model_y = self._new_rls(self._min_y_to_update)
@@ -756,6 +763,7 @@ class RLSForecastRunner:
             train_g.select(self._driver_cols_price)
             .to_numpy()
             .astype(np.float64, order="C")
+            # .astype(np.float32, order="C")
         )
         price = train_g["value"].to_numpy()
         log_price = np.log1p(np.clip(price, 0.0, None))
@@ -779,6 +787,7 @@ class RLSForecastRunner:
 
         X_y_test = (
             test_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
+            # test_g.select(self._driver_cols).to_numpy().astype(np.float32, order="C")
         )
         log_yhat_test = model_y.predict(X_y_test)
         if self._use_correction_factor:
@@ -791,6 +800,7 @@ class RLSForecastRunner:
             test_g.select(self._driver_cols_price)
             .to_numpy()
             .astype(np.float64, order="C")
+            # .astype(np.float32, order="C")
         )
         log_pricehat = model_p.predict(X_p_test)
         if self._use_correction_factor:
@@ -872,6 +882,8 @@ class RLSForecastRunner:
             coefs[uid] = (
                 np.asarray(model_y.final_coef_[0], dtype=np.float64).ravel(),
                 np.asarray(model_p.final_coef_[0], dtype=np.float64).ravel(),
+                # np.asarray(model_y.final_coef_[0], dtype=np.float32).ravel(),
+                # np.asarray(model_p.final_coef_[0], dtype=np.float32).ravel(),
             )
             for name, parts in target_parts.items():
                 test_g = parts.get(uid)
@@ -1095,8 +1107,9 @@ class RLSForecastRunner:
             pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid")
         )
 
-        coef_y_sec = np.ascontiguousarray(coef_section[0], dtype=np.float64).ravel()
-        coef_p_sec = np.ascontiguousarray(coef_section[1], dtype=np.float64).ravel()
+        coef_y_sec = np.ascontiguousarray(coef_section[0], dtype=np.float32).ravel()
+        coef_p_sec = np.ascontiguousarray(coef_section[1], dtype=np.float32).ravel()
+
         coef_y_sec_fx = coef_y_sec[idx_y]
         coef_p_sec_fx = coef_p_sec[idx_p]
 
@@ -1105,6 +1118,7 @@ class RLSForecastRunner:
         has_period = "period_type" in panel.columns
 
         for si, store_uid in enumerate(store_uids):
+            # Liberar variables temporales explícitamente e invocar garbage collection si la tienda es muy grande
             coef_store = store_coefs.get(store_uid)
             if coef_store is None:
                 continue
@@ -1112,17 +1126,21 @@ class RLSForecastRunner:
             sub = panel.filter(pl.col("_store_uid") == store_uid)
             if sub.height == 0:
                 continue
+            elif sub.height > 500_000:
+                gc.collect()
 
-            # Un solo to_numpy por bloque de drivers (Float64)
+            # Un solo to_numpy por bloque de drivers (Float32)
             X_y = np.ascontiguousarray(
-                sub.select(driver_cols).to_numpy(), dtype=np.float64
+                sub.select(driver_cols).to_numpy(), dtype=np.float32
             )
             X_p = np.ascontiguousarray(
-                sub.select(driver_cols_price).to_numpy(), dtype=np.float64
+                sub.select(driver_cols_price).to_numpy(), dtype=np.float32
             )
             y = sub["y"].to_numpy().astype(np.float64, copy=False)
+            # y = sub["y"].to_numpy().astype(np.float32, copy=False)
             value = (
                 sub["value"].to_numpy().astype(np.float64, copy=False)
+                # sub["value"].to_numpy().astype(np.float32, copy=False)
                 if "value" in sub.columns
                 else np.zeros_like(y)
             )
@@ -1134,8 +1152,8 @@ class RLSForecastRunner:
                 periods = None
                 is_train = np.ones(len(y), dtype=bool)
 
-            coef_y_sto = np.ascontiguousarray(coef_store[0], dtype=np.float64).ravel()
-            coef_p_sto = np.ascontiguousarray(coef_store[1], dtype=np.float64).ravel()
+            coef_y_sto = np.ascontiguousarray(coef_store[0], dtype=np.float32).ravel()
+            coef_p_sto = np.ascontiguousarray(coef_store[1], dtype=np.float32).ravel()
 
             # Predicciones completas RLS (auditoría + selección)
             yhat_sec = np.round(np.expm1(X_y @ coef_y_sec)).ravel()
@@ -1524,6 +1542,10 @@ class RLSForecastPipeline:
         groups = df.sort(["unique_id", "ds"]).partition_by(
             "unique_id", maintain_order=True
         )
+        if not decompose_price:
+            raise TypeError(
+                "El componente decompose_price no ha sido definido, instalar tqdm y probar nuevamente..."
+            )
         for part in tqdm(
             groups,
             desc="EDP (loop)",
@@ -1541,6 +1563,9 @@ class RLSForecastPipeline:
                 "asp": np.asarray(asp, dtype=np.float64).ravel(),
                 "edp": np.asarray(edp, dtype=np.float64).ravel(),
                 "discount": np.asarray(discount, dtype=np.float64).ravel(),
+                # "asp": np.asarray(asp, dtype=np.float32).ravel(),
+                # "edp": np.asarray(edp, dtype=np.float32).ravel(),
+                # "discount": np.asarray(discount, dtype=np.float32).ravel(),
             }
             for name, arr in computed.items():
                 if arr.shape[0] != part.height:
@@ -1624,6 +1649,9 @@ class RLSForecastPipeline:
             pl.Series("asp", np.asarray(asp, dtype=np.float64)),
             pl.Series("edp", np.asarray(edp, dtype=np.float64)),
             pl.Series("discount", np.asarray(discount, dtype=np.float64)),
+            # pl.Series("asp", np.asarray(asp, dtype=np.float32)),
+            # pl.Series("edp", np.asarray(edp, dtype=np.float32)),
+            # pl.Series("discount", np.asarray(discount, dtype=np.float32)),
         )
 
     def _run_section(

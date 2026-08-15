@@ -1,6 +1,6 @@
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from numba import jit
@@ -14,28 +14,36 @@ from rls_opt.priors import RLSConstantPrior, RLSPrior, RLSPriorBase, RLSRelative
 class RecursiveLeastSquaresRegression:
     forgetting_factor: float
     min_y_to_update: float
-    weighting_function: Optional[Union[Callable[[float], float], CPUDispatcher]] = field(default=None)
+    weighting_function: Callable[[float], float] | CPUDispatcher | None = field(
+        default=None
+    )
     return_all_coefs: bool = False
     check_inputs: bool = False
-    final_coef_: List[np.ndarray] = field(default_factory=list, repr=False)
-    all_coef_: List[np.ndarray] = field(default_factory=list, repr=False)
-    errors: List[float] = field(default_factory=list, repr=False)
-    
+    final_coef_: list[np.ndarray] = field(default_factory=list, repr=False)
+    all_coef_: list[np.ndarray] = field(default_factory=list, repr=False)
+    errors: list[float] = field(default_factory=list, repr=False)
+
     # TODO: Add xxt to return values. This value supplies the confidence of each coef value
 
     @property
-    def all_coef(self) -> List[np.ndarray]:
+    def all_coef(self) -> list[np.ndarray]:
         if not self.all_coef_:
-            raise ValueError(f"{self} does not have final_coeffs_indexors. Must set return_all_coeffs = True.")
+            raise ValueError(
+                f"{self} does not have final_coeffs_indexors. Must set return_all_coeffs = True."
+            )
         return self.all_coef_
 
     def _check_priors(self, priors: Sequence[RLSPriorBase]):
-        num_constant_priors = sum(isinstance(prior, RLSConstantPrior) for prior in priors)
+        num_constant_priors = sum(
+            isinstance(prior, RLSConstantPrior) for prior in priors
+        )
         assert num_constant_priors <= 1
         if num_constant_priors == 1:
             assert isinstance(priors[0], RLSConstantPrior)
 
-    def _check_inputs(self, x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv: np.ndarray) -> None:
+    def _check_inputs(
+        self, x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv: np.ndarray
+    ) -> None:
         assert x.ndim == 2
         num_rows, num_cols = x.shape
         assert len(y) == num_rows
@@ -50,12 +58,14 @@ class RecursiveLeastSquaresRegression:
         if not np.isfinite(xxt_inv).any():
             raise ValueError("xxt_inv is not finite, includes nan or inf")
 
-    def fit(self,
-            x: np.ndarray,
-            y: np.ndarray,
-            priors: Sequence[RLSPriorBase],
-            in_sample_metrics: bool = False,
-            out_sample_metrics: bool = False) -> None:
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        priors: Sequence[RLSPriorBase],
+        in_sample_metrics: bool = False,
+        out_sample_metrics: bool = False,
+    ) -> None:
         # TODO: Add support for `in_sample_metrics` and `out_sample_metrics`
 
         self._check_priors(priors)
@@ -66,26 +76,30 @@ class RecursiveLeastSquaresRegression:
         if self.check_inputs:
             self._check_inputs(x=x, y=y, priors=coeffs_0, xxt_inv=xxt_inv_0)
 
-        coeffs, all_coeffs, errors = _rls(x=x,
-                                  y=y,
-                                  priors=coeffs_0,
-                                  xxt_inv_seed=xxt_inv_0,
-                                  forgetting_factor=self.forgetting_factor,
-                                  weighting_function=self.weighting_function,
-                                  return_all_coeffs=self.return_all_coefs,
-                                  min_y_to_update=self.min_y_to_update)
+        coeffs, all_coeffs, errors = _rls(
+            x=x,
+            y=y,
+            priors=coeffs_0,
+            xxt_inv_seed=xxt_inv_0,
+            forgetting_factor=self.forgetting_factor,
+            weighting_function=self.weighting_function,
+            return_all_coeffs=self.return_all_coefs,
+            min_y_to_update=self.min_y_to_update,
+        )
         if self.return_all_coefs:
             self.all_coef_.append(all_coeffs)
         self.final_coef_.append(coeffs)
         self.errors = errors
 
-    def fit_stacked(self,
-                    x: np.ndarray,
-                    y: np.ndarray,
-                    priors: Sequence[RLSPriorBase],
-                    indexors: Optional[Union[Sequence[slice], Sequence[np.ndarray]]] = None,
-                    in_sample_metrics: bool = False,
-                    out_sample_metrics: bool = False) -> None:
+    def fit_stacked(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        priors: Sequence[RLSPriorBase],
+        indexors: Sequence[slice] | Sequence[np.ndarray] | None = None,
+        in_sample_metrics: bool = False,
+        out_sample_metrics: bool = False,
+    ) -> None:
         # TODO: Add support for `in_sample_metrics` and `out_sample_metrics`
 
         assert x.ndim == 2
@@ -101,7 +115,9 @@ class RecursiveLeastSquaresRegression:
             y_i = np.ascontiguousarray(y[indexor])
             self.fit(x=x_i, y=y_i, priors=priors)
 
-    def predict(self, x, indexors: Optional[Union[Sequence[slice], Sequence[np.ndarray]]] = None):
+    def predict(
+        self, x, indexors: Sequence[slice] | Sequence[np.ndarray] | None = None
+    ):
         if indexors is None:
             indexors = [slice(None, None, None)]
 
@@ -131,11 +147,20 @@ class RecursiveLeastSquaresRegression:
                 # if (priors_no_constant!=0).sum() == 0: # si es todo cero
                 #     coefficients.append(1)
                 # else:
-                coefficients.append(prior.coefficient_value(x=x_no_constants, y=y, priors_coeffs=priors_no_constant))
+                coefficients.append(
+                    prior.coefficient_value(
+                        x=x_no_constants, y=y, priors_coeffs=priors_no_constant
+                    )
+                )
 
         return np.ascontiguousarray(np.array(coefficients)[::-1])
 
-    def _xxt_inv_seeds(self, y: np.ndarray, priors: Sequence[RLSPriorBase], coefficient_seeds: np.ndarray) -> np.ndarray:
+    def _xxt_inv_seeds(
+        self,
+        y: np.ndarray,
+        priors: Sequence[RLSPriorBase],
+        coefficient_seeds: np.ndarray,
+    ) -> np.ndarray:
         """
 
         Returns
@@ -157,16 +182,26 @@ class RecursiveLeastSquaresRegression:
 
 
 class RLSConvergenceError(Exception):
-    def __init__(self, message="RLS Solver found an convergence error. Try increasing Forgetting Factor."):
-        super(RLSConvergenceError, self).__init__(message)
+    def __init__(
+        self,
+        message="RLS Solver found an convergence error. Try increasing Forgetting Factor.",
+    ):
+        super().__init__(message)
         self.message = message
 
 
 @jit(nopython=True, cache=True)
-def _rls(x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv_seed: np.ndarray, forgetting_factor: float = 1,
-         weighting_function: Optional[Callable[[float], float]] = None, return_all_coeffs: bool = False,
-         min_y_to_update: float = 1e-2) -> Tuple[np.ndarray, np.ndarray, List[float]]:
-    """ Weighted Recursive Least Squares
+def _rls(
+    x: np.ndarray,
+    y: np.ndarray,
+    priors: np.ndarray,
+    xxt_inv_seed: np.ndarray,
+    forgetting_factor: float = 1,
+    weighting_function: Callable[[float], float] | None = None,
+    return_all_coeffs: bool = False,
+    min_y_to_update: float = 1e-2,
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
+    """Weighted Recursive Least Squares
 
     Parameters
     ----------
@@ -213,10 +248,12 @@ def _rls(x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv_seed: np.ndar
     assert len(priors) == num_vars
     assert xxt_inv_seed.shape == (num_vars, num_vars)
 
-    assert 0. < forgetting_factor <= 1.
-    assert min_y_to_update > 0.
+    assert 0.0 < forgetting_factor <= 1.0
+    assert min_y_to_update > 0.0
 
-    B = np.copy(xxt_inv_seed)  # We will refer to xxt_inv_seed as B in later steps to make code more readable:
+    B = np.copy(
+        xxt_inv_seed
+    )  # We will refer to xxt_inv_seed as B in later steps to make code more readable:
     coeffs = np.copy(priors)
 
     all_coeffs = np.zeros_like(x, dtype=np.float64)
@@ -236,21 +273,27 @@ def _rls(x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv_seed: np.ndar
                 xtwB = (weighting_function(y_i) * x_i) @ B
 
             Bx = B @ x_i
-            _numba_outer(Bx, xtwB, BxxtwB)  # Re-implement numpy.outer as inplace operation.
+            _numba_outer(
+                Bx, xtwB, BxxtwB
+            )  # Re-implement numpy.outer as inplace operation.
             xtwBx: float = xtwB @ x_i
             alpha = 1 / (forgetting_factor + xtwBx)
 
             if math.isnan(alpha):
                 _N = 10000
-                print("forgetting_factor of ~"
-                      + str(int(_N*forgetting_factor)) + "/" + str(_N)
-                      + " is to small. Please increase forgetting_factor.")
+                print(
+                    "forgetting_factor of ~"
+                    + str(int(_N * forgetting_factor))
+                    + "/"
+                    + str(_N)
+                    + " is to small. Please increase forgetting_factor."
+                )
                 # We need to print here instead of including the error message in the RLSConvergenceError error as
                 # Numba requires all error message to be compile time constants. See
                 # http://numba.pydata.org/numba-doc/dev/reference/pysupported.html
                 raise RLSConvergenceError()
 
-            B -= (alpha * BxxtwB)
+            B -= alpha * BxxtwB
             B /= forgetting_factor
             oos_error.append(y_i - z_i)
             coeffs += (alpha * (y_i - z_i)) * xtwB
@@ -258,7 +301,8 @@ def _rls(x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv_seed: np.ndar
         if return_all_coeffs:
             # The following for loop is equivalent to
             # #all_coeffs[i, :] = coeffs
-            for j in range(num_vars): all_coeffs[i, j] = coeffs[j]
+            for j in range(num_vars):
+                all_coeffs[i, j] = coeffs[j]
 
     return coeffs, all_coeffs, oos_error
 
@@ -296,7 +340,7 @@ def _rls_predict(coeffs: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 @jit(nopython=True, cache=True)
 def _numba_outer(x1: np.ndarray, x2: np.ndarray, out: np.ndarray) -> None:
-    """ Re-implements np.outer as an inplace operation at ~10x the speed of np.outer.
+    """Re-implements np.outer as an inplace operation at ~10x the speed of np.outer.
 
     See np.outer for more details.
     """
@@ -312,8 +356,12 @@ def _numba_outer(x1: np.ndarray, x2: np.ndarray, out: np.ndarray) -> None:
 
 
 @jit(nopython=True, cache=True)
-def _rls_out_of_sample_forecasts(x: np.ndarray, all_coeffs: np.ndarray, ignore_first_n: Optional[int] = None,
-                                 forecast_horizon: int = 12) -> List[np.ndarray]:
+def _rls_out_of_sample_forecasts(
+    x: np.ndarray,
+    all_coeffs: np.ndarray,
+    ignore_first_n: int | None = None,
+    forecast_horizon: int = 12,
+) -> list[np.ndarray]:
     """
     Parameters
     ----------
@@ -373,7 +421,9 @@ def _rls_out_of_sample_forecasts(x: np.ndarray, all_coeffs: np.ndarray, ignore_f
 
         if coeff_index >= ignore_first_n:
             index_coeffs = all_coeffs[coeff_index, :]
-            for horizon_index in range(coeff_index, min(num_obs, coeff_index + forecast_horizon)):
+            for horizon_index in range(
+                coeff_index, min(num_obs, coeff_index + forecast_horizon)
+            ):
                 x_i = x[horizon_index, :]
                 index_forecasts.append(_rls_predict(coeffs=index_coeffs, x=x_i))
 
@@ -382,8 +432,9 @@ def _rls_out_of_sample_forecasts(x: np.ndarray, all_coeffs: np.ndarray, ignore_f
     return forecasts
 
 
-def _rls_in_sample_forecasts(x: np.ndarray, all_coeffs: np.ndarray,
-                             ignore_first_n: Optional[int] = None) -> List[np.ndarray]:
+def _rls_in_sample_forecasts(
+    x: np.ndarray, all_coeffs: np.ndarray, ignore_first_n: int | None = None
+) -> list[np.ndarray]:
     """
 
     Parameters
@@ -410,7 +461,9 @@ def _rls_in_sample_forecasts(x: np.ndarray, all_coeffs: np.ndarray,
     forecasts = []
     for coeff_index in range(num_obs):
         if coeff_index >= ignore_first_n:
-            forecasts.append(_rls_predict(all_coeffs[coeff_index, :], x[:coeff_index, :]))
+            forecasts.append(
+                _rls_predict(all_coeffs[coeff_index, :], x[:coeff_index, :])
+            )
         else:
             forecasts.append(np.array([]))
     return forecasts
