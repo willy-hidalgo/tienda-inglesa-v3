@@ -250,10 +250,7 @@ def wmape_por_id(
         n_fechas_spine = spine_n_fechas(base_m if base_m.height else base, ids)
     n_fechas_spine = int(n_fechas_spine or 0)
 
-    scored = base_m.filter(
-        pl.col("y").is_not_null()
-        & (pl.col("y") != 0)  & pl.col("yhat").is_finite()  # defiende contra NaN/inf en yhat (parquet stale)
-    )
+    scored = base_m.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
     if scored.height == 0:
         # devolver todos los ids con wmape null/0 y n_points = spine
         return pl.DataFrame(
@@ -460,10 +457,7 @@ def ranking_table(
 def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
     if df.height == 0:
         return 0.0, 0.0, 0
-    scored = df.filter(
-        pl.col("y").is_not_null()
-        & (pl.col("y") != 0)  & pl.col("yhat").is_finite()  # defiende contra NaN/inf en yhat (parquet stale)
-    )
+    scored = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
     if scored.height == 0:
         return 0.0, 0.0, 0
     if "abs_error" not in scored.columns:

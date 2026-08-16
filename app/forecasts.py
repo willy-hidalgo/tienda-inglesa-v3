@@ -2116,6 +2116,18 @@ class RLSForecastPipeline:
         )
         logger.info("✓ WMAPE guardado en: %s", wmape_path)
         self._export_forecast_excel(res_df)
+        # Artefactos del dashboard (index + metrics + series slim)
+        try:
+            from app.dashboard_artifacts import build_artifacts
+
+            adir = build_artifacts(forecast_path)
+            logger.info("✓ Artefactos dashboard en: %s", adir)
+        except Exception:
+            logger.exception(
+                "No se pudieron construir artefactos del dashboard "
+                "(el dashboard usará path legacy hasta que se ejecute "
+                "`python -m app.dashboard_artifacts`)"
+            )
 
     def _export_forecast_excel(self, res_df: pl.DataFrame) -> None:
         """

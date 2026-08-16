@@ -15,6 +15,7 @@ Uso:
   python -m app.main --n-jobs 4
   uv run app/main.py --n-jobs 8
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,7 +23,7 @@ import logging
 import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logging.basicConfig(
@@ -52,7 +53,7 @@ class MenuOption:
 
 
 class PipelineCLI:
-    _EXIT_KEY = "5"
+    _EXIT_KEY = "6"
 
     def __init__(
         self,
@@ -81,9 +82,7 @@ class PipelineCLI:
         """Pregunta workers; Enter conserva el default."""
         default = self._default_n_jobs
         hint = f" [{default}]" if default else " [secuencial]"
-        raw = input(
-            f"Nº de procesos paralelos para RLS (--n-jobs){hint}: "
-        ).strip()
+        raw = input(f"Nº de procesos paralelos para RLS (--n-jobs){hint}: ").strip()
         if not raw:
             return default
         try:
@@ -118,9 +117,7 @@ class PipelineCLI:
         try:
             result = subprocess.run(cmd, check=False)
         except FileNotFoundError as exc:
-            logger.error(
-                "No se pudo ejecutar el comando (%s): %s", cmd[0], exc
-            )
+            logger.error("No se pudo ejecutar el comando (%s): %s", cmd[0], exc)
             return
 
         if result.returncode == 0:
@@ -137,7 +134,7 @@ class PipelineCLI:
             self._render_menu()
             try:
                 choice = self._prompt_choice()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError, KeyboardInterrupt:
                 print("\nSaliendo...")
                 return
 
@@ -190,6 +187,11 @@ def build_default_options(project_root: Path) -> list[MenuOption]:
         ),
         MenuOption(
             "4",
+            "construir artefactos dashboard (rápido)",
+            [python, str(app / "dashboard_artifacts.py")],
+        ),
+        MenuOption(
+            "5",
             "cargar dashboard",
             [
                 python,
@@ -220,7 +222,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--run",
         type=str,
-        choices=["1", "2", "3", "4", "ingest", "select", "forecast", "dashboard"],
+        choices=[
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "ingest",
+            "select",
+            "forecast",
+            "artifacts",
+            "dashboard",
+        ],
         default=None,
         help="Ejecuta una etapa y sale (sin menú interactivo).",
     )
@@ -244,7 +257,8 @@ _RUN_ALIASES = {
     "ingest": "1",
     "select": "2",
     "forecast": "3",
-    "dashboard": "4",
+    "artifacts": "4",
+    "dashboard": "5",
 }
 
 
