@@ -134,9 +134,18 @@ def _ranking_from_metrics(
         (pl.col("seccion") == seccion) & (pl.col("unidad") == unidad)
     )
     if base.height == 0:
+        # Fallback sin multiplicar unidades: tomar una sola unidad si hay varias
         base = metrics.filter(pl.col("seccion") == seccion)
+        if "unidad" in base.columns and base.height:
+            base = base.unique(subset=["unique_id"], keep="first")
     if base.height == 0:
         return empty
+
+    # Defensa: metrics mal generados no deben duplicar filas del ranking
+    if "unidad" in base.columns:
+        base = base.unique(subset=["unique_id", "unidad"], keep="first")
+    else:
+        base = base.unique(subset=["unique_id"], keep="first")
 
     if "store" not in base.columns or "sku" not in base.columns:
         uids = base["unique_id"].to_list()
@@ -211,7 +220,11 @@ def _ranking_from_metrics(
                 )
                 code_col = "sku"
 
-    tabla = tabla.filter(pl.col("sum_y") > 0).sort("wmape")
+    # Solo filas con rotación y wMAPE > 0 (el usuario no quiere ver wMAPE=0)
+    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0)).sort("wmape")
+    # Una fila por código (defensa extra)
+    if tabla.height and code_col in tabla.columns:
+        tabla = tabla.unique(subset=[code_col], keep="first")
     if tabla.height == 0:
         return empty
 

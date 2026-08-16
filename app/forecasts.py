@@ -101,7 +101,7 @@ def _collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     except TypeError:
         try:
             return lf.collect(streaming=True)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return lf.collect()
 
 
@@ -1497,7 +1497,11 @@ class RLSForecastPipeline:
         end: dt.date,
         template: pl.DataFrame,
     ) -> pl.DataFrame:
-        """Genera filas ds para [start, end] por unique_id (y=0). Grid vía np.repeat/tile."""
+        """Genera filas ds para [start, end] por unique_id (y=0, value=0).
+
+        No incluye asp/edp/discount: se rellenan después con carry-forward
+        desde train/OOS vía `_carry_forward_prices`.
+        """
         n_days = (end - start).days + 1
         n_uid = len(unique_ids)
         if n_days <= 0 or n_uid == 0:
@@ -1531,6 +1535,64 @@ class RLSForecastPipeline:
             pl.lit(1).cast(pl.Int8).alias("intercept"),
             pl.lit(0).cast(pl.UInt32).alias("conteo_sku"),
         )
+
+    @staticmethod
+    def _carry_forward_prices(
+        history: pl.DataFrame, grid: pl.DataFrame
+    ) -> pl.DataFrame:
+        """
+        Propaga el último estado de precio (asp / edp / discount) por unique_id
+        al grid de forecast-only.
+
+        Sin esto el RLS recibe precio=0 en el tramo sin actuals y el nivel de
+        yhat se infla (elasticidad a precio → demanda artificialmente alta).
+
+        Regla: último día con y>0 de cada serie; si no hay ventas, último día
+        con asp/edp no nulo; si tampoco, 0.
+        """
+        price_cols = [c for c in ("asp", "edp", "discount") if c in history.columns]
+        if grid.height == 0:
+            return grid
+        if not price_cols or history.height == 0:
+            return grid.with_columns(
+                [pl.lit(0.0).alias(c) for c in ("asp", "edp", "discount")]
+            )
+
+        cols = ["unique_id", "ds"] + price_cols
+        if "y" in history.columns:
+            cols.append("y")
+        hist = history.select([c for c in cols if c in history.columns])
+
+        if "y" in hist.columns:
+            with_sales = hist.filter(pl.col("y") > 0)
+            base = with_sales if with_sales.height else hist
+        else:
+            base = hist
+
+        # Preferir filas con algún precio observado > 0
+        priced = base.filter(
+            pl.any_horizontal(
+                [
+                    (pl.col(c).is_not_null() & (pl.col(c) > 0))
+                    for c in price_cols
+                ]
+            )
+        )
+        if priced.height:
+            base = priced
+
+        last = (
+            base.sort("ds")
+            .group_by("unique_id")
+            .agg([pl.col(c).last().alias(c) for c in price_cols])
+        )
+        out = grid.join(last, on="unique_id", how="left")
+        out = out.with_columns([pl.col(c).fill_null(0.0) for c in price_cols])
+        # Columnas de precio que no estaban en history (defensa)
+        for c in ("asp", "edp", "discount"):
+            if c not in out.columns:
+                out = out.with_columns(pl.lit(0.0).alias(c))
+        return out
 
     @staticmethod
     def _calculate_edp_per_series(df: pl.DataFrame) -> pl.DataFrame:
@@ -1784,7 +1846,7 @@ class RLSForecastPipeline:
                 ).sort("ds")
             logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
 
-        # ── Forecast-only (calendario sintético) ───────────────────────────────
+        # ── Forecast-only (calendario sintético + carry-forward de precios) ───
         uids = df_train["unique_id"].unique().to_list()
         fcst_start = hz["forecast_start"]
         fcst_end = hz["forecast_end"]
@@ -1799,6 +1861,29 @@ class RLSForecastPipeline:
                 uids, fcst_start, fcst_end, df_train
             )
             if df_fcst_raw.height:
+                # Historial de precios: train + OOS (si hay). Sin esto asp/edp/
+                # discount quedan en 0 y el RLS infla el nivel de yhat.
+                price_history = df_train
+                if df_oos.height:
+                    price_history = pl.concat(
+                        [df_train, df_oos], how="diagonal_relaxed"
+                    )
+                df_fcst_raw = self._carry_forward_prices(price_history, df_fcst_raw)
+                n_with_price = (
+                    int(
+                        df_fcst_raw.filter(
+                            (pl.col("edp") > 0) | (pl.col("asp") > 0)
+                        )["unique_id"].n_unique()
+                    )
+                    if "edp" in df_fcst_raw.columns
+                    else 0
+                )
+                logger.info(
+                    "Sección %s: carry-forward precios → %d/%d series con edp/asp>0",
+                    seccion,
+                    n_with_price,
+                    len(uids),
+                )
                 df_fcst = self._feature_builder.extract_drivers(
                     df_fcst_raw.with_columns(pl.lit(1).alias("intercept")),
                     req_columns=driver_cols,

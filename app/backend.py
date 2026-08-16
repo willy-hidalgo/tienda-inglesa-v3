@@ -412,10 +412,8 @@ def ranking_table(
             code_expr = pl.col("_sku")
             uid_expr = pl.col("unique_id")
 
-    # Mostrar filas con ventas (sum_y>0); wmape==0 se mantiene al final
-    # (antes se filtraba wmape!=0 y desaparecían series con error nulo o
-    # sin ventas que igual interesan para rotación).
-    tabla = tabla.filter(pl.col("sum_y") > 0).sort("wmape")
+    # Solo filas con rotación y wMAPE > 0 (no mostrar wMAPE=0 en ranking).
+    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0)).sort("wmape")
     if tabla.height == 0:
         return empty
 

@@ -438,7 +438,11 @@ def build_artifacts(
     metrics = pl.concat([p for p in metric_parts if p.height], how="diagonal_relaxed")
 
     if metrics.height:
-        parts_df = _parse_uid_parts(metrics["unique_id"].to_list())
+        # unique_id se repite por unidad (Unidades / Valor $). parts_df debe
+        # tener 1 fila por uid; si no, el join multiplica filas → ranking duplicado.
+        parts_df = _parse_uid_parts(
+            metrics["unique_id"].unique().to_list()
+        ).unique(subset=["unique_id"])
         metrics = metrics.drop(
             [c for c in ("store", "sku", "node_kind", "seccion") if c in metrics.columns]
         )
@@ -449,12 +453,8 @@ def build_artifacts(
     series = res_df.select(keep)
 
     pure = _build_pure_sku_series_vectorized(res_df)
+    pure_ids: list[str] = []
     if pure.height:
-        for c in keep:
-            if c not in pure.columns:
-                pure = pure.with_columns(pl.lit(None).alias(c))
-        pure = pure.select([c for c in keep if c in pure.columns])
-        # alinear columnas
         for c in keep:
             if c not in pure.columns:
                 pure = pure.with_columns(pl.lit(None).alias(c))
@@ -494,7 +494,9 @@ def build_artifacts(
                 )
         if pure_metric_parts:
             pure_metrics = pl.concat(pure_metric_parts, how="diagonal_relaxed")
-            pure_parts = _parse_uid_parts(pure_metrics["unique_id"].to_list())
+            pure_parts = _parse_uid_parts(
+                pure_metrics["unique_id"].unique().to_list()
+            ).unique(subset=["unique_id"])
             pure_metrics = pure_metrics.drop(
                 [
                     c
@@ -522,6 +524,12 @@ def build_artifacts(
                 desc_map[uid] = hit or settings.ranking_description(
                     uid, hit or None, None
                 )
+
+    # Seguridad: una fila por (unique_id, unidad)
+    if metrics.height and "unidad" in metrics.columns:
+        metrics = metrics.unique(subset=["unique_id", "unidad"], keep="first")
+    elif metrics.height:
+        metrics = metrics.unique(subset=["unique_id"], keep="first")
 
     # ── index + labels ────────────────────────────────────────────────────
     index = _build_index(res_df, all_ids, metrics, fpath, label_map, desc_map)
