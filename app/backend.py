@@ -2,6 +2,7 @@
 Backend de cálculos (sin Streamlit / sin Plotly).
 El dashboard solo visualiza lo que prepara dashboard_data.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -185,9 +186,7 @@ def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
     meta = df.select(cols).unique(subset=["unique_id"])
     uids = meta["unique_id"].to_list()
     descs = (
-        meta["sku_desc"].to_list()
-        if "sku_desc" in meta.columns
-        else [""] * len(uids)
+        meta["sku_desc"].to_list() if "sku_desc" in meta.columns else [""] * len(uids)
     )
     snames = (
         meta["store_name"].to_list()
@@ -211,24 +210,31 @@ def spine_n_fechas(df: pl.DataFrame, unique_ids: list[str] | None = None) -> int
     """Nº de fechas distintas del panel (spine denso)."""
     if df.height == 0 or "ds" not in df.columns:
         return 0
-    sub = df
     if unique_ids:
-        sub = df.filter(pl.col("unique_id").is_in(unique_ids))
+        # Semi-join más barato que is_in sobre listas enormes en algunos casos
+        ids_df = pl.DataFrame({"unique_id": unique_ids})
+        sub = df.join(ids_df, on="unique_id", how="semi")
         if sub.height == 0:
             sub = df
-    return int(sub["ds"].n_unique())
+    else:
+        sub = df
+    return int(sub.select(pl.col("ds").n_unique()).item())
 
 
 def wmape_por_id(
-    ids: list[str],
+    ids: list[str] | None,
     df: pl.DataFrame,
     *,
     n_fechas_spine: int | None = None,
+    fill_missing: bool = True,
 ) -> pl.DataFrame:
     """
     WMAPE = Σ|y−ŷ|/Σ|y| (excluye y==0 y forecast_only del cálculo).
     n_points = longitud del spine (igual para todos si el panel está denso).
     n_with_sales = conteo y≠0 (informativo).
+
+    Optimizado: un solo group_by, anti-join para ids sin ventas (sin loops Python).
+    Si `ids is None`, agrega todos los unique_id presentes en df.
     """
     schema = {
         "unique_id": pl.Utf8,
@@ -237,61 +243,102 @@ def wmape_por_id(
         "n_points": pl.UInt32,
         "n_with_sales": pl.UInt32,
     }
-    if not ids:
+    if df.height == 0:
+        return pl.DataFrame(schema=schema)
+    if ids is not None and len(ids) == 0:
         return pl.DataFrame(schema=schema)
 
-    base = df.filter(pl.col("unique_id").is_in(ids))
+    # Filtrar panel una sola vez
+    if ids is not None:
+        ids_df = pl.DataFrame({"unique_id": ids}).unique()
+        base = df.join(ids_df, on="unique_id", how="semi")
+    else:
+        ids_df = None
+        base = df
+
+    if base.height == 0:
+        if fill_missing and ids is not None:
+            n = len(ids)
+            return pl.DataFrame(
+                {
+                    "unique_id": ids,
+                    "wmape": [0.0] * n,
+                    "sum_y": [0.0] * n,
+                    "n_points": [int(n_fechas_spine or 0)] * n,
+                    "n_with_sales": [0] * n,
+                }
+            )
+        return pl.DataFrame(schema=schema)
+
     if "period_type" in base.columns:
         base_m = base.filter(pl.col("period_type") != "forecast_only")
     else:
         base_m = base
 
     if n_fechas_spine is None:
-        n_fechas_spine = spine_n_fechas(base_m if base_m.height else base, ids)
+        n_fechas_spine = (
+            int(base_m.select(pl.col("ds").n_unique()).item())
+            if base_m.height and "ds" in base_m.columns
+            else 0
+        )
     n_fechas_spine = int(n_fechas_spine or 0)
+    n_spine_lit = pl.lit(n_fechas_spine).cast(pl.UInt32)
 
-    scored = base_m.filter(
-        pl.col("y").is_not_null()
-        & (pl.col("y") != 0)  & pl.col("yhat").is_finite()  # defiende contra NaN/inf en yhat (parquet stale)
-    )
+    # Solo filas con venta: un group_by
+    scored = base_m.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
     if scored.height == 0:
-        # devolver todos los ids con wmape null/0 y n_points = spine
-        return pl.DataFrame(
-            {
-                "unique_id": ids,
-                "wmape": [0.0] * len(ids),
-                "sum_y": [0.0] * len(ids),
-                "n_points": [n_fechas_spine] * len(ids),
-                "n_with_sales": [0] * len(ids),
-            }
-        ).filter(pl.col("unique_id").is_in(ids))
+        agg = pl.DataFrame(schema=schema)
+    else:
+        agg = (
+            scored.group_by("unique_id")
+            .agg(
+                pl.col("y").sum().alias("sum_y"),
+                (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
+                pl.len().alias("n_with_sales"),
+            )
+            .with_columns(
+                pl.when(pl.col("sum_y") != 0)
+                .then(pl.col("sum_abs_error") / pl.col("sum_y"))
+                .otherwise(0.0)
+                .alias("wmape"),
+                n_spine_lit.alias("n_points"),
+            )
+            .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
+        )
 
-    agg = (
-        scored.group_by("unique_id")
-        .agg(
-            pl.col("y").sum().alias("sum_y"),
-            (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
-            pl.len().alias("n_with_sales"),
+    if not fill_missing or ids is None:
+        return agg if agg.height else pl.DataFrame(schema=schema)
+
+    # Completar ids sin ventas vía anti-join (sin set() Python)
+    assert ids_df is not None
+    if agg.height == 0:
+        return ids_df.with_columns(
+            pl.lit(0.0).alias("wmape"),
+            pl.lit(0.0).alias("sum_y"),
+            n_spine_lit.alias("n_points"),
+            pl.lit(0).cast(pl.UInt32).alias("n_with_sales"),
         )
-        .filter(pl.col("sum_y") != 0)
-        .with_columns((pl.col("sum_abs_error") / pl.col("sum_y")).alias("wmape"))
-        .with_columns(pl.lit(n_fechas_spine).cast(pl.UInt32).alias("n_points"))
-        .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
+
+    missing = ids_df.join(agg.select("unique_id"), on="unique_id", how="anti")
+    if missing.height == 0:
+        return agg
+    extra = missing.with_columns(
+        pl.lit(0.0).alias("wmape"),
+        pl.lit(0.0).alias("sum_y"),
+        n_spine_lit.alias("n_points"),
+        pl.lit(0).cast(pl.UInt32).alias("n_with_sales"),
     )
-    # ids sin ventas: aún así n_points = spine
-    missing = [i for i in ids if i not in set(agg["unique_id"].to_list())]
-    if missing:
-        extra = pl.DataFrame(
-            {
-                "unique_id": missing,
-                "wmape": [0.0] * len(missing),
-                "sum_y": [0.0] * len(missing),
-                "n_points": [n_fechas_spine] * len(missing),
-                "n_with_sales": [0] * len(missing),
-            }
-        )
-        agg = pl.concat([agg, extra], how="diagonal_relaxed")
-    return agg
+    return pl.concat([agg, extra], how="diagonal_relaxed")
+
+
+def wmape_all_ids(
+    df: pl.DataFrame,
+    *,
+    n_fechas_spine: int | None = None,
+) -> pl.DataFrame:
+    """WMAPE de todos los unique_id del panel (un solo group_by, sin lista de ids)."""
+    return wmape_por_id(None, df, n_fechas_spine=n_fechas_spine, fill_missing=False)
+
 
 def ranking_table(
     tabla_base: pl.DataFrame,
@@ -353,74 +400,88 @@ def ranking_table(
         .alias("_sku"),
     ).filter(pl.col("_sec") == seccion)
 
+    enriched = enriched.with_columns(
+        pl.col("_store").cast(pl.Utf8),
+        pl.col("_sku").cast(pl.Utf8),
+    )
+
     if axis == "store":
-        if fixed_peer is not None:
-            # Hojas tienda+sku del SKU fijo
-            tabla = enriched.filter(
-                (pl.col("_sku") == fixed_peer) & pl.col("_store").is_not_null()
-            )
-            if exclude is not None:
-                tabla = tabla.filter(pl.col("_store") != exclude)
-            code_expr = pl.col("_store")
-            uid_expr = pl.col("unique_id")
-        else:
-            # Nodos tienda puros (depth 1, sin SKU)
-            tabla = enriched.filter(
-                pl.col("_store").is_not_null() & pl.col("_sku").is_null()
-            )
-            if exclude is not None:
-                tabla = tabla.filter(pl.col("_store") != exclude)
-            code_expr = pl.col("_store")
-            uid_expr = pl.col("unique_id")
+        # Siempre y solo nodos tienda puros (store presente, sku ausente).
+        tabla = enriched.filter(
+            pl.col("_store").is_not_null() & pl.col("_sku").is_null()
+        )
+        if exclude is not None:
+            tabla = tabla.filter(pl.col("_store") != str(exclude))
+        code_expr = pl.col("_store")
+        uid_expr = pl.col("unique_id")
+        code_col = "_store"
     else:  # axis == "sku"
         if fixed_peer is not None:
-            # Hojas tienda+sku de la tienda fija
+            # Tienda seleccionada → SOLO hojas sku+tienda de ESA tienda
+            peer = str(fixed_peer)
             tabla = enriched.filter(
-                (pl.col("_store") == fixed_peer) & pl.col("_sku").is_not_null()
+                (pl.col("_store") == peer) & pl.col("_sku").is_not_null()
             )
+            if tabla.height == 0:
+                needle = f"||T:{peer}||"
+                tabla = enriched.filter(
+                    pl.col("unique_id").str.contains(needle, literal=True)
+                    & pl.col("_sku").is_not_null()
+                )
             if exclude is not None:
-                tabla = tabla.filter(pl.col("_sku") != exclude)
+                tabla = tabla.filter(pl.col("_sku") != str(exclude))
             code_expr = pl.col("_sku")
             uid_expr = pl.col("unique_id")
+            code_col = "_sku"
         else:
-            # Agregar hojas sku+tienda → ranking por SKU (no hay nodos SKU puro)
-            leaves = enriched.filter(
-                pl.col("_store").is_not_null() & pl.col("_sku").is_not_null()
+            pure = enriched.filter(
+                pl.col("_sku").is_not_null() & pl.col("_store").is_null()
             )
             if exclude is not None:
-                leaves = leaves.filter(pl.col("_sku") != exclude)
-            if leaves.height == 0:
-                return empty
-            # WMAPE agregado ≈ Σ(wmape_i * sum_y_i) / Σ sum_y_i
-            tabla = (
-                leaves.group_by("_sku")
-                .agg(
-                    (pl.col("wmape") * pl.col("sum_y")).sum().alias("_sum_abs"),
-                    pl.col("sum_y").sum().alias("sum_y"),
-                    pl.col("n_with_sales").sum().alias("n_with_sales"),
-                    pl.col("n_points").first().alias("n_points"),
+                pure = pure.filter(pl.col("_sku") != str(exclude))
+            if pure.height > 0:
+                tabla = pure
+                code_expr = pl.col("_sku")
+                uid_expr = pl.col("unique_id")
+                code_col = "_sku"
+            else:
+                leaves = enriched.filter(
+                    pl.col("_store").is_not_null() & pl.col("_sku").is_not_null()
                 )
-                .with_columns(
-                    pl.when(pl.col("sum_y") != 0)
-                    .then(pl.col("_sum_abs") / pl.col("sum_y"))
-                    .otherwise(0.0)
-                    .alias("wmape"),
-                    # unique_id virtual de SKU puro (para click → filtro SKU)
-                    pl.concat_str(
-                        [pl.lit(seccion), pl.lit("||S:"), pl.col("_sku")]
-                    ).alias("unique_id"),
+                if exclude is not None:
+                    leaves = leaves.filter(pl.col("_sku") != str(exclude))
+                if leaves.height == 0:
+                    return empty
+                tabla = (
+                    leaves.group_by("_sku")
+                    .agg(
+                        (pl.col("wmape") * pl.col("sum_y")).sum().alias("_sum_abs"),
+                        pl.col("sum_y").sum().alias("sum_y"),
+                        pl.col("n_with_sales").sum().alias("n_with_sales"),
+                        pl.col("n_points").first().alias("n_points"),
+                    )
+                    .with_columns(
+                        pl.when(pl.col("sum_y") != 0)
+                        .then(pl.col("_sum_abs") / pl.col("sum_y"))
+                        .otherwise(0.0)
+                        .alias("wmape"),
+                        pl.concat_str(
+                            [pl.lit(seccion), pl.lit("||S:"), pl.col("_sku")]
+                        ).alias("unique_id"),
+                    )
+                    .drop("_sum_abs")
                 )
-                .drop("_sum_abs")
-            )
-            code_expr = pl.col("_sku")
-            uid_expr = pl.col("unique_id")
+                code_expr = pl.col("_sku")
+                uid_expr = pl.col("unique_id")
+                code_col = "_sku"
 
-    # Mostrar filas con ventas (sum_y>0); wmape==0 se mantiene al final
-    # (antes se filtraba wmape!=0 y desaparecían series con error nulo o
-    # sin ventas que igual interesan para rotación).
-    tabla = tabla.filter(pl.col("sum_y") > 0).sort("wmape")
+    # Solo filas con rotación y wMAPE > 0; orden ascendente por wMAPE
+    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
     if tabla.height == 0:
         return empty
+    tabla = tabla.sort("wmape", descending=False).unique(
+        subset=[code_col], keep="first", maintain_order=True
+    )
 
     codes = tabla.select(code_expr.alias("Código"))["Código"].to_list()
     uids2 = tabla.select(uid_expr.alias("unique_id"))["unique_id"].to_list()
@@ -430,13 +491,10 @@ def ranking_table(
         (float(nw) / float(np_) * 100) if np_ else 0.0
         for nw, np_ in zip(n_with_sales, n_points)
     ]
-    # Descripción: preferir la del unique_id; si es SKU virtual, buscar
-    # cualquier hoja con ese SKU en desc_map.
     descriptions: list[str] = []
     for u, code in zip(uids2, codes):
         d = desc_map.get(u, "")
-        if not d and axis == "sku" and fixed_peer is None:
-            # Buscar primera hoja que contenga este SKU
+        if not d and axis == "sku":
             prefix_hit = next(
                 (desc_map[k] for k in desc_map if f"||S:{code}" in k and desc_map[k]),
                 "",
@@ -460,10 +518,7 @@ def ranking_table(
 def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
     if df.height == 0:
         return 0.0, 0.0, 0
-    scored = df.filter(
-        pl.col("y").is_not_null()
-        & (pl.col("y") != 0)  & pl.col("yhat").is_finite()  # defiende contra NaN/inf en yhat (parquet stale)
-    )
+    scored = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
     if scored.height == 0:
         return 0.0, 0.0, 0
     if "abs_error" not in scored.columns:
@@ -523,7 +578,9 @@ def resolve_horizons(
     if isinstance(first_d, dt.datetime):
         first_d = first_d.date()
     hz = settings.section_horizons(seccion, first_d)
-    train_end = meta_date_from_df(df_daily, "train_end", hz["train_end"], available_cols)
+    train_end = meta_date_from_df(
+        df_daily, "train_end", hz["train_end"], available_cols
+    )
     test_start = meta_date_from_df(
         df_daily, "test_start", hz["test_start"], available_cols
     )
@@ -534,9 +591,7 @@ def resolve_horizons(
         hz.get("forecast_start", hz["test_end"] + dt.timedelta(days=1)),
         available_cols,
     )
-    if fcst_start is None or (
-        isinstance(test_end, dt.date) and fcst_start <= test_end
-    ):
+    if fcst_start is None or (isinstance(test_end, dt.date) and fcst_start <= test_end):
         fcst_start = test_end + dt.timedelta(days=1) if test_end else fcst_start
     fcst_end = meta_date_from_df(
         df_daily, "forecast_end", hz["forecast_end"], available_cols
@@ -582,6 +637,7 @@ def build_chart_series(
     hist, fcst = split_hist_forecast(
         df_view, test_end, forecast_start, forecast_end, has_period
     )
+
     def _col(df, name):
         if name in df.columns and df.height:
             return df[name].to_list()
@@ -603,9 +659,7 @@ def build_chart_series(
 def detail_view(df: pl.DataFrame) -> pl.DataFrame:
     cols = [c for c in DETAIL_COLUMNS if c in df.columns]
     if "abs_error" not in cols and "y" in df.columns and "yhat" in df.columns:
-        df = df.with_columns(
-            (pl.col("y") - pl.col("yhat")).abs().alias("abs_error")
-        )
+        df = df.with_columns((pl.col("y") - pl.col("yhat")).abs().alias("abs_error"))
         cols = [c for c in DETAIL_COLUMNS if c in df.columns]
     return df.select(cols)
 
@@ -621,7 +675,6 @@ def ds_range(df: pl.DataFrame) -> tuple[dt.date | None, dt.date | None]:
     return mn, mx
 
 
-
 def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
     """
     Formatea columnas numéricas para la UI:
@@ -633,8 +686,15 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
     num_cols = [
         c
         for c in (
-            "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
-            "driver_effect", "driver_effect_value", "abs_error",
+            "y",
+            "yhat",
+            "yhat28",
+            "value",
+            "valuehat",
+            "valuehat28",
+            "driver_effect",
+            "driver_effect_value",
+            "abs_error",
         )
         if c in df.columns
     ]
@@ -648,14 +708,11 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
             if v != v:  # NaN
                 return ""
             return f"{round(float(v)):,}"
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return ""
 
     exprs = [
-        pl.col(c)
-        .map_elements(_fmt, return_dtype=pl.Utf8)
-        .alias(c)
-        for c in num_cols
+        pl.col(c).map_elements(_fmt, return_dtype=pl.Utf8).alias(c) for c in num_cols
     ]
     return df.with_columns(exprs)
 
@@ -665,9 +722,7 @@ def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:
     if df_view.height == 0 or "yhat28" not in df_view.columns:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
     scored = df_view.filter(
-        pl.col("y").is_not_null()
-        & (pl.col("y") != 0)
-        & pl.col("yhat28").is_not_null()
+        pl.col("y").is_not_null() & (pl.col("y") != 0) & pl.col("yhat28").is_not_null()
     )
     if scored.height == 0:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}

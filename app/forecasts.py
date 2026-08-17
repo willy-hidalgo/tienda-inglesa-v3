@@ -101,7 +101,7 @@ def _collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     except TypeError:
         try:
             return lf.collect(streaming=True)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return lf.collect()
 
 
@@ -958,57 +958,67 @@ class RLSForecastRunner:
         uid: np.ndarray,
         is_train: np.ndarray,
     ) -> dict[str, str]:
-        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}."""
+        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}.
+
+        Vectorizado con reduceat sobre grupos contiguos de uid (sin loop
+        Python por punto; solo un paso por serie).
+        """
         selection: dict[str, str] = {}
-        # Agrupar índices por uid (solo filas train con y != 0)
         mask = is_train & np.isfinite(y) & (y != 0)
         if not np.any(mask):
             for u in np.unique(uid):
                 selection[str(u)] = "seccion"
             return selection
 
-        # Ordenar por uid para barrido lineal
-        order = np.argsort(uid, kind="mergesort")
-        uid_s = uid[order]
-        y_s = y[order]
-        ys_s = yhat_sec[order]
-        yt_s = yhat_sto[order]
-        m_s = mask[order]
+        # Solo filas train con venta; ordenar por uid
+        idx = np.flatnonzero(mask)
+        uid_m = np.asarray(uid)[idx]
+        order = np.argsort(uid_m, kind="mergesort")
+        uid_s = uid_m[order]
+        y_s = np.asarray(y, dtype=np.float64)[idx][order]
+        ys_s = np.asarray(yhat_sec, dtype=np.float64)[idx][order]
+        yt_s = np.asarray(yhat_sto, dtype=np.float64)[idx][order]
 
-        n = len(uid_s)
-        i = 0
-        while i < n:
-            j = i + 1
-            while j < n and uid_s[j] == uid_s[i]:
-                j += 1
-            m = m_s[i:j]
-            if not np.any(m):
-                selection[str(uid_s[i])] = "seccion"
-                i = j
+        # Bordes de grupo
+        change = np.empty(len(uid_s), dtype=bool)
+        change[0] = True
+        change[1:] = uid_s[1:] != uid_s[:-1]
+        starts = np.flatnonzero(change)
+        # reduceat acumula por grupo
+        sum_abs_y = np.add.reduceat(np.abs(y_s), starts)
+        err_sec = np.add.reduceat(np.abs(y_s - ys_s), starts)
+        err_sto = np.add.reduceat(np.abs(y_s - yt_s), starts)
+        sum_y = np.add.reduceat(y_s, starts)
+        bias_sec = np.add.reduceat(ys_s - y_s, starts)
+        bias_sto = np.add.reduceat(yt_s - y_s, starts)
+
+        uids_grp = uid_s[starts]
+        for k, u in enumerate(uids_grp):
+            denom = float(sum_abs_y[k])
+            if denom == 0.0:
+                selection[str(u)] = "seccion"
                 continue
-            yy = y_s[i:j][m]
-            denom = float(np.abs(yy).sum())
-            if denom == 0:
-                selection[str(uid_s[i])] = "seccion"
-                i = j
-                continue
-            err_sec = float(np.abs(yy - ys_s[i:j][m]).sum())
-            err_sto = float(np.abs(yy - yt_s[i:j][m]).sum())
-            if err_sto < err_sec:
-                selection[str(uid_s[i])] = "tienda"
-            elif err_sto > err_sec:
-                selection[str(uid_s[i])] = "seccion"
+            es, et = float(err_sec[k]), float(err_sto[k])
+            if et < es:
+                selection[str(u)] = "tienda"
+            elif et > es:
+                selection[str(u)] = "seccion"
             else:
-                sum_y = float(yy.sum())
-                if sum_y == 0:
-                    selection[str(uid_s[i])] = "seccion"
+                sy = float(sum_y[k])
+                if sy == 0.0:
+                    selection[str(u)] = "seccion"
                 else:
-                    bias_sec = float((ys_s[i:j][m] - yy).sum()) / sum_y
-                    bias_sto = float((yt_s[i:j][m] - yy).sum()) / sum_y
-                    selection[str(uid_s[i])] = (
-                        "tienda" if abs(bias_sto) <= abs(bias_sec) else "seccion"
+                    selection[str(u)] = (
+                        "tienda"
+                        if abs(float(bias_sto[k]) / sy) <= abs(float(bias_sec[k]) / sy)
+                        else "seccion"
                     )
-            i = j
+
+        # Series sin puntos train con venta → sección por defecto
+        for u in np.unique(uid):
+            su = str(u)
+            if su not in selection:
+                selection[su] = "seccion"
         return selection
 
     def derive_sku_store_forecasts(
@@ -1497,7 +1507,11 @@ class RLSForecastPipeline:
         end: dt.date,
         template: pl.DataFrame,
     ) -> pl.DataFrame:
-        """Genera filas ds para [start, end] por unique_id (y=0). Grid vía np.repeat/tile."""
+        """Genera filas ds para [start, end] por unique_id (y=0, value=0).
+
+        No incluye asp/edp/discount: se rellenan después con carry-forward
+        desde train/OOS vía `_carry_forward_prices`.
+        """
         n_days = (end - start).days + 1
         n_uid = len(unique_ids)
         if n_days <= 0 or n_uid == 0:
@@ -1531,6 +1545,64 @@ class RLSForecastPipeline:
             pl.lit(1).cast(pl.Int8).alias("intercept"),
             pl.lit(0).cast(pl.UInt32).alias("conteo_sku"),
         )
+
+    @staticmethod
+    def _carry_forward_prices(
+        history: pl.DataFrame, grid: pl.DataFrame
+    ) -> pl.DataFrame:
+        """
+        Propaga el último estado de precio (asp / edp / discount) por unique_id
+        al grid de forecast-only.
+
+        Sin esto el RLS recibe precio=0 en el tramo sin actuals y el nivel de
+        yhat se infla (elasticidad a precio → demanda artificialmente alta).
+
+        Regla: último día con y>0 de cada serie; si no hay ventas, último día
+        con asp/edp no nulo; si tampoco, 0.
+        """
+        price_cols = [c for c in ("asp", "edp", "discount") if c in history.columns]
+        if grid.height == 0:
+            return grid
+        if not price_cols or history.height == 0:
+            return grid.with_columns(
+                [pl.lit(0.0).alias(c) for c in ("asp", "edp", "discount")]
+            )
+
+        cols = ["unique_id", "ds"] + price_cols
+        if "y" in history.columns:
+            cols.append("y")
+        hist = history.select([c for c in cols if c in history.columns])
+
+        if "y" in hist.columns:
+            with_sales = hist.filter(pl.col("y") > 0)
+            base = with_sales if with_sales.height else hist
+        else:
+            base = hist
+
+        # Preferir filas con algún precio observado > 0
+        priced = base.filter(
+            pl.any_horizontal(
+                [
+                    (pl.col(c).is_not_null() & (pl.col(c) > 0))
+                    for c in price_cols
+                ]
+            )
+        )
+        if priced.height:
+            base = priced
+
+        last = (
+            base.sort("ds")
+            .group_by("unique_id")
+            .agg([pl.col(c).last().alias(c) for c in price_cols])
+        )
+        out = grid.join(last, on="unique_id", how="left")
+        out = out.with_columns([pl.col(c).fill_null(0.0) for c in price_cols])
+        # Columnas de precio que no estaban en history (defensa)
+        for c in ("asp", "edp", "discount"):
+            if c not in out.columns:
+                out = out.with_columns(pl.lit(0.0).alias(c))
+        return out
 
     @staticmethod
     def _calculate_edp_per_series(df: pl.DataFrame) -> pl.DataFrame:
@@ -1784,7 +1856,7 @@ class RLSForecastPipeline:
                 ).sort("ds")
             logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
 
-        # ── Forecast-only (calendario sintético) ───────────────────────────────
+        # ── Forecast-only (calendario sintético + carry-forward de precios) ───
         uids = df_train["unique_id"].unique().to_list()
         fcst_start = hz["forecast_start"]
         fcst_end = hz["forecast_end"]
@@ -1799,6 +1871,29 @@ class RLSForecastPipeline:
                 uids, fcst_start, fcst_end, df_train
             )
             if df_fcst_raw.height:
+                # Historial de precios: train + OOS (si hay). Sin esto asp/edp/
+                # discount quedan en 0 y el RLS infla el nivel de yhat.
+                price_history = df_train
+                if df_oos.height:
+                    price_history = pl.concat(
+                        [df_train, df_oos], how="diagonal_relaxed"
+                    )
+                df_fcst_raw = self._carry_forward_prices(price_history, df_fcst_raw)
+                n_with_price = (
+                    int(
+                        df_fcst_raw.filter(
+                            (pl.col("edp") > 0) | (pl.col("asp") > 0)
+                        )["unique_id"].n_unique()
+                    )
+                    if "edp" in df_fcst_raw.columns
+                    else 0
+                )
+                logger.info(
+                    "Sección %s: carry-forward precios → %d/%d series con edp/asp>0",
+                    seccion,
+                    n_with_price,
+                    len(uids),
+                )
                 df_fcst = self._feature_builder.extract_drivers(
                     df_fcst_raw.with_columns(pl.lit(1).alias("intercept")),
                     req_columns=driver_cols,
@@ -2116,6 +2211,18 @@ class RLSForecastPipeline:
         )
         logger.info("✓ WMAPE guardado en: %s", wmape_path)
         self._export_forecast_excel(res_df)
+        # Artefactos del dashboard (index + metrics + series slim)
+        try:
+            from app.dashboard_artifacts import build_artifacts
+
+            adir = build_artifacts(forecast_path)
+            logger.info("✓ Artefactos dashboard en: %s", adir)
+        except Exception:
+            logger.exception(
+                "No se pudieron construir artefactos del dashboard "
+                "(el dashboard usará path legacy hasta que se ejecute "
+                "`python -m app.dashboard_artifacts`)"
+            )
 
     def _export_forecast_excel(self, res_df: pl.DataFrame) -> None:
         """

@@ -97,9 +97,11 @@ class MasterCatalogIngestor:
     @staticmethod
     def _normalize_column_names(raw_names: list[str]) -> list[str]:
         return [
-            name.replace(" ", "_")
-            if name != "DESCSUBCATEGORIA"
-            else "DESC_SUBCATEGORIA"
+            (
+                name.replace(" ", "_")
+                if name != "DESCSUBCATEGORIA"
+                else "DESC_SUBCATEGORIA"
+            )
             for name in raw_names
         ]
 
@@ -247,9 +249,8 @@ class SalesIngestor:
                 files,
                 desc="Escaneando ventas",
                 unit="archivo",
-                ncols=50,  # Controla el ancho total
+                ncols=80,  # Controla el ancho total
                 ascii="░█",  # Define los caracteres de llenado (vacío/lleno)
-                bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",  # Estructura del texto
             )
         ]
         sales_df = (
