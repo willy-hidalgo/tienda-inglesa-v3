@@ -10,6 +10,7 @@ Modo rápido (artefactos precalculados):
 Modo legacy (sin artefactos): mantiene prepare_dashboard_state original
 sobre el DataFrame completo (lento; solo fallback).
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -76,7 +77,7 @@ def _parse_date(v: str | None) -> dt.date | None:
         return v.date()
     try:
         return dt.date.fromisoformat(str(v)[:10])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -130,9 +131,7 @@ def _ranking_from_metrics(
             "unique_id": pl.Utf8,
         }
     )
-    base = metrics.filter(
-        (pl.col("seccion") == seccion) & (pl.col("unidad") == unidad)
-    )
+    base = metrics.filter((pl.col("seccion") == seccion) & (pl.col("unidad") == unidad))
     if base.height == 0:
         # Fallback sin multiplicar unidades: tomar una sola unidad si hay varias
         base = metrics.filter(pl.col("seccion") == seccion)
@@ -159,35 +158,51 @@ def _ranking_from_metrics(
             pl.Series("sku", skus),
         )
 
+    # Normalizar códigos a Utf8 para comparaciones estables
+    if "store" in base.columns:
+        base = base.with_columns(pl.col("store").cast(pl.Utf8))
+    if "sku" in base.columns:
+        base = base.with_columns(pl.col("sku").cast(pl.Utf8))
+
     if axis == "store":
-        if fixed_peer is not None:
-            tabla = base.filter(
-                (pl.col("sku") == fixed_peer) & pl.col("store").is_not_null()
-            )
-            if exclude is not None:
-                tabla = tabla.filter(pl.col("store") != exclude)
-            code_col = "store"
-        else:
-            tabla = base.filter(
-                pl.col("store").is_not_null() & pl.col("sku").is_null()
-            )
-            if exclude is not None:
-                tabla = tabla.filter(pl.col("store") != exclude)
-            code_col = "store"
+        # Siempre y solo nodos tienda puros (store presente, sku ausente).
+        tabla = base.filter(pl.col("store").is_not_null() & pl.col("sku").is_null())
+        if exclude is not None:
+            tabla = tabla.filter(pl.col("store") != str(exclude))
+        code_col = "store"
     else:
+        # Ranking SKU
         if fixed_peer is not None:
-            tabla = base.filter(
-                (pl.col("store") == fixed_peer) & pl.col("sku").is_not_null()
-            )
+            # Tienda seleccionada → SOLO hojas sku+tienda de ESA tienda
+            peer = str(fixed_peer)
+            tabla = base.filter((pl.col("store") == peer) & pl.col("sku").is_not_null())
+            if tabla.height == 0:
+                # Fallback por patrón de unique_id (por si store no parseó bien)
+                needle = f"||T:{peer}||"
+                tabla = base.filter(
+                    pl.col("unique_id").str.contains(needle, literal=True)
+                    & (
+                        pl.col("sku").is_not_null()
+                        | pl.col("unique_id").str.contains("||S:", literal=True)
+                    )
+                )
+                if tabla.height and (
+                    "sku" not in tabla.columns
+                    or tabla.filter(pl.col("sku").is_not_null()).height == 0
+                ):
+                    tabla = tabla.with_columns(
+                        pl.col("unique_id")
+                        .str.extract(r"\|\|S:([^|]+)", 1)
+                        .alias("sku")
+                    )
             if exclude is not None:
-                tabla = tabla.filter(pl.col("sku") != exclude)
+                tabla = tabla.filter(pl.col("sku") != str(exclude))
             code_col = "sku"
         else:
-            pure = base.filter(
-                pl.col("sku").is_not_null() & pl.col("store").is_null()
-            )
+            # Sin tienda: preferir nodos SKU puro; si no, agregar hojas
+            pure = base.filter(pl.col("sku").is_not_null() & pl.col("store").is_null())
             if exclude is not None:
-                pure = pure.filter(pl.col("sku") != exclude)
+                pure = pure.filter(pl.col("sku") != str(exclude))
             if pure.height > 0:
                 tabla = pure
                 code_col = "sku"
@@ -196,7 +211,7 @@ def _ranking_from_metrics(
                     pl.col("store").is_not_null() & pl.col("sku").is_not_null()
                 )
                 if exclude is not None:
-                    leaves = leaves.filter(pl.col("sku") != exclude)
+                    leaves = leaves.filter(pl.col("sku") != str(exclude))
                 if leaves.height == 0:
                     return empty
                 tabla = (
@@ -220,25 +235,28 @@ def _ranking_from_metrics(
                 )
                 code_col = "sku"
 
-    # Solo filas con rotación y wMAPE > 0 (el usuario no quiere ver wMAPE=0)
-    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0)).sort("wmape")
-    # Una fila por código (defensa extra)
-    if tabla.height and code_col in tabla.columns:
-        tabla = tabla.unique(subset=[code_col], keep="first")
+    # Solo filas con rotación y wMAPE > 0; orden descendente por wMAPE
+    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
     if tabla.height == 0:
         return empty
+    if code_col in tabla.columns:
+        # Un código por fila quedándose con el mayor wMAPE
+        tabla = tabla.sort("wmape", descending=False).unique(
+            subset=[code_col], keep="first", maintain_order=True
+        )
+    else:
+        tabla = tabla.sort("wmape", descending=False)
 
     codes = tabla[code_col].to_list()
     uids2 = tabla["unique_id"].to_list()
     n_with_sales = tabla["n_with_sales"].to_list()
     pct = [
-        (float(nw) / float(n_spine) * 100) if n_spine else 0.0
-        for nw in n_with_sales
+        (float(nw) / float(n_spine) * 100) if n_spine else 0.0 for nw in n_with_sales
     ]
     descriptions: list[str] = []
     for u, code in zip(uids2, codes):
         d = desc_map.get(u, "")
-        if not d and axis == "sku" and fixed_peer is None:
+        if not d and axis == "sku":
             d = next(
                 (desc_map[k] for k in desc_map if f"||S:{code}" in k and desc_map[k]),
                 "",
@@ -375,9 +393,7 @@ def prepare_dashboard_state_fast(
     )
 
 
-def _aggregate_pure_sku(
-    unit_df: pl.DataFrame, seccion: str, sku: str
-) -> pl.DataFrame:
+def _aggregate_pure_sku(unit_df: pl.DataFrame, seccion: str, sku: str) -> pl.DataFrame:
     prefix = f"{seccion}||"
     suffix = f"||S:{sku}"
     leaves = unit_df.filter(

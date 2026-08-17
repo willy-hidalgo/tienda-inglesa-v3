@@ -958,57 +958,67 @@ class RLSForecastRunner:
         uid: np.ndarray,
         is_train: np.ndarray,
     ) -> dict[str, str]:
-        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}."""
+        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}.
+
+        Vectorizado con reduceat sobre grupos contiguos de uid (sin loop
+        Python por punto; solo un paso por serie).
+        """
         selection: dict[str, str] = {}
-        # Agrupar índices por uid (solo filas train con y != 0)
         mask = is_train & np.isfinite(y) & (y != 0)
         if not np.any(mask):
             for u in np.unique(uid):
                 selection[str(u)] = "seccion"
             return selection
 
-        # Ordenar por uid para barrido lineal
-        order = np.argsort(uid, kind="mergesort")
-        uid_s = uid[order]
-        y_s = y[order]
-        ys_s = yhat_sec[order]
-        yt_s = yhat_sto[order]
-        m_s = mask[order]
+        # Solo filas train con venta; ordenar por uid
+        idx = np.flatnonzero(mask)
+        uid_m = np.asarray(uid)[idx]
+        order = np.argsort(uid_m, kind="mergesort")
+        uid_s = uid_m[order]
+        y_s = np.asarray(y, dtype=np.float64)[idx][order]
+        ys_s = np.asarray(yhat_sec, dtype=np.float64)[idx][order]
+        yt_s = np.asarray(yhat_sto, dtype=np.float64)[idx][order]
 
-        n = len(uid_s)
-        i = 0
-        while i < n:
-            j = i + 1
-            while j < n and uid_s[j] == uid_s[i]:
-                j += 1
-            m = m_s[i:j]
-            if not np.any(m):
-                selection[str(uid_s[i])] = "seccion"
-                i = j
+        # Bordes de grupo
+        change = np.empty(len(uid_s), dtype=bool)
+        change[0] = True
+        change[1:] = uid_s[1:] != uid_s[:-1]
+        starts = np.flatnonzero(change)
+        # reduceat acumula por grupo
+        sum_abs_y = np.add.reduceat(np.abs(y_s), starts)
+        err_sec = np.add.reduceat(np.abs(y_s - ys_s), starts)
+        err_sto = np.add.reduceat(np.abs(y_s - yt_s), starts)
+        sum_y = np.add.reduceat(y_s, starts)
+        bias_sec = np.add.reduceat(ys_s - y_s, starts)
+        bias_sto = np.add.reduceat(yt_s - y_s, starts)
+
+        uids_grp = uid_s[starts]
+        for k, u in enumerate(uids_grp):
+            denom = float(sum_abs_y[k])
+            if denom == 0.0:
+                selection[str(u)] = "seccion"
                 continue
-            yy = y_s[i:j][m]
-            denom = float(np.abs(yy).sum())
-            if denom == 0:
-                selection[str(uid_s[i])] = "seccion"
-                i = j
-                continue
-            err_sec = float(np.abs(yy - ys_s[i:j][m]).sum())
-            err_sto = float(np.abs(yy - yt_s[i:j][m]).sum())
-            if err_sto < err_sec:
-                selection[str(uid_s[i])] = "tienda"
-            elif err_sto > err_sec:
-                selection[str(uid_s[i])] = "seccion"
+            es, et = float(err_sec[k]), float(err_sto[k])
+            if et < es:
+                selection[str(u)] = "tienda"
+            elif et > es:
+                selection[str(u)] = "seccion"
             else:
-                sum_y = float(yy.sum())
-                if sum_y == 0:
-                    selection[str(uid_s[i])] = "seccion"
+                sy = float(sum_y[k])
+                if sy == 0.0:
+                    selection[str(u)] = "seccion"
                 else:
-                    bias_sec = float((ys_s[i:j][m] - yy).sum()) / sum_y
-                    bias_sto = float((yt_s[i:j][m] - yy).sum()) / sum_y
-                    selection[str(uid_s[i])] = (
-                        "tienda" if abs(bias_sto) <= abs(bias_sec) else "seccion"
+                    selection[str(u)] = (
+                        "tienda"
+                        if abs(float(bias_sto[k]) / sy) <= abs(float(bias_sec[k]) / sy)
+                        else "seccion"
                     )
-            i = j
+
+        # Series sin puntos train con venta → sección por defecto
+        for u in np.unique(uid):
+            su = str(u)
+            if su not in selection:
+                selection[su] = "seccion"
         return selection
 
     def derive_sku_store_forecasts(

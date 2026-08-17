@@ -141,54 +141,81 @@ def _wmape_table_for_unit(
     all_ids: list[str],
     unidad: str,
 ) -> pl.DataFrame:
-    """Métricas por unique_id para una unidad (Valor o Unidades)."""
-    secciones = sorted(
-        {
-            settings.split_unique_id(u)["seccion"]
-            for u in all_ids
-            if settings.split_unique_id(u)["store"] is None
-            and settings.split_unique_id(u)["sku"] is None
+    """
+    Métricas por unique_id para una unidad (Valor o Unidades).
+
+    Un solo group_by sobre el panel completo (no un wmape_por_id por sección).
+    n_spine se asigna después por sección vía join.
+    """
+    empty = pl.DataFrame(
+        schema={
+            "unique_id": pl.Utf8,
+            "wmape": pl.Float64,
+            "sum_y": pl.Float64,
+            "n_points": pl.UInt32,
+            "n_with_sales": pl.UInt32,
+            "unidad": pl.Utf8,
+            "seccion": pl.Utf8,
+            "n_spine": pl.UInt32,
         }
-        or {settings.split_unique_id(u)["seccion"] for u in all_ids}
     )
-    parts: list[pl.DataFrame] = []
+    if unit_df.height == 0:
+        return empty
+
+    # Secciones: parseo una sola vez
+    sec_from_id = (
+        pl.DataFrame({"unique_id": all_ids})
+        .with_columns(
+            pl.col("unique_id").str.split("||").list.get(0).alias("seccion")
+        )
+        .unique()
+    )
+    secciones = (
+        sec_from_id.filter(~pl.col("unique_id").str.contains(r"\|\|", literal=False))
+        ["seccion"]
+        .unique()
+        .to_list()
+    )
+    if not secciones:
+        secciones = sec_from_id["seccion"].unique().to_list()
+
+    # n_spine por sección (settings + opcional override por datos)
+    spine_rows = []
     for seccion in secciones:
-        candidatos = [
-            uid
-            for uid in all_ids
-            if uid == seccion or uid.startswith(f"{seccion}||")
-        ]
-        if not candidatos:
-            continue
         hz = settings.section_horizons(seccion)
         n_spine = (hz["forecast_end"] - hz["train_start"]).days + 1
-        n_data = backend.spine_n_fechas(unit_df, candidatos)
-        if n_data > n_spine:
-            n_spine = n_data
-        tabla = backend.wmape_por_id(candidatos, unit_df, n_fechas_spine=n_spine)
-        if tabla.height == 0:
-            continue
-        parts.append(
-            tabla.with_columns(
-                pl.lit(unidad).alias("unidad"),
-                pl.lit(seccion).alias("seccion"),
-                pl.lit(int(n_spine)).cast(pl.UInt32).alias("n_spine"),
-            )
+        spine_rows.append({"seccion": seccion, "n_spine": int(n_spine)})
+    spine_df = pl.DataFrame(spine_rows).with_columns(
+        pl.col("n_spine").cast(pl.UInt32)
+    )
+
+    # Un solo WMAPE sobre todo el panel (sin lista de ids → group_by directo)
+    # n_points se rellena después con n_spine de la sección.
+    tabla = backend.wmape_all_ids(unit_df, n_fechas_spine=0)
+    if tabla.height == 0:
+        return empty
+
+    tabla = (
+        tabla.join(sec_from_id, on="unique_id", how="left")
+        .join(spine_df, on="seccion", how="left")
+        .with_columns(
+            pl.col("n_spine").fill_null(0).alias("n_points"),
+            pl.lit(unidad).alias("unidad"),
         )
-    if not parts:
-        return pl.DataFrame(
-            schema={
-                "unique_id": pl.Utf8,
-                "wmape": pl.Float64,
-                "sum_y": pl.Float64,
-                "n_points": pl.UInt32,
-                "n_with_sales": pl.UInt32,
-                "unidad": pl.Utf8,
-                "seccion": pl.Utf8,
-                "n_spine": pl.UInt32,
-            }
+        .select(
+            [
+                "unique_id",
+                "wmape",
+                "sum_y",
+                "n_points",
+                "n_with_sales",
+                "unidad",
+                "seccion",
+                "n_spine",
+            ]
         )
-    return pl.concat(parts, how="diagonal_relaxed")
+    )
+    return tabla
 
 
 def _build_pure_sku_series_vectorized(res_df: pl.DataFrame) -> pl.DataFrame:
@@ -462,36 +489,18 @@ def build_artifacts(
         series = pl.concat([series, pure], how="diagonal_relaxed")
 
         pure_ids = pure["unique_id"].unique().to_list()
-        pure_metric_parts: list[pl.DataFrame] = []
         unit_specs: list[tuple[str, pl.DataFrame]] = [("Unidades", pure)]
         if has_value and "value" in pure.columns and "valuehat" in pure.columns:
             exprs = [pl.col("value").alias("y"), pl.col("valuehat").alias("yhat")]
             if "valuehat28" in pure.columns:
                 exprs.append(pl.col("valuehat28").alias("yhat28"))
             unit_specs.append(("Valor ($)", pure.with_columns(exprs)))
+        pure_metric_parts: list[pl.DataFrame] = []
         for unidad, pure_unit in unit_specs:
-            by_sec: dict[str, list[str]] = {}
-            for uid in pure_ids:
-                p = settings.split_unique_id(uid)
-                by_sec.setdefault(p["seccion"], []).append(uid)
-            for seccion, candidatos in by_sec.items():
-                hz = settings.section_horizons(seccion)
-                n_spine = (hz["forecast_end"] - hz["train_start"]).days + 1
-                sub = pure_unit.filter(pl.col("unique_id").is_in(candidatos))
-                if sub.height == 0:
-                    continue
-                tabla = backend.wmape_por_id(
-                    candidatos, sub, n_fechas_spine=n_spine
-                )
-                if tabla.height == 0:
-                    continue
-                pure_metric_parts.append(
-                    tabla.with_columns(
-                        pl.lit(unidad).alias("unidad"),
-                        pl.lit(seccion).alias("seccion"),
-                        pl.lit(int(n_spine)).cast(pl.UInt32).alias("n_spine"),
-                    )
-                )
+            # Un solo group_by sobre todas las series SKU-puro
+            tabla = _wmape_table_for_unit(pure_unit, pure_ids, unidad)
+            if tabla.height:
+                pure_metric_parts.append(tabla)
         if pure_metric_parts:
             pure_metrics = pl.concat(pure_metric_parts, how="diagonal_relaxed")
             pure_parts = _parse_uid_parts(
