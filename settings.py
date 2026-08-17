@@ -2,6 +2,7 @@
 Configuración central del proyecto de forecasting jerárquico RLS.
 Secciones 1 y 23 · niveles: sección → SKU → local (tienda).
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -40,13 +41,13 @@ TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
 ROLLING_HORIZON_DAYS = 28  # yhat28 / valuehat28 walk-forward
 COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat28
-                             # (el dashboard detecta la ausencia de estas
-                             # columnas en el parquet para ocultar el control
-                             # de selección de series y la sección de métricas
-                             # rolling28; ver README § Rolling 28d). Desde el
-                             # cambio de arquitectura (RLS solo a nivel
-                             # sección), el rolling28 SOLO se calcula para los
-                             # nodos de sección — ver README § Modelo jerárquico.
+# (el dashboard detecta la ausencia de estas
+# columnas en el parquet para ocultar el control
+# de selección de series y la sección de métricas
+# rolling28; ver README § Rolling 28d). Desde el
+# cambio de arquitectura (RLS solo a nivel
+# sección), el rolling28 SOLO se calcula para los
+# nodos de sección — ver README § Modelo jerárquico.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Modelo jerárquico: RLS solo a nivel sección; tienda/sku/tienda+sku se
@@ -54,9 +55,9 @@ COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat2
 # residuo). Ver README § Modelo jerárquico para el detalle del método.
 # ─────────────────────────────────────────────────────────────────────────────
 SES_ALPHA = 0.1  # alpha fijo de la suavización exponencial simple (SES)
-                 # aplicada sobre "y_neto" (y menos el efecto de los drivers
-                 # de la sección) para obtener yhat en nodos tienda/sku/
-                 # tienda+sku. Fijo (no auto-tuneado) por velocidad.
+# aplicada sobre "y_neto" (y menos el efecto de los drivers
+# de la sección) para obtener yhat en nodos tienda/sku/
+# tienda+sku. Fijo (no auto-tuneado) por velocidad.
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
 FECHAS_TEST = (TEST_START, TEST_END)
@@ -293,8 +294,7 @@ def section_horizons(seccion: str, first_data: dt.date | None = None) -> dict:
     forecast_end = cfg.get("forecast_end") or (
         test_end + dt.timedelta(days=METRIC_HORIZON_DAYS)
     )
-    if forecast_end < forecast_start:
-        forecast_end = forecast_start
+    forecast_end = max(forecast_end, forecast_start)
     return {
         "train_start": train_start,
         "train_end": train_end,
