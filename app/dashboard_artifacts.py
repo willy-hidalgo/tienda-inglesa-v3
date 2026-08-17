@@ -489,32 +489,8 @@ def build_artifacts(
         series = pl.concat([series, pure], how="diagonal_relaxed")
 
         pure_ids = pure["unique_id"].unique().to_list()
-        unit_specs: list[tuple[str, pl.DataFrame]] = [("Unidades", pure)]
-        if has_value and "value" in pure.columns and "valuehat" in pure.columns:
-            exprs = [pl.col("value").alias("y"), pl.col("valuehat").alias("yhat")]
-            if "valuehat28" in pure.columns:
-                exprs.append(pl.col("valuehat28").alias("yhat28"))
-            unit_specs.append(("Valor ($)", pure.with_columns(exprs)))
-        pure_metric_parts: list[pl.DataFrame] = []
-        for unidad, pure_unit in unit_specs:
-            # Un solo group_by sobre todas las series SKU-puro
-            tabla = _wmape_table_for_unit(pure_unit, pure_ids, unidad)
-            if tabla.height:
-                pure_metric_parts.append(tabla)
-        if pure_metric_parts:
-            pure_metrics = pl.concat(pure_metric_parts, how="diagonal_relaxed")
-            pure_parts = _parse_uid_parts(
-                pure_metrics["unique_id"].unique().to_list()
-            ).unique(subset=["unique_id"])
-            pure_metrics = pure_metrics.drop(
-                [
-                    c
-                    for c in ("store", "sku", "node_kind", "seccion")
-                    if c in pure_metrics.columns
-                ]
-            )
-            pure_metrics = pure_metrics.join(pure_parts, on="unique_id", how="left")
-            metrics = pl.concat([metrics, pure_metrics], how="diagonal_relaxed")
+        # wMAPE de SKU puro ya sale bottom-up desde hojas en _wmape_table_for_unit
+        # (no recalcular sobre la serie agregada: sería otro método).
 
         # labels SKU puro
         for uid in pure_ids:

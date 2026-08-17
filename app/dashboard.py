@@ -535,7 +535,7 @@ st.caption(
     f"Sección **{view.seccion}** · Train → {hz.get('train_end')} · "
     f"OOS [{hz.get('test_start')} → {hz.get('test_end')}] · "
     f"Solo-forecast [{hz.get('forecast_start')} → {hz.get('forecast_end')}]. "
-    "WMAPE = Σ|y−ŷ|/Σ|y| (excl. y=0)."
+    "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda (excl. y=0, forecast_only)."
 )
 
 c1, c2, c3 = st.columns(3)

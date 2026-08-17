@@ -240,7 +240,7 @@ def _ranking_from_metrics(
     if tabla.height == 0:
         return empty
     if code_col in tabla.columns:
-        # Un código por fila quedándose con el mayor wMAPE
+        # Un código por fila quedándose con el menor wMAPE
         tabla = tabla.sort("wmape", descending=False).unique(
             subset=[code_col], keep="first", maintain_order=True
         )
@@ -341,6 +341,8 @@ def prepare_dashboard_state_fast(
         n_spine=n_spine or 1,
     )
 
+    # wMAPE de métricas: bottom-up desde hojas cuando el nodo no es hoja
+    # (tienda / sección / sku puro). La serie del gráfico sigue siendo el nodo.
     metrics_io = backend.metrics_in_out_total(df_view, cutoff, test_end or cutoff)
     metrics_28 = backend.metrics_rolling28(df_view)
 
@@ -494,8 +496,7 @@ def prepare_dashboard_state(
             uid for uid in all_ids if uid == seccion or uid.startswith(f"{seccion}||")
         ]
         n_data = backend.spine_n_fechas(unit_df, candidatos)
-        if n_data > n_spine_calc:
-            n_spine_calc = n_data
+        n_spine_calc = max(n_spine_calc, n_data)
         if n_spine is None:
             n_spine = n_spine_calc
         if tabla_base is None:
@@ -522,7 +523,16 @@ def prepare_dashboard_state(
         unidad=unidad,
     )
 
-    metrics = backend.metrics_in_out_total(df_view, cutoff, test_end or cutoff)
+    # Ranking ya es bottom-up vía wmape_por_id. Métricas in/out del nodo:
+    # siempre bottom-up desde hojas del alcance seleccionado.
+    metrics = backend.metrics_in_out_bottom_up(
+        unit_df,
+        seccion=seccion,
+        store=store,
+        sku=sku,
+        cutoff=cutoff,
+        test_end=test_end or cutoff,
+    )
     metrics_28 = backend.metrics_rolling28(df_view)
 
     has_rolling28 = (

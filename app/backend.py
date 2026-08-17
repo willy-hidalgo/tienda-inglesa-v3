@@ -211,7 +211,6 @@ def spine_n_fechas(df: pl.DataFrame, unique_ids: list[str] | None = None) -> int
     if df.height == 0 or "ds" not in df.columns:
         return 0
     if unique_ids:
-        # Semi-join más barato que is_in sobre listas enormes en algunos casos
         ids_df = pl.DataFrame({"unique_id": unique_ids})
         sub = df.join(ids_df, on="unique_id", how="semi")
         if sub.height == 0:
@@ -219,6 +218,161 @@ def spine_n_fechas(df: pl.DataFrame, unique_ids: list[str] | None = None) -> int
     else:
         sub = df
     return int(sub.select(pl.col("ds").n_unique()).item())
+
+
+def _is_leaf_expr() -> pl.Expr:
+    """Hoja sku+tienda: exactamente 2 separadores '||' (sec||T:x||S:y)."""
+    return pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2
+
+
+def _scored_leaves(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Hojas sku+tienda con venta, excluyendo forecast_only.
+    Columnas extra: _abs_error, _store_uid, _seccion, _sku, _sku_uid.
+    """
+    if df.height == 0 or "y" not in df.columns or "yhat" not in df.columns:
+        return df.head(0)
+
+    leaves = df.filter(_is_leaf_expr())
+    if "period_type" in leaves.columns:
+        leaves = leaves.filter(pl.col("period_type") != "forecast_only")
+    leaves = leaves.filter(
+        pl.col("y").is_not_null() & pl.col("yhat").is_not_null() & (pl.col("y") != 0)
+    )
+    if leaves.height == 0:
+        return leaves
+
+    return leaves.with_columns(
+        (pl.col("y") - pl.col("yhat")).abs().alias("_abs_error"),
+        # "1||T:00063||S:127360" → store_uid "1||T:00063", seccion "1", sku "127360"
+        pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
+        pl.col("unique_id").str.split("||").list.get(0).alias("_seccion"),
+        pl.col("unique_id").str.extract(r"\|\|S:([^|]+)", 1).alias("_sku"),
+    ).with_columns(
+        pl.concat_str([pl.col("_seccion"), pl.lit("||S:"), pl.col("_sku")]).alias(
+            "_sku_uid"
+        )
+    )
+
+
+def wmape_bottom_up(
+    df: pl.DataFrame,
+    *,
+    n_fechas_spine: int | None = None,
+) -> pl.DataFrame:
+    """
+    WMAPE bottom-up desde hojas sku+tienda (única fuente de verdad).
+
+    Definición (igual para hoja / tienda / sección / SKU puro):
+        abs_err_i = |y_i − ŷ_i|   en cada fila de hoja con y ≠ 0
+        wMAPE     = Σ abs_err / Σ |y|
+
+    - Hoja sku+tienda: suma sobre sus propias filas.
+    - Tienda: suma de abs_err y de y de **todas** las hojas de esa tienda
+      (no usa el yhat del nodo tienda agregado).
+    - Sección: idem sobre todas las hojas de la sección.
+    - SKU puro (sec||S:sku): suma sobre hojas de ese SKU en todas las tiendas.
+
+    Excluye period_type == forecast_only.
+    """
+    schema = {
+        "unique_id": pl.Utf8,
+        "wmape": pl.Float64,
+        "sum_y": pl.Float64,
+        "n_points": pl.UInt32,
+        "n_with_sales": pl.UInt32,
+    }
+    leaves = _scored_leaves(df)
+    if leaves.height == 0:
+        return pl.DataFrame(schema=schema)
+
+    n_fechas_spine = int(
+        n_fechas_spine
+        if n_fechas_spine is not None
+        else (
+            leaves.select(pl.col("ds").n_unique()).item()
+            if "ds" in leaves.columns
+            else 0
+        )
+    )
+    n_spine_lit = pl.lit(n_fechas_spine).cast(pl.UInt32)
+
+    # Hojas
+    out_leaf = (
+        leaves.group_by("unique_id")
+        .agg(
+            pl.col("_abs_error").sum().alias("sum_abs_error"),
+            pl.col("y").sum().alias("sum_y"),
+            pl.len().alias("n_with_sales"),
+        )
+        .with_columns(
+            pl.when(pl.col("sum_y") != 0)
+            .then(pl.col("sum_abs_error") / pl.col("sum_y").abs())
+            .otherwise(0.0)
+            .alias("wmape"),
+            n_spine_lit.alias("n_points"),
+        )
+        .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
+    )
+
+    # Tienda: 1||T:00063
+    out_store = (
+        leaves.group_by("_store_uid")
+        .agg(
+            pl.col("_abs_error").sum().alias("sum_abs_error"),
+            pl.col("y").sum().alias("sum_y"),
+            pl.len().alias("n_with_sales"),
+        )
+        .with_columns(
+            pl.when(pl.col("sum_y") != 0)
+            .then(pl.col("sum_abs_error") / pl.col("sum_y").abs())
+            .otherwise(0.0)
+            .alias("wmape"),
+            n_spine_lit.alias("n_points"),
+        )
+        .rename({"_store_uid": "unique_id"})
+        .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
+    )
+
+    # Sección: "1"
+    out_sec = (
+        leaves.group_by("_seccion")
+        .agg(
+            pl.col("_abs_error").sum().alias("sum_abs_error"),
+            pl.col("y").sum().alias("sum_y"),
+            pl.len().alias("n_with_sales"),
+        )
+        .with_columns(
+            pl.when(pl.col("sum_y") != 0)
+            .then(pl.col("sum_abs_error") / pl.col("sum_y").abs())
+            .otherwise(0.0)
+            .alias("wmape"),
+            n_spine_lit.alias("n_points"),
+        )
+        .rename({"_seccion": "unique_id"})
+        .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
+    )
+
+    # SKU puro: 1||S:127360 (todas las tiendas de ese SKU)
+    out_sku = (
+        leaves.group_by("_sku_uid")
+        .agg(
+            pl.col("_abs_error").sum().alias("sum_abs_error"),
+            pl.col("y").sum().alias("sum_y"),
+            pl.len().alias("n_with_sales"),
+        )
+        .with_columns(
+            pl.when(pl.col("sum_y") != 0)
+            .then(pl.col("sum_abs_error") / pl.col("sum_y").abs())
+            .otherwise(0.0)
+            .alias("wmape"),
+            n_spine_lit.alias("n_points"),
+        )
+        .rename({"_sku_uid": "unique_id"})
+        .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
+    )
+
+    return pl.concat([out_leaf, out_store, out_sec, out_sku], how="diagonal_relaxed")
 
 
 def wmape_por_id(
@@ -229,12 +383,10 @@ def wmape_por_id(
     fill_missing: bool = True,
 ) -> pl.DataFrame:
     """
-    WMAPE = Σ|y−ŷ|/Σ|y| (excluye y==0 y forecast_only del cálculo).
-    n_points = longitud del spine (igual para todos si el panel está denso).
-    n_with_sales = conteo y≠0 (informativo).
+    WMAPE bottom-up (ver `wmape_bottom_up`).
 
-    Optimizado: un solo group_by, anti-join para ids sin ventas (sin loops Python).
-    Si `ids is None`, agrega todos los unique_id presentes en df.
+    Si se pasa `ids`, filtra el resultado a esos unique_id y opcionalmente
+    completa faltantes con wMAPE=0.
     """
     schema = {
         "unique_id": pl.Utf8,
@@ -248,69 +400,18 @@ def wmape_por_id(
     if ids is not None and len(ids) == 0:
         return pl.DataFrame(schema=schema)
 
-    # Filtrar panel una sola vez
-    if ids is not None:
-        ids_df = pl.DataFrame({"unique_id": ids}).unique()
-        base = df.join(ids_df, on="unique_id", how="semi")
-    else:
-        ids_df = None
-        base = df
-
-    if base.height == 0:
-        if fill_missing and ids is not None:
-            n = len(ids)
-            return pl.DataFrame(
-                {
-                    "unique_id": ids,
-                    "wmape": [0.0] * n,
-                    "sum_y": [0.0] * n,
-                    "n_points": [int(n_fechas_spine or 0)] * n,
-                    "n_with_sales": [0] * n,
-                }
-            )
-        return pl.DataFrame(schema=schema)
-
-    if "period_type" in base.columns:
-        base_m = base.filter(pl.col("period_type") != "forecast_only")
-    else:
-        base_m = base
-
-    if n_fechas_spine is None:
-        n_fechas_spine = (
-            int(base_m.select(pl.col("ds").n_unique()).item())
-            if base_m.height and "ds" in base_m.columns
-            else 0
-        )
-    n_fechas_spine = int(n_fechas_spine or 0)
-    n_spine_lit = pl.lit(n_fechas_spine).cast(pl.UInt32)
-
-    # Solo filas con venta: un group_by
-    scored = base_m.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
-    if scored.height == 0:
-        agg = pl.DataFrame(schema=schema)
-    else:
-        agg = (
-            scored.group_by("unique_id")
-            .agg(
-                pl.col("y").sum().alias("sum_y"),
-                (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error"),
-                pl.len().alias("n_with_sales"),
-            )
-            .with_columns(
-                pl.when(pl.col("sum_y") != 0)
-                .then(pl.col("sum_abs_error") / pl.col("sum_y"))
-                .otherwise(0.0)
-                .alias("wmape"),
-                n_spine_lit.alias("n_points"),
-            )
-            .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
-        )
-
-    if not fill_missing or ids is None:
+    agg = wmape_bottom_up(df, n_fechas_spine=n_fechas_spine)
+    if ids is None:
         return agg if agg.height else pl.DataFrame(schema=schema)
 
-    # Completar ids sin ventas vía anti-join (sin set() Python)
-    assert ids_df is not None
+    ids_df = pl.DataFrame({"unique_id": ids}).unique()
+    agg = agg.join(ids_df, on="unique_id", how="semi")
+
+    if not fill_missing:
+        return agg if agg.height else pl.DataFrame(schema=schema)
+
+    n_spine = int(n_fechas_spine or 0)
+    n_spine_lit = pl.lit(n_spine).cast(pl.UInt32)
     if agg.height == 0:
         return ids_df.with_columns(
             pl.lit(0.0).alias("wmape"),
@@ -318,7 +419,6 @@ def wmape_por_id(
             n_spine_lit.alias("n_points"),
             pl.lit(0).cast(pl.UInt32).alias("n_with_sales"),
         )
-
     missing = ids_df.join(agg.select("unique_id"), on="unique_id", how="anti")
     if missing.height == 0:
         return agg
@@ -336,8 +436,46 @@ def wmape_all_ids(
     *,
     n_fechas_spine: int | None = None,
 ) -> pl.DataFrame:
-    """WMAPE de todos los unique_id del panel (un solo group_by, sin lista de ids)."""
-    return wmape_por_id(None, df, n_fechas_spine=n_fechas_spine, fill_missing=False)
+    """WMAPE bottom-up de todos los nodos derivables de las hojas."""
+    return wmape_bottom_up(df, n_fechas_spine=n_fechas_spine)
+
+
+def wmape_scope_from_leaves(
+    df: pl.DataFrame,
+    *,
+    seccion: str,
+    store: str | None = None,
+    sku: str | None = None,
+) -> dict[str, float | int]:
+    """
+    wMAPE de un alcance (sección / tienda / sku+tienda / sku puro) calculado
+    siempre bottom-up desde hojas. Usado por métricas in/out del dashboard.
+    """
+    leaves = _scored_leaves(df)
+    if leaves.height == 0:
+        return {"wmape": 0.0, "sum_y": 0.0, "sum_abs_error": 0.0, "n": 0}
+
+    leaves = leaves.filter(pl.col("_seccion") == str(seccion))
+    if store is not None and sku is not None:
+        uid = f"{seccion}||T:{store}||S:{sku}"
+        leaves = leaves.filter(pl.col("unique_id") == uid)
+    elif store is not None:
+        leaves = leaves.filter(pl.col("_store_uid") == f"{seccion}||T:{store}")
+    elif sku is not None:
+        leaves = leaves.filter(pl.col("_sku") == str(sku))
+
+    if leaves.height == 0:
+        return {"wmape": 0.0, "sum_y": 0.0, "sum_abs_error": 0.0, "n": 0}
+
+    sum_y = float(leaves["y"].sum())
+    sum_err = float(leaves["_abs_error"].sum())
+    wmape = (sum_err / abs(sum_y)) if sum_y != 0 else 0.0
+    return {
+        "wmape": wmape,
+        "sum_y": sum_y,
+        "sum_abs_error": sum_err,
+        "n": leaves.height,
+    }
 
 
 def ranking_table(
@@ -516,6 +654,10 @@ def ranking_table(
 
 
 def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
+    """
+    wMAPE = Σ|y−ŷ| / Σ|y| sobre filas con y≠0.
+    Si `df` trae varias hojas, es bottom-up (suma de abs_err de cada fila hoja).
+    """
     if df.height == 0:
         return 0.0, 0.0, 0
     scored = df.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
@@ -536,6 +678,10 @@ def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
 def metrics_in_out_total(
     df_view: pl.DataFrame, cutoff: dt.date, test_end: dt.date
 ) -> dict[str, dict[str, float | int]]:
+    """
+    Métricas in / out / total. Si `df_view` son hojas (varios unique_id),
+    el wMAPE es bottom-up: Σ|y−ŷ| / Σ|y| sobre todas las filas hoja del tramo.
+    """
     df_in = df_view.filter(pl.col("ds").cast(pl.Date) < cutoff)
     df_out = df_view.filter(
         (pl.col("ds").cast(pl.Date) >= cutoff)
@@ -553,6 +699,39 @@ def metrics_in_out_total(
         w, b, n = calcular_metricas(frame)
         out[key] = {"wmape": w, "bias": b, "n": n}
     return out
+
+
+def metrics_in_out_bottom_up(
+    unit_df: pl.DataFrame,
+    *,
+    seccion: str,
+    store: str | None,
+    sku: str | None,
+    cutoff: dt.date,
+    test_end: dt.date,
+) -> dict[str, dict[str, float | int]]:
+    """
+    in/out/total wMAPE bottom-up para un alcance (sección / tienda / hoja / sku).
+    Parte siempre de hojas sku+tienda.
+    """
+    leaves = _scored_leaves(unit_df)
+    if leaves.height == 0:
+        z = {"wmape": 0.0, "bias": 0.0, "n": 0}
+        return {"in": z, "out": dict(z), "total": dict(z)}
+
+    leaves = leaves.filter(pl.col("_seccion") == str(seccion))
+    if store is not None and sku is not None:
+        leaves = leaves.filter(pl.col("unique_id") == f"{seccion}||T:{store}||S:{sku}")
+    elif store is not None:
+        leaves = leaves.filter(pl.col("_store_uid") == f"{seccion}||T:{store}")
+    elif sku is not None:
+        leaves = leaves.filter(pl.col("_sku") == str(sku))
+
+    if leaves.height == 0:
+        z = {"wmape": 0.0, "bias": 0.0, "n": 0}
+        return {"in": z, "out": dict(z), "total": dict(z)}
+
+    return metrics_in_out_total(leaves, cutoff, test_end)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
