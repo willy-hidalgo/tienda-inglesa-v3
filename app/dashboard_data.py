@@ -10,7 +10,6 @@ Modo rápido (artefactos precalculados):
 Modo legacy (sin artefactos): mantiene prepare_dashboard_state original
 sobre el DataFrame completo (lento; solo fallback).
 """
-
 from __future__ import annotations
 
 import datetime as dt
@@ -77,7 +76,7 @@ def _parse_date(v: str | None) -> dt.date | None:
         return v.date()
     try:
         return dt.date.fromisoformat(str(v)[:10])
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -131,7 +130,9 @@ def _ranking_from_metrics(
             "unique_id": pl.Utf8,
         }
     )
-    base = metrics.filter((pl.col("seccion") == seccion) & (pl.col("unidad") == unidad))
+    base = metrics.filter(
+        (pl.col("seccion") == seccion) & (pl.col("unidad") == unidad)
+    )
     if base.height == 0:
         # Fallback sin multiplicar unidades: tomar una sola unidad si hay varias
         base = metrics.filter(pl.col("seccion") == seccion)
@@ -166,7 +167,9 @@ def _ranking_from_metrics(
 
     if axis == "store":
         # Siempre y solo nodos tienda puros (store presente, sku ausente).
-        tabla = base.filter(pl.col("store").is_not_null() & pl.col("sku").is_null())
+        tabla = base.filter(
+            pl.col("store").is_not_null() & pl.col("sku").is_null()
+        )
         if exclude is not None:
             tabla = tabla.filter(pl.col("store") != str(exclude))
         code_col = "store"
@@ -175,7 +178,9 @@ def _ranking_from_metrics(
         if fixed_peer is not None:
             # Tienda seleccionada → SOLO hojas sku+tienda de ESA tienda
             peer = str(fixed_peer)
-            tabla = base.filter((pl.col("store") == peer) & pl.col("sku").is_not_null())
+            tabla = base.filter(
+                (pl.col("store") == peer) & pl.col("sku").is_not_null()
+            )
             if tabla.height == 0:
                 # Fallback por patrón de unique_id (por si store no parseó bien)
                 needle = f"||T:{peer}||"
@@ -200,7 +205,9 @@ def _ranking_from_metrics(
             code_col = "sku"
         else:
             # Sin tienda: preferir nodos SKU puro; si no, agregar hojas
-            pure = base.filter(pl.col("sku").is_not_null() & pl.col("store").is_null())
+            pure = base.filter(
+                pl.col("sku").is_not_null() & pl.col("store").is_null()
+            )
             if exclude is not None:
                 pure = pure.filter(pl.col("sku") != str(exclude))
             if pure.height > 0:
@@ -235,12 +242,12 @@ def _ranking_from_metrics(
                 )
                 code_col = "sku"
 
-    # Solo filas con rotación y wMAPE > 0; orden descendente por wMAPE
+    # Solo filas con rotación y wMAPE > 0; orden ASCENDENTE por wMAPE (mejor primero)
     tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
     if tabla.height == 0:
         return empty
     if code_col in tabla.columns:
-        # Un código por fila quedándose con el menor wMAPE
+        # Un código por fila; keep first tras sort ASC = menor wMAPE
         tabla = tabla.sort("wmape", descending=False).unique(
             subset=[code_col], keep="first", maintain_order=True
         )
@@ -251,7 +258,8 @@ def _ranking_from_metrics(
     uids2 = tabla["unique_id"].to_list()
     n_with_sales = tabla["n_with_sales"].to_list()
     pct = [
-        (float(nw) / float(n_spine) * 100) if n_spine else 0.0 for nw in n_with_sales
+        (float(nw) / float(n_spine) * 100) if n_spine else 0.0
+        for nw in n_with_sales
     ]
     descriptions: list[str] = []
     for u, code in zip(uids2, codes):
@@ -341,9 +349,36 @@ def prepare_dashboard_state_fast(
         n_spine=n_spine or 1,
     )
 
-    # wMAPE de métricas: bottom-up desde hojas cuando el nodo no es hoja
-    # (tienda / sección / sku puro). La serie del gráfico sigue siendo el nodo.
-    metrics_io = backend.metrics_in_out_total(df_view, cutoff, test_end or cutoff)
+    # Métricas in/out/total siempre bottom-up desde hojas del alcance.
+    # La serie del gráfico sigue siendo el nodo seleccionado (df_view).
+    fpath = Path(forecast_path) if forecast_path else None
+    if store is not None and sku is not None:
+        # Hoja: la propia serie diaria (bottom-up trivial de una hoja)
+        metrics_io = backend.metrics_in_out_total(
+            df_daily, cutoff, test_end or cutoff
+        )
+    else:
+        leaves = artifacts.load_leaves_for_scope(
+            seccion,
+            store=store,
+            sku=sku,
+            forecast_path=fpath,
+            unidad=unidad,
+            has_value=has_value,
+        )
+        if leaves.height:
+            metrics_io = backend.metrics_in_out_bottom_up(
+                leaves,
+                seccion=seccion,
+                store=store,
+                sku=sku,
+                cutoff=cutoff,
+                test_end=test_end or cutoff,
+            )
+        else:
+            metrics_io = backend.metrics_in_out_total(
+                df_view, cutoff, test_end or cutoff
+            )
     metrics_28 = backend.metrics_rolling28(df_view)
 
     has_rolling28 = (
@@ -395,7 +430,9 @@ def prepare_dashboard_state_fast(
     )
 
 
-def _aggregate_pure_sku(unit_df: pl.DataFrame, seccion: str, sku: str) -> pl.DataFrame:
+def _aggregate_pure_sku(
+    unit_df: pl.DataFrame, seccion: str, sku: str
+) -> pl.DataFrame:
     prefix = f"{seccion}||"
     suffix = f"||S:{sku}"
     leaves = unit_df.filter(
@@ -496,7 +533,8 @@ def prepare_dashboard_state(
             uid for uid in all_ids if uid == seccion or uid.startswith(f"{seccion}||")
         ]
         n_data = backend.spine_n_fechas(unit_df, candidatos)
-        n_spine_calc = max(n_spine_calc, n_data)
+        if n_data > n_spine_calc:
+            n_spine_calc = n_data
         if n_spine is None:
             n_spine = n_spine_calc
         if tabla_base is None:

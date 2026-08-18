@@ -1126,20 +1126,14 @@ class RLSForecastRunner:
         store_uids = panel.get_column("_store_uid").unique().to_list()
         frames: list[pl.DataFrame] = []
         has_period = "period_type" in panel.columns
+        # ~150k × 76 × float32 ≈ 45 MiB por matriz; configurable
+        max_rows = int(getattr(settings, "DERIVE_MAX_ROWS_PER_CHUNK", 150_000))
 
-        for si, store_uid in enumerate(store_uids):
-            # Liberar variables temporales explícitamente e invocar garbage collection si la tienda es muy grande
-            coef_store = store_coefs.get(store_uid)
-            if coef_store is None:
-                continue
-
-            sub = panel.filter(pl.col("_store_uid") == store_uid)
+        def _process_sub(sub: pl.DataFrame, coef_store) -> pl.DataFrame | None:
+            """Procesa un bloque (tienda completa o lote de SKUs)."""
             if sub.height == 0:
-                continue
-            elif sub.height > 500_000:
-                gc.collect()
+                return None
 
-            # Un solo to_numpy por bloque de drivers (Float32)
             X_y = np.ascontiguousarray(
                 sub.select(driver_cols).to_numpy(), dtype=np.float32
             )
@@ -1147,25 +1141,21 @@ class RLSForecastRunner:
                 sub.select(driver_cols_price).to_numpy(), dtype=np.float32
             )
             y = sub["y"].to_numpy().astype(np.float64, copy=False)
-            # y = sub["y"].to_numpy().astype(np.float32, copy=False)
             value = (
                 sub["value"].to_numpy().astype(np.float64, copy=False)
-                # sub["value"].to_numpy().astype(np.float32, copy=False)
                 if "value" in sub.columns
-                else np.zeros_like(y)
+                else np.zeros(len(y), dtype=np.float64)
             )
             uids = sub["unique_id"].to_numpy()
             if has_period:
                 periods = sub["period_type"].to_numpy()
                 is_train = periods == "in_sample"
             else:
-                periods = None
                 is_train = np.ones(len(y), dtype=bool)
 
             coef_y_sto = np.ascontiguousarray(coef_store[0], dtype=np.float32).ravel()
             coef_p_sto = np.ascontiguousarray(coef_store[1], dtype=np.float32).ravel()
 
-            # Predicciones completas RLS (auditoría + selección)
             yhat_sec = np.round(np.expm1(X_y @ coef_y_sec)).ravel()
             yhat_sto = np.round(np.expm1(X_y @ coef_y_sto)).ravel()
             valuehat_sec = np.round(np.expm1(X_p @ coef_p_sec), 2).ravel()
@@ -1180,7 +1170,6 @@ class RLSForecastRunner:
             yhat_rls = np.where(use_sto, yhat_sto, yhat_sec)
             valuehat_rls = np.where(use_sto, valuehat_sto, valuehat_sec)
 
-            # Efecto sin intercepto del modelo elegido (vistas, sin copiar X)
             effect_y = np.where(
                 use_sto,
                 X_y[:, idx_y] @ coef_y_sto[idx_y],
@@ -1191,7 +1180,6 @@ class RLSForecastRunner:
                 X_p[:, idx_p] @ coef_p_sto[idx_p],
                 X_p[:, idx_p] @ coef_p_sec_fx,
             )
-            # Interceptos del modelo log seccionado por serie (uno por fila).
             intercept_y = np.where(
                 use_sto,
                 coef_y_sto[intercept_idx_y],
@@ -1204,10 +1192,6 @@ class RLSForecastRunner:
             )
             del X_y, X_p
 
-            # Residuo EN LOG-SPACE (modelo RLS ajustado sobre log1p):
-            #   log1p(y) − (intercept + efecto de drivers)
-            # Antes se restaba effect (log-space) de y (lineal), lo que producía
-            # un "y_neto" incoherente y pronósticos 0/negativos en OOS/fcst.
             with np.errstate(divide="ignore", invalid="ignore"):
                 log_y = np.log1p(np.clip(y, 0.0, None))
                 log_v = np.log1p(np.clip(value, 0.0, None))
@@ -1236,25 +1220,12 @@ class RLSForecastRunner:
             )
             del yhat_sec, yhat_sto, valuehat_sec, valuehat_sto
             del yhat_rls, valuehat_rls, effect_y, effect_v, intercept_y, intercept_v
+            del y, value, use_sto, log_y, log_v, log_resid_y, log_resid_v
 
             block = self._apply_ses(block, "_y_neto", "_y_neto_hat", alpha)
             block = self._apply_ses(block, "_v_neto", "_v_neto_hat", alpha)
 
             if has_period:
-                # Reconstrucción en log-space: expm1(intercept + efecto + SES(residuo)).
-                # Se aplica IGUAL para in_sample/out_sample/forecast_only.
-                #
-                # Antes, in_sample usaba directamente `_yhat_rls` (predicción cruda
-                # del RLS de sección/tienda, ajustado sobre el y/value AGREGADO de
-                # ese nivel). Esa predicción vive en la escala del agregado
-                # (sección o tienda), no en la escala de la hoja SKU+tienda, y por
-                # eso el gráfico mostraba yhat/valuehat in-sample varios órdenes de
-                # magnitud por encima de los actuals, con un salto abrupto al pasar
-                # a OOS (que sí usaba la reconstrucción con SES).
-                # `_y_neto_hat`/`_v_neto_hat` ya están definidos para in_sample y
-                # out_sample por igual (`_apply_ses` trata todo el período con
-                # actuals como una sola serie continua), así que no hace falta
-                # ninguna rama especial: usar la misma fórmula corrige la escala.
                 block = block.with_columns(
                     (
                         (
@@ -1300,9 +1271,79 @@ class RLSForecastRunner:
                 )
                 if c in block.columns
             ]
-            frames.append(block.drop(drop_tmp))
-            del sub, block, y, value, use_sto
-            if (si + 1) % 5 == 0:
+            out_b = block.drop(drop_tmp)
+            del block
+            return out_b
+
+        for si, store_uid in enumerate(store_uids):
+            coef_store = store_coefs.get(store_uid)
+            if coef_store is None:
+                continue
+
+            sub = panel.filter(pl.col("_store_uid") == store_uid)
+            if sub.height == 0:
+                continue
+
+            if sub.height <= max_rows:
+                batches = [sub]
+            else:
+                uid_list = sub.get_column("unique_id").unique().to_list()
+                n_uid = len(uid_list)
+                avg = max(1, sub.height // max(1, n_uid))
+                batch_uids = max(1, max_rows // avg)
+                batches = [
+                    sub.filter(pl.col("unique_id").is_in(uid_list[i : i + batch_uids]))
+                    for i in range(0, n_uid, batch_uids)
+                ]
+                logger.info(
+                    "  tienda %s: %d filas / %d SKU → %d lotes (≤%d filas)",
+                    store_uid,
+                    sub.height,
+                    n_uid,
+                    len(batches),
+                    max_rows,
+                )
+
+            for bi, chunk in enumerate(batches):
+                out_b = None
+                try:
+                    out_b = _process_sub(chunk, coef_store)
+                except Exception as e:
+                    msg = str(e)
+                    is_mem = isinstance(e, MemoryError) or (
+                        "Unable to allocate" in msg or "ArrayMemoryError" in type(e).__name__
+                    )
+                    if not is_mem:
+                        raise
+                    logger.warning(
+                        "MemoryError %s lote %d (%d filas); fallback SKU a SKU: %s",
+                        store_uid,
+                        bi,
+                        chunk.height,
+                        msg[:120],
+                    )
+                    for one_uid in chunk.get_column("unique_id").unique().to_list():
+                        one = chunk.filter(pl.col("unique_id") == one_uid)
+                        try:
+                            part = _process_sub(one, coef_store)
+                        except Exception as e2:
+                            logger.error("SKU %s omitido: %s", one_uid, e2)
+                            part = None
+                        if part is not None and part.height:
+                            frames.append(part)
+                        del one, part
+                        gc.collect()
+                if out_b is not None and out_b.height:
+                    frames.append(out_b)
+                del chunk, out_b
+                if (bi + 1) % 3 == 0:
+                    gc.collect()
+
+            del sub, batches
+            if (si + 1) % 2 == 0:
+                gc.collect()
+            if len(frames) >= 20:
+                frames = [pl.concat(frames, how="vertical")]
                 gc.collect()
 
         if not frames:
@@ -1312,6 +1353,8 @@ class RLSForecastRunner:
         del frames
         gc.collect()
         return out
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

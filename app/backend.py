@@ -2,7 +2,6 @@
 Backend de cálculos (sin Streamlit / sin Plotly).
 El dashboard solo visualiza lo que prepara dashboard_data.
 """
-
 from __future__ import annotations
 
 import datetime as dt
@@ -186,7 +185,9 @@ def build_label_maps(df: pl.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
     meta = df.select(cols).unique(subset=["unique_id"])
     uids = meta["unique_id"].to_list()
     descs = (
-        meta["sku_desc"].to_list() if "sku_desc" in meta.columns else [""] * len(uids)
+        meta["sku_desc"].to_list()
+        if "sku_desc" in meta.columns
+        else [""] * len(uids)
     )
     snames = (
         meta["store_name"].to_list()
@@ -237,7 +238,11 @@ def _scored_leaves(df: pl.DataFrame) -> pl.DataFrame:
     if "period_type" in leaves.columns:
         leaves = leaves.filter(pl.col("period_type") != "forecast_only")
     leaves = leaves.filter(
-        pl.col("y").is_not_null() & pl.col("yhat").is_not_null() & (pl.col("y") != 0)
+        pl.col("y").is_not_null()
+        & pl.col("yhat").is_not_null()
+        & pl.col("y").is_finite()
+        & pl.col("yhat").is_finite()
+        & (pl.col("y") != 0)
     )
     if leaves.height == 0:
         return leaves
@@ -249,9 +254,9 @@ def _scored_leaves(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("unique_id").str.split("||").list.get(0).alias("_seccion"),
         pl.col("unique_id").str.extract(r"\|\|S:([^|]+)", 1).alias("_sku"),
     ).with_columns(
-        pl.concat_str([pl.col("_seccion"), pl.lit("||S:"), pl.col("_sku")]).alias(
-            "_sku_uid"
-        )
+        pl.concat_str(
+            [pl.col("_seccion"), pl.lit("||S:"), pl.col("_sku")]
+        ).alias("_sku_uid")
     )
 
 
@@ -372,7 +377,9 @@ def wmape_bottom_up(
         .select(["unique_id", "wmape", "sum_y", "n_points", "n_with_sales"])
     )
 
-    return pl.concat([out_leaf, out_store, out_sec, out_sku], how="diagonal_relaxed")
+    return pl.concat(
+        [out_leaf, out_store, out_sec, out_sku], how="diagonal_relaxed"
+    )
 
 
 def wmape_por_id(
@@ -476,7 +483,6 @@ def wmape_scope_from_leaves(
         "sum_abs_error": sum_err,
         "n": leaves.height,
     }
-
 
 def ranking_table(
     tabla_base: pl.DataFrame,
@@ -613,7 +619,7 @@ def ranking_table(
                 uid_expr = pl.col("unique_id")
                 code_col = "_sku"
 
-    # Solo filas con rotación y wMAPE > 0; orden ascendente por wMAPE
+    # Solo filas con rotación y wMAPE > 0; orden ASCENDENTE por wMAPE (mejor primero)
     tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
     if tabla.height == 0:
         return empty
@@ -721,7 +727,9 @@ def metrics_in_out_bottom_up(
 
     leaves = leaves.filter(pl.col("_seccion") == str(seccion))
     if store is not None and sku is not None:
-        leaves = leaves.filter(pl.col("unique_id") == f"{seccion}||T:{store}||S:{sku}")
+        leaves = leaves.filter(
+            pl.col("unique_id") == f"{seccion}||T:{store}||S:{sku}"
+        )
     elif store is not None:
         leaves = leaves.filter(pl.col("_store_uid") == f"{seccion}||T:{store}")
     elif sku is not None:
@@ -757,9 +765,7 @@ def resolve_horizons(
     if isinstance(first_d, dt.datetime):
         first_d = first_d.date()
     hz = settings.section_horizons(seccion, first_d)
-    train_end = meta_date_from_df(
-        df_daily, "train_end", hz["train_end"], available_cols
-    )
+    train_end = meta_date_from_df(df_daily, "train_end", hz["train_end"], available_cols)
     test_start = meta_date_from_df(
         df_daily, "test_start", hz["test_start"], available_cols
     )
@@ -770,7 +776,9 @@ def resolve_horizons(
         hz.get("forecast_start", hz["test_end"] + dt.timedelta(days=1)),
         available_cols,
     )
-    if fcst_start is None or (isinstance(test_end, dt.date) and fcst_start <= test_end):
+    if fcst_start is None or (
+        isinstance(test_end, dt.date) and fcst_start <= test_end
+    ):
         fcst_start = test_end + dt.timedelta(days=1) if test_end else fcst_start
     fcst_end = meta_date_from_df(
         df_daily, "forecast_end", hz["forecast_end"], available_cols
@@ -816,7 +824,6 @@ def build_chart_series(
     hist, fcst = split_hist_forecast(
         df_view, test_end, forecast_start, forecast_end, has_period
     )
-
     def _col(df, name):
         if name in df.columns and df.height:
             return df[name].to_list()
@@ -838,7 +845,9 @@ def build_chart_series(
 def detail_view(df: pl.DataFrame) -> pl.DataFrame:
     cols = [c for c in DETAIL_COLUMNS if c in df.columns]
     if "abs_error" not in cols and "y" in df.columns and "yhat" in df.columns:
-        df = df.with_columns((pl.col("y") - pl.col("yhat")).abs().alias("abs_error"))
+        df = df.with_columns(
+            (pl.col("y") - pl.col("yhat")).abs().alias("abs_error")
+        )
         cols = [c for c in DETAIL_COLUMNS if c in df.columns]
     return df.select(cols)
 
@@ -854,6 +863,7 @@ def ds_range(df: pl.DataFrame) -> tuple[dt.date | None, dt.date | None]:
     return mn, mx
 
 
+
 def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
     """
     Formatea columnas numéricas para la UI:
@@ -865,15 +875,8 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
     num_cols = [
         c
         for c in (
-            "y",
-            "yhat",
-            "yhat28",
-            "value",
-            "valuehat",
-            "valuehat28",
-            "driver_effect",
-            "driver_effect_value",
-            "abs_error",
+            "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
+            "driver_effect", "driver_effect_value", "abs_error",
         )
         if c in df.columns
     ]
@@ -887,11 +890,14 @@ def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
             if v != v:  # NaN
                 return ""
             return f"{round(float(v)):,}"
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return ""
 
     exprs = [
-        pl.col(c).map_elements(_fmt, return_dtype=pl.Utf8).alias(c) for c in num_cols
+        pl.col(c)
+        .map_elements(_fmt, return_dtype=pl.Utf8)
+        .alias(c)
+        for c in num_cols
     ]
     return df.with_columns(exprs)
 
@@ -901,7 +907,9 @@ def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:
     if df_view.height == 0 or "yhat28" not in df_view.columns:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
     scored = df_view.filter(
-        pl.col("y").is_not_null() & (pl.col("y") != 0) & pl.col("yhat28").is_not_null()
+        pl.col("y").is_not_null()
+        & (pl.col("y") != 0)
+        & pl.col("yhat28").is_not_null()
     )
     if scored.height == 0:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}

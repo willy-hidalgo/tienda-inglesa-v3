@@ -667,6 +667,51 @@ def load_series_many(
     return pl.concat(chunks, how="diagonal_relaxed").sort("unique_id", "ds")
 
 
+
+def load_leaves_for_scope(
+    seccion: str,
+    store: str | None = None,
+    sku: str | None = None,
+    forecast_path: Path | None = None,
+    *,
+    unidad: str = "Unidades",
+    has_value: bool = False,
+) -> pl.DataFrame:
+    """
+    Hojas sku+tienda del alcance desde artefactos (métricas bottom-up).
+    """
+    adir = artifacts_dir(forecast_path)
+    sdir = _series_dir(adir)
+    part = sdir / f"seccion={seccion}" / "data.parquet"
+    if part.exists():
+        lf = pl.scan_parquet(part)
+    else:
+        legacy = _series_legacy_path(adir)
+        if not legacy.exists():
+            return pl.DataFrame()
+        lf = pl.scan_parquet(legacy).filter(
+            (pl.col("unique_id") == seccion)
+            | pl.col("unique_id").str.starts_with(f"{seccion}||")
+        )
+
+    lf = lf.filter(pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2)
+
+    if store is not None and sku is not None:
+        uid = f"{seccion}||T:{store}||S:{sku}"
+        lf = lf.filter(pl.col("unique_id") == uid)
+    elif store is not None:
+        prefix = f"{seccion}||T:{store}||"
+        lf = lf.filter(pl.col("unique_id").str.starts_with(prefix))
+    elif sku is not None:
+        needle = f"||S:{sku}"
+        lf = lf.filter(pl.col("unique_id").str.ends_with(needle))
+
+    df = lf.collect()
+    if df.height == 0:
+        return df
+    return backend.prepare_unit_df(df, unidad, has_value)
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
