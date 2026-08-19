@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-from forecasts import densify_section_panel
+from app.forecasting.panel import densify_section_panel
 import backend
 import settings
 

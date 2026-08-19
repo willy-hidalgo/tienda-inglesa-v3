@@ -10,7 +10,7 @@ Salida (junto al forecast.parquet, o en settings.DASHBOARD_DIR si existe):
     index.json              — secciones, tiendas, skus, horizontes, flags
                               (SIN label_map: va en labels.parquet)
     labels.parquet          — unique_id → label, description
-    metrics.parquet         — una fila por (unique_id, unidad); wMAPE = out-of-sample
+    metrics.parquet         — una fila por (unique_id, unidad)
     series/seccion=<s>/...  — panel slim particionado por sección
                               (predicate pushdown + menos I/O)
 
@@ -19,14 +19,13 @@ Uso:
   python -m app.dashboard_artifacts --forecast path/to/forecast.parquet
   from app.dashboard_artifacts import build_artifacts, load_index, load_metrics, load_series
 """
+
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -68,28 +67,6 @@ SERIES_COLS_PREFERRED = [
     "driver_effect_value",
 ]
 
-# Columnas mínimas para WMAPE (reduce picos de memoria al preparar unidades)
-_WMAPE_COLS = ("unique_id", "ds", "y", "yhat", "period_type", "value", "valuehat", "valuehat28")
-
-
-def _rss_mb() -> float:
-    try:
-        import psutil
-
-        return psutil.Process().memory_info().rss / (1024 * 1024)
-    except Exception:
-        return -1.0
-
-
-def _progress(msg: str, t0: float | None = None) -> None:
-    """Log de avance con timestamp relativo y RSS si está disponible."""
-    rss = _rss_mb()
-    mem = f" | RSS={rss:.0f} MB" if rss >= 0 else ""
-    if t0 is None:
-        logger.info("%s%s", msg, mem)
-    else:
-        logger.info("%s (%.1fs)%s", msg, time.perf_counter() - t0, mem)
-
 
 def artifacts_dir(forecast_path: Path | None = None) -> Path:
     """Directorio de artefactos. Prefer settings.DASHBOARD_DIR; si no, junto al parquet."""
@@ -125,11 +102,7 @@ def _series_legacy_path(adir: Path) -> Path:
 def artifacts_exist(forecast_path: Path | None = None) -> bool:
     adir = artifacts_dir(forecast_path)
     has_series = _series_dir(adir).is_dir() or _series_legacy_path(adir).exists()
-    return (
-        _index_path(adir).exists()
-        and _metrics_path(adir).exists()
-        and has_series
-    )
+    return _index_path(adir).exists() and _metrics_path(adir).exists() and has_series
 
 
 def _parse_uid_parts(uids: list[str]) -> pl.DataFrame:
@@ -160,94 +133,56 @@ def _parse_uid_parts(uids: list[str]) -> pl.DataFrame:
     )
 
 
-def _slim_for_wmape(df: pl.DataFrame) -> pl.DataFrame:
-    """Solo columnas necesarias para WMAPE — evita duplicar el panel completo."""
-    keep = [c for c in _WMAPE_COLS if c in df.columns]
-    return df.select(keep)
-
-
 def _wmape_table_for_unit(
     unit_df: pl.DataFrame,
     all_ids: list[str],
     unidad: str,
 ) -> pl.DataFrame:
-    """
-    Métricas por unique_id para una unidad (Valor o Unidades).
-
-    Un solo group_by sobre el panel completo (no un wmape_por_id por sección).
-    n_spine se asigna después por sección vía join.
-    """
-    empty = pl.DataFrame(
-        schema={
-            "unique_id": pl.Utf8,
-            "wmape": pl.Float64,
-            "sum_y": pl.Float64,
-            "n_points": pl.UInt32,
-            "n_with_sales": pl.UInt32,
-            "unidad": pl.Utf8,
-            "seccion": pl.Utf8,
-            "n_spine": pl.UInt32,
+    """Métricas por unique_id para una unidad (Valor o Unidades)."""
+    secciones = sorted(
+        {
+            settings.split_unique_id(u)["seccion"]
+            for u in all_ids
+            if settings.split_unique_id(u)["store"] is None
+            and settings.split_unique_id(u)["sku"] is None
         }
+        or {settings.split_unique_id(u)["seccion"] for u in all_ids}
     )
-    if unit_df.height == 0:
-        return empty
-
-    # Secciones: parseo una sola vez
-    sec_from_id = (
-        pl.DataFrame({"unique_id": all_ids})
-        .with_columns(
-            pl.col("unique_id").str.split("||").list.get(0).alias("seccion")
-        )
-        .unique()
-    )
-    secciones = (
-        sec_from_id.filter(~pl.col("unique_id").str.contains(r"\|\|", literal=False))
-        ["seccion"]
-        .unique()
-        .to_list()
-    )
-    if not secciones:
-        secciones = sec_from_id["seccion"].unique().to_list()
-
-    # n_spine por sección (settings + opcional override por datos)
-    spine_rows = []
+    parts: list[pl.DataFrame] = []
     for seccion in secciones:
+        candidatos = [
+            uid for uid in all_ids if uid == seccion or uid.startswith(f"{seccion}||")
+        ]
+        if not candidatos:
+            continue
         hz = settings.section_horizons(seccion)
         n_spine = (hz["forecast_end"] - hz["train_start"]).days + 1
-        spine_rows.append({"seccion": seccion, "n_spine": int(n_spine)})
-    spine_df = pl.DataFrame(spine_rows).with_columns(
-        pl.col("n_spine").cast(pl.UInt32)
-    )
-
-    # WMAPE de rankings = solo out-of-sample (única fuente de verdad en tablas).
-    # n_points se rellena después con n_spine de la sección.
-    tabla = backend.wmape_all_ids(
-        unit_df, n_fechas_spine=0, period_types=["out_sample"]
-    )
-    if tabla.height == 0:
-        return empty
-
-    tabla = (
-        tabla.join(sec_from_id, on="unique_id", how="left")
-        .join(spine_df, on="seccion", how="left")
-        .with_columns(
-            pl.col("n_spine").fill_null(0).alias("n_points"),
-            pl.lit(unidad).alias("unidad"),
+        n_data = backend.spine_n_fechas(unit_df, candidatos)
+        n_spine = max(n_spine, n_data)
+        tabla = backend.wmape_por_id(candidatos, unit_df, n_fechas_spine=n_spine)
+        if tabla.height == 0:
+            continue
+        parts.append(
+            tabla.with_columns(
+                pl.lit(unidad).alias("unidad"),
+                pl.lit(seccion).alias("seccion"),
+                pl.lit(int(n_spine)).cast(pl.UInt32).alias("n_spine"),
+            )
         )
-        .select(
-            [
-                "unique_id",
-                "wmape",
-                "sum_y",
-                "n_points",
-                "n_with_sales",
-                "unidad",
-                "seccion",
-                "n_spine",
-            ]
+    if not parts:
+        return pl.DataFrame(
+            schema={
+                "unique_id": pl.Utf8,
+                "wmape": pl.Float64,
+                "sum_y": pl.Float64,
+                "n_points": pl.UInt32,
+                "n_with_sales": pl.UInt32,
+                "unidad": pl.Utf8,
+                "seccion": pl.Utf8,
+                "n_spine": pl.UInt32,
+            }
         )
-    )
-    return tabla
+    return pl.concat(parts, how="diagonal_relaxed")
 
 
 def _build_pure_sku_series_vectorized(res_df: pl.DataFrame) -> pl.DataFrame:
@@ -299,9 +234,9 @@ def _build_pure_sku_series_vectorized(res_df: pl.DataFrame) -> pl.DataFrame:
         leaves.group_by(["_sec", "_sku", "ds"])
         .agg(aggs)
         .with_columns(
-            pl.concat_str(
-                [pl.col("_sec"), pl.lit("||S:"), pl.col("_sku")]
-            ).alias("unique_id"),
+            pl.concat_str([pl.col("_sec"), pl.lit("||S:"), pl.col("_sku")]).alias(
+                "unique_id"
+            ),
             # SKU puro no tiene store_name
             pl.lit(None).cast(pl.Utf8).alias("store_name")
             if "store_name" in res_df.columns
@@ -313,34 +248,6 @@ def _build_pure_sku_series_vectorized(res_df: pl.DataFrame) -> pl.DataFrame:
     return pure
 
 
-def _parts_from_ids(all_ids: list[str]) -> pl.DataFrame:
-    """Parseo vectorizado de unique_ids → seccion/store/sku/node_kind (una sola vez)."""
-    return (
-        pl.DataFrame({"unique_id": all_ids})
-        .with_columns(
-            pl.col("unique_id").str.split("||").list.get(0).alias("seccion"),
-            pl.when(pl.col("unique_id").str.contains(r"\|\|T:", literal=False))
-            .then(pl.col("unique_id").str.extract(r"\|\|T:([^|]+)", 1))
-            .otherwise(None)
-            .alias("store"),
-            pl.when(pl.col("unique_id").str.contains(r"\|\|S:", literal=False))
-            .then(pl.col("unique_id").str.extract(r"\|\|S:([^|]+)", 1))
-            .otherwise(None)
-            .alias("sku"),
-        )
-        .with_columns(
-            pl.when(pl.col("store").is_not_null() & pl.col("sku").is_not_null())
-            .then(pl.lit("tienda_sku"))
-            .when(pl.col("sku").is_not_null())
-            .then(pl.lit("sku"))
-            .when(pl.col("store").is_not_null())
-            .then(pl.lit("tienda"))
-            .otherwise(pl.lit("seccion"))
-            .alias("node_kind")
-        )
-    )
-
-
 def _build_index(
     res_df: pl.DataFrame,
     all_ids: list[str],
@@ -349,19 +256,8 @@ def _build_index(
     label_map: dict[str, str],
     desc_map: dict[str, str],
 ) -> dict[str, Any]:
-    """Index liviano: sin label_map/desc_map (van a labels.parquet). Vectorizado."""
-    parts = _parts_from_ids(all_ids)
-
-    # Secciones = nodos sin store ni sku
-    secciones = (
-        parts.filter(pl.col("node_kind") == "seccion")["seccion"]
-        .unique()
-        .sort()
-        .to_list()
-    )
-    if not secciones:
-        secciones = parts["seccion"].unique().sort().to_list()
-
+    """Index liviano: sin label_map/desc_map (van a labels.parquet)."""
+    secciones = backend.secciones_disponibles(all_ids)
     stores_by_sec: dict[str, list[str]] = {}
     skus_by_sec: dict[str, list[str]] = {}
     stores_for_sku: dict[str, dict[str, list[str]]] = {}
@@ -369,78 +265,34 @@ def _build_index(
     n_spine_by_sec: dict[str, int] = {}
     horizons_by_sec: dict[str, dict[str, str | None]] = {}
 
-    # Tiendas y SKUs por sección (nodos tienda / cualquier id con sku)
     for seccion in secciones:
-        sec_parts = parts.filter(pl.col("seccion") == seccion)
-        stores_by_sec[seccion] = (
-            sec_parts.filter(pl.col("node_kind") == "tienda")["store"]
-            .drop_nulls()
-            .unique()
-            .sort()
-            .to_list()
-        )
-        skus_by_sec[seccion] = (
-            sec_parts.filter(pl.col("sku").is_not_null())["sku"]
-            .unique()
-            .sort()
-            .to_list()
-        )
-
-        # Hojas: store×sku presentes
-        leaves = sec_parts.filter(pl.col("node_kind") == "tienda_sku")
-        if leaves.height:
-            # stores_for_sku[seccion][sku] = [stores…]
-            sfs: dict[str, list[str]] = {}
-            for row in (
-                leaves.group_by("sku")
-                .agg(pl.col("store").unique().sort().alias("stores"))
-                .iter_rows(named=True)
-            ):
-                sfs[str(row["sku"])] = [str(x) for x in row["stores"] if x is not None]
-            stores_for_sku[seccion] = sfs
-
-            # skus_for_store[seccion][store] = [skus…]
-            sft: dict[str, list[str]] = {}
-            for row in (
-                leaves.group_by("store")
-                .agg(pl.col("sku").unique().sort().alias("skus"))
-                .iter_rows(named=True)
-            ):
-                sft[str(row["store"])] = [str(x) for x in row["skus"] if x is not None]
-            skus_for_store[seccion] = sft
-        else:
-            stores_for_sku[seccion] = {}
-            skus_for_store[seccion] = {}
-
+        stores_by_sec[seccion] = backend.all_stores_in_section(all_ids, seccion)
+        skus_by_sec[seccion] = backend.all_skus_in_section(all_ids, seccion)
+        stores_for_sku[seccion] = {
+            sku: backend.stores_for_sku(all_ids, seccion, sku)
+            for sku in skus_by_sec[seccion]
+        }
+        skus_for_store[seccion] = {
+            store: backend.skus_for_store(all_ids, seccion, store)
+            for store in stores_by_sec[seccion]
+        }
         hz = settings.section_horizons(seccion)
         horizons_by_sec[seccion] = {
             k: (v.isoformat() if v is not None else None)
             for k, v in hz.items()
             if hasattr(v, "isoformat") or v is None
         }
-        sub = metrics.filter(pl.col("seccion") == seccion) if metrics.height else metrics
-        n_val = None
+        sub = metrics.filter(pl.col("seccion") == seccion)
         if sub.height and "n_spine" in sub.columns:
-            raw = sub["n_spine"][0]
-            if raw is not None:
-                try:
-                    n_val = int(raw)
-                except (TypeError, ValueError):
-                    n_val = None
-        if n_val is None or n_val <= 0:
-            n_val = (hz["forecast_end"] - hz["train_start"]).days + 1
-        n_spine_by_sec[seccion] = int(n_val)
+            n_spine_by_sec[seccion] = int(sub["n_spine"][0])
+        else:
+            n_spine_by_sec[seccion] = (hz["forecast_end"] - hz["train_start"]).days + 1
 
     cols = set(res_df.columns)
     has_value = "value" in cols and "valuehat" in cols
-    has_rolling28 = False
-    if "yhat28" in cols:
-        # sample cheap: null count vs height on a projection
-        has_rolling28 = res_df.select(pl.col("yhat28").null_count()).item() < res_df.height
-    if not has_rolling28 and "valuehat28" in cols:
-        has_rolling28 = (
-            res_df.select(pl.col("valuehat28").null_count()).item() < res_df.height
-        )
+    has_rolling28 = (
+        "yhat28" in cols and res_df.select("yhat28").drop_nulls().height > 0
+    ) or ("valuehat28" in cols and res_df.select("valuehat28").drop_nulls().height > 0)
 
     # labels para SKU puro virtuales
     for seccion, skus in skus_by_sec.items():
@@ -463,7 +315,9 @@ def _build_index(
     return {
         "version": 2,
         "forecast_path": str(forecast_path.resolve()),
-        "forecast_mtime": forecast_path.stat().st_mtime if forecast_path.exists() else 0.0,
+        "forecast_mtime": forecast_path.stat().st_mtime
+        if forecast_path.exists()
+        else 0.0,
         "secciones": secciones,
         "stores_by_sec": stores_by_sec,
         "skus_by_sec": skus_by_sec,
@@ -482,38 +336,19 @@ def _build_index(
     }
 
 
-def _clear_series_dir(sdir: Path) -> None:
-    if not sdir.exists():
-        return
-    for p in sdir.rglob("*.parquet"):
-        p.unlink()
-    for p in sorted(sdir.rglob("*"), reverse=True):
-        if p.is_dir():
-            try:
-                p.rmdir()
-            except OSError:
-                pass
-
-
-def _write_one_section_series(part: pl.DataFrame, sdir: Path, seccion: str) -> None:
-    """Escribe una partición seccion=<s>/data.parquet ordenada."""
-    out = sdir / f"seccion={seccion}"
-    out.mkdir(parents=True, exist_ok=True)
-    (
-        part.sort("unique_id", "ds")
-        .write_parquet(
-            out / "data.parquet",
-            compression="zstd",
-            compression_level=3,
-            statistics=True,
-        )
-    )
-
-
 def _write_series_partitioned(series: pl.DataFrame, adir: Path) -> None:
     """Escribe series/seccion=<s>/data.parquet ordenado por unique_id, ds."""
     sdir = _series_dir(adir)
-    _clear_series_dir(sdir)
+    if sdir.exists():
+        # limpiar particiones previas
+        for p in sdir.rglob("*.parquet"):
+            p.unlink()
+        for p in sorted(sdir.rglob("*"), reverse=True):
+            if p.is_dir():
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
     sdir.mkdir(parents=True, exist_ok=True)
 
     if series.height == 0:
@@ -525,6 +360,7 @@ def _write_series_partitioned(series: pl.DataFrame, adir: Path) -> None:
             pl.col("unique_id").str.split("||").list.get(0).alias("seccion")
         )
     else:
+        # rellenar nulls desde unique_id
         series = series.with_columns(
             pl.when(pl.col("seccion").is_null() | (pl.col("seccion") == ""))
             .then(pl.col("unique_id").str.split("||").list.get(0))
@@ -532,16 +368,19 @@ def _write_series_partitioned(series: pl.DataFrame, adir: Path) -> None:
             .alias("seccion")
         )
 
-    n_sec = series.select(pl.col("seccion").n_unique()).item()
-    _progress(f"  escribiendo series particionadas ({n_sec} secciones)…")
-    for i, (seccion, part) in enumerate(
-        series.partition_by("seccion", as_dict=True).items(), start=1
-    ):
+    for seccion, part in series.partition_by("seccion", as_dict=True).items():
         sec_val = seccion[0] if isinstance(seccion, tuple) else seccion
         sec_str = str(sec_val)
-        _write_one_section_series(part, sdir, sec_str)
-        if i == 1 or i % 5 == 0 or i == n_sec:
-            _progress(f"  serie sección {i}/{n_sec}: {sec_str} ({part.height:,} filas)")
+        out = sdir / f"seccion={sec_str}"
+        out.mkdir(parents=True, exist_ok=True)
+        (
+            part.sort("unique_id", "ds").write_parquet(
+                out / "data.parquet",
+                compression="zstd",
+                compression_level=3,
+                statistics=True,
+            )
+        )
 
 
 def _labels_df(label_map: dict[str, str], desc_map: dict[str, str]) -> pl.DataFrame:
@@ -563,106 +402,102 @@ def build_artifacts(
     """
     Lee forecast.parquet y materializa index + labels + metrics + series particionadas.
     Devuelve el directorio de artefactos.
-
-    Diseñado para datasets grandes:
-    - logs de avance por etapa + RSS
-    - paneles WMAPE slim (solo columnas necesarias)
-    - libera intermedios con gc
-    - index vectorizado (sin O(ids × skus) en Python)
-    - series escritas por sección
     """
-    t_all = time.perf_counter()
     fpath = Path(forecast_path or settings.FORECAST_PATH)
     if not fpath.exists():
         raise FileNotFoundError(f"No existe forecast: {fpath}")
 
     adir = Path(out_dir) if out_dir else artifacts_dir(fpath)
     adir.mkdir(parents=True, exist_ok=True)
-    _progress(f"Construyendo artefactos dashboard en {adir}")
-    _progress(f"Fuente: {fpath} ({fpath.stat().st_size / (1024**2):.1f} MB)")
+    logger.info("Construyendo artefactos dashboard en %s …", adir)
 
-    # ── 1. Carga ──────────────────────────────────────────────────────────
-    t = time.perf_counter()
-    _progress("1/6 Cargando forecast.parquet…")
     res_df = backend.load_forecast_parquet(fpath)
     all_ids = res_df["unique_id"].unique().to_list()
     cols = set(res_df.columns)
     has_value = "value" in cols and "valuehat" in cols
-    _progress(
-        f"1/6 Cargado: {res_df.height:,} filas, {len(all_ids):,} unique_ids, "
-        f"{len(cols)} cols",
-        t,
-    )
 
-    # ── 2. Labels ─────────────────────────────────────────────────────────
-    t = time.perf_counter()
-    _progress("2/6 Construyendo label_map / desc_map…")
     label_map, desc_map = backend.build_label_maps(res_df)
-    _progress(f"2/6 Labels: {len(label_map):,} ids", t)
 
-    # ── 3. Metrics (slim + liberar unit dfs) ───────────────────────────────
-    t = time.perf_counter()
-    _progress("3/6 Calculando metrics (WMAPE OOS bottom-up)…")
+    # ── metrics (unidades + valor si hay) ──────────────────────────────────
     metric_parts: list[pl.DataFrame] = []
-
-    slim = _slim_for_wmape(res_df)
-    _progress(f"  panel slim WMAPE: {slim.height:,} filas, {len(slim.columns)} cols")
-
-    unit_df_u = backend.prepare_unit_df(slim, "Unidades", has_value)
-    _progress("  WMAPE Unidades…")
+    unit_df_u = backend.prepare_unit_df(res_df, "Unidades", has_value)
     metric_parts.append(_wmape_table_for_unit(unit_df_u, all_ids, "Unidades"))
-    del unit_df_u
-    gc.collect()
-
     if has_value:
-        unit_df_v = backend.prepare_unit_df(slim, "Valor ($)", has_value)
-        _progress("  WMAPE Valor ($)…")
+        unit_df_v = backend.prepare_unit_df(res_df, "Valor ($)", has_value)
         metric_parts.append(_wmape_table_for_unit(unit_df_v, all_ids, "Valor ($)"))
-        del unit_df_v
-        gc.collect()
-
-    del slim
-    gc.collect()
-
     metrics = pl.concat([p for p in metric_parts if p.height], how="diagonal_relaxed")
-    del metric_parts
-    gc.collect()
 
     if metrics.height:
-        # unique_id se repite por unidad. parts_df 1 fila por uid.
-        parts_df = _parse_uid_parts(
-            metrics["unique_id"].unique().to_list()
-        ).unique(subset=["unique_id"])
+        parts_df = _parse_uid_parts(metrics["unique_id"].to_list())
         metrics = metrics.drop(
-            [c for c in ("store", "sku", "node_kind", "seccion") if c in metrics.columns]
+            [
+                c
+                for c in ("store", "sku", "node_kind", "seccion")
+                if c in metrics.columns
+            ]
         )
         metrics = metrics.join(parts_df, on="unique_id", how="left")
-        del parts_df
 
-    if metrics.height and "unidad" in metrics.columns:
-        metrics = metrics.unique(subset=["unique_id", "unidad"], keep="first")
-    elif metrics.height:
-        metrics = metrics.unique(subset=["unique_id"], keep="first")
-
-    _progress(f"3/6 Metrics: {metrics.height:,} filas", t)
-
-    # ── 4. Series slim + SKU puro ─────────────────────────────────────────
-    t = time.perf_counter()
-    _progress("4/6 Materializando series slim + SKU puro…")
+    # ── series slim + SKU puro vectorizado ────────────────────────────────
     keep = [c for c in SERIES_COLS_PREFERRED if c in res_df.columns]
     series = res_df.select(keep)
 
     pure = _build_pure_sku_series_vectorized(res_df)
-    pure_ids: list[str] = []
     if pure.height:
+        for c in keep:
+            if c not in pure.columns:
+                pure = pure.with_columns(pl.lit(None).alias(c))
+        pure = pure.select([c for c in keep if c in pure.columns])
+        # alinear columnas
         for c in keep:
             if c not in pure.columns:
                 pure = pure.with_columns(pl.lit(None).alias(c))
         pure = pure.select(keep)
         series = pl.concat([series, pure], how="diagonal_relaxed")
-        pure_ids = pure["unique_id"].unique().to_list()
-        _progress(f"  SKU puro: {len(pure_ids):,} ids, {pure.height:,} filas")
 
+        pure_ids = pure["unique_id"].unique().to_list()
+        pure_metric_parts: list[pl.DataFrame] = []
+        unit_specs: list[tuple[str, pl.DataFrame]] = [("Unidades", pure)]
+        if has_value and "value" in pure.columns and "valuehat" in pure.columns:
+            exprs = [pl.col("value").alias("y"), pl.col("valuehat").alias("yhat")]
+            if "valuehat28" in pure.columns:
+                exprs.append(pl.col("valuehat28").alias("yhat28"))
+            unit_specs.append(("Valor ($)", pure.with_columns(exprs)))
+        for unidad, pure_unit in unit_specs:
+            by_sec: dict[str, list[str]] = {}
+            for uid in pure_ids:
+                p = settings.split_unique_id(uid)
+                by_sec.setdefault(p["seccion"], []).append(uid)
+            for seccion, candidatos in by_sec.items():
+                hz = settings.section_horizons(seccion)
+                n_spine = (hz["forecast_end"] - hz["train_start"]).days + 1
+                sub = pure_unit.filter(pl.col("unique_id").is_in(candidatos))
+                if sub.height == 0:
+                    continue
+                tabla = backend.wmape_por_id(candidatos, sub, n_fechas_spine=n_spine)
+                if tabla.height == 0:
+                    continue
+                pure_metric_parts.append(
+                    tabla.with_columns(
+                        pl.lit(unidad).alias("unidad"),
+                        pl.lit(seccion).alias("seccion"),
+                        pl.lit(int(n_spine)).cast(pl.UInt32).alias("n_spine"),
+                    )
+                )
+        if pure_metric_parts:
+            pure_metrics = pl.concat(pure_metric_parts, how="diagonal_relaxed")
+            pure_parts = _parse_uid_parts(pure_metrics["unique_id"].to_list())
+            pure_metrics = pure_metrics.drop(
+                [
+                    c
+                    for c in ("store", "sku", "node_kind", "seccion")
+                    if c in pure_metrics.columns
+                ]
+            )
+            pure_metrics = pure_metrics.join(pure_parts, on="unique_id", how="left")
+            metrics = pl.concat([metrics, pure_metrics], how="diagonal_relaxed")
+
+        # labels SKU puro
         for uid in pure_ids:
             if uid not in label_map:
                 p = settings.split_unique_id(uid)
@@ -679,35 +514,12 @@ def build_artifacts(
                 desc_map[uid] = hit or settings.ranking_description(
                     uid, hit or None, None
                 )
-        del pure
-        gc.collect()
-    else:
-        del pure
 
-    # Ya no necesitamos el panel completo
-    n_rows_source = res_df.height
-    # Mantener res_df solo para flags has_rolling28 en index (proyección barata)
-    # → liberamos después de index
-    _progress(f"4/6 Series en memoria: {series.height:,} filas", t)
-
-    # ── 5. Index + labels ─────────────────────────────────────────────────
-    t = time.perf_counter()
-    _progress("5/6 Construyendo index + labels…")
+    # ── index + labels ────────────────────────────────────────────────────
     index = _build_index(res_df, all_ids, metrics, fpath, label_map, desc_map)
-    # Corregir n_rows_source por si res_df se usó antes de pure
-    index["n_rows_source"] = n_rows_source
     labels = _labels_df(label_map, desc_map)
-    del label_map, desc_map, all_ids
-    del res_df
-    gc.collect()
-    _progress(
-        f"5/6 Index: {len(index['secciones'])} secciones, labels={labels.height:,}",
-        t,
-    )
 
-    # ── 6. Write ──────────────────────────────────────────────────────────
-    t = time.perf_counter()
-    _progress("6/6 Escribiendo artefactos a disco…")
+    # ── write ─────────────────────────────────────────────────────────────
     _index_path(adir).write_text(
         json.dumps(index, ensure_ascii=False, indent=0), encoding="utf-8"
     )
@@ -717,21 +529,17 @@ def build_artifacts(
     metrics.write_parquet(
         _metrics_path(adir), compression="zstd", compression_level=3, statistics=True
     )
-    del labels, metrics
-    gc.collect()
-
     _write_series_partitioned(series, adir)
-    del series
-    gc.collect()
-
+    # eliminar legacy monolítico si existía
     legacy = _series_legacy_path(adir)
     if legacy.exists():
         legacy.unlink()
 
-    _progress(
-        f"✓ Artefactos listos: {len(index['secciones'])} secciones, "
-        f"series particionadas en {adir}",
-        t_all,
+    logger.info(
+        "✓ Artefactos: index (%d secciones), metrics (%d filas), series particionadas, labels (%d)",
+        len(index["secciones"]),
+        metrics.height,
+        labels.height,
     )
     return adir
 
@@ -841,9 +649,7 @@ def load_series_many(
             if not part.exists():
                 continue
             chunks.append(
-                pl.scan_parquet(part)
-                .filter(pl.col("unique_id").is_in(uids))
-                .collect()
+                pl.scan_parquet(part).filter(pl.col("unique_id").is_in(uids)).collect()
             )
     else:
         legacy = _series_legacy_path(adir)
@@ -856,50 +662,6 @@ def load_series_many(
     if not chunks:
         return pl.DataFrame()
     return pl.concat(chunks, how="diagonal_relaxed").sort("unique_id", "ds")
-
-
-def load_leaves_for_scope(
-    seccion: str,
-    store: str | None = None,
-    sku: str | None = None,
-    forecast_path: Path | None = None,
-    *,
-    unidad: str = "Unidades",
-    has_value: bool = False,
-) -> pl.DataFrame:
-    """
-    Hojas sku+tienda del alcance desde artefactos (métricas bottom-up).
-    """
-    adir = artifacts_dir(forecast_path)
-    sdir = _series_dir(adir)
-    part = sdir / f"seccion={seccion}" / "data.parquet"
-    if part.exists():
-        lf = pl.scan_parquet(part)
-    else:
-        legacy = _series_legacy_path(adir)
-        if not legacy.exists():
-            return pl.DataFrame()
-        lf = pl.scan_parquet(legacy).filter(
-            (pl.col("unique_id") == seccion)
-            | pl.col("unique_id").str.starts_with(f"{seccion}||")
-        )
-
-    lf = lf.filter(pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2)
-
-    if store is not None and sku is not None:
-        uid = f"{seccion}||T:{store}||S:{sku}"
-        lf = lf.filter(pl.col("unique_id") == uid)
-    elif store is not None:
-        prefix = f"{seccion}||T:{store}||"
-        lf = lf.filter(pl.col("unique_id").str.starts_with(prefix))
-    elif sku is not None:
-        needle = f"||S:{sku}"
-        lf = lf.filter(pl.col("unique_id").str.ends_with(needle))
-
-    df = lf.collect()
-    if df.height == 0:
-        return df
-    return backend.prepare_unit_df(df, unidad, has_value)
 
 
 def main(argv: list[str] | None = None) -> None:

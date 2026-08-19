@@ -35,7 +35,6 @@ class DemandAnalysisConfig:
     out_dir: Path
     focus_sections: list[str]
     analysis_end_date: dt.date
-    demo_mode: bool
 
     @classmethod
     def from_settings(cls) -> DemandAnalysisConfig:
@@ -49,7 +48,6 @@ class DemandAnalysisConfig:
             out_dir=Path(settings.OUT_DIR),
             focus_sections=list(settings.FOCUS_SECTIONS),
             analysis_end_date=max_end,
-            demo_mode=settings.DEMO_MODE,
         )
 
 
@@ -128,11 +126,7 @@ class SectionDemandSelector:
         self._focus_sections = focus_sections
         self._analysis_end_date = analysis_end_date
 
-    def select(self, df: pl.DataFrame, demo_mode) -> pl.DataFrame:
-
-        if demo_mode:
-            df = self.select_best_skus(df)
-
+    def select(self, df: pl.DataFrame) -> pl.DataFrame:
         by_sec = (
             df.group_by("SECCION")
             .agg(
@@ -151,113 +145,6 @@ class SectionDemandSelector:
         logger.info("Filas seleccionadas: %d", out.height)
         return out
 
-    @staticmethod
-    def select_best_skus(df: pl.DataFrame) -> pl.DataFrame:
-        best_skus = [
-            "412091",
-            "278120",
-            "39472",
-            "581783",
-            "580661",
-            "106356",
-            "459977",
-            "495933",
-            "516028",
-            "568160",
-            "46499",
-            "541427",
-            "41796",
-            "75048",
-            "58905",
-            "46853",
-            "567332",
-            "39472",
-            "85860",
-            "568161",
-            "483046",
-            "208",
-            "143871",
-            "489263",
-            "606556",
-            "64048",
-            "447684",
-            "568160",
-            "478352",
-            "43549",
-            "565871",
-            "2322",
-            "168765",
-            "190454",
-            "473932",
-            "42231",
-            "58905",
-            "456855",
-            "218557",
-            "568160",
-            "43422",
-            "127359",
-            "116741",
-            "100622",
-            "565118",
-            "46713",
-            "379145",
-            "6656",
-            "495933",
-            "61722",
-            "603595",
-            "195295",
-            "219991",
-            "587387",
-            "113618",
-            "514081",
-            "582947",
-            "333113",
-            "113618",
-            "501237",
-            "113618",
-            "218058",
-            "103986",
-            "71765",
-            "448634",
-            "113618",
-            "32757",
-            "45642",
-            "71765",
-            "197305",
-            "474665",
-            "28303",
-            "333110",
-            "197305",
-            "306915",
-            "593461",
-            "306915",
-            "218058",
-            "5898",
-            "392615",
-            "598287",
-            "600005",
-            "582946",
-            "45642",
-            "385301",
-            "519600",
-            "448849",
-            "17245",
-            "126196",
-            "25879",
-            "419464",
-            "523647",
-            "288718",
-            "466270",
-            "90052",
-            "306918",
-            "197305",
-            "566325",
-            "448848",
-            "590253",
-        ]
-
-        return df.filter(pl.col("SKU_ID").is_in(best_skus))
-
 
 class DemandAnalysisPipeline:
     def __init__(self, config: DemandAnalysisConfig | None = None):
@@ -268,7 +155,7 @@ class DemandAnalysisPipeline:
 
     def run(self) -> pl.DataFrame:
         df = SalesCatalogLoader(self._cfg).load()
-        df_common = self._selector.select(df, self._cfg.demo_mode)
+        df_common = self._selector.select(df)
         self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
         # Compresión zstd: lectura más rápida y archivo más pequeño
         df_common.write_parquet(

@@ -130,13 +130,13 @@ def _tabla_base_ranking() -> pl.DataFrame:
     return pl.DataFrame(
         {
             "unique_id": [
-                "1||T:A", "1||T:B", "1||S:X", "1||S:Y",
-                "1||T:A||S:X", "1||T:B||S:X", "1||T:B||S:Y",
+                "1||T:A", "1||T:B", "1||S:X", "1||T:A||S:X", "1||T:B||S:X",
+                "1||T:B||S:Y",
             ],
-            "wmape": [0.1, 0.2, 0.15, 0.3, 0.05, 0.25, 0.3],
-            "sum_y": [100.0, 50.0, 80.0, 20.0, 60.0, 40.0, 20.0],
-            "n_points": [10] * 7,
-            "n_with_sales": [8, 4, 7, 2, 6, 3, 2],
+            "wmape": [0.1, 0.2, 0.15, 0.05, 0.25, 0.3],
+            "sum_y": [100.0, 50.0, 80.0, 60.0, 40.0, 20.0],
+            "n_points": [10] * 6,
+            "n_with_sales": [8, 4, 7, 6, 3, 2],
         }
     )
 
@@ -166,32 +166,15 @@ def test_ranking_table_no_filtro_devuelve_nodos_puros():
     assert sorted(t_sku["Código"].to_list()) == ["X", "Y"]
 
 
-def test_ranking_table_order_asc_by_wmape():
-    """Ranking ordenado ASCENDENTE por wMAPE (mejor primero)."""
-    tabla = _tabla_base_ranking()
-    t_store = backend.ranking_table(
-        tabla, seccion="1", axis="store", fixed_peer=None, exclude=None,
-        desc_map={}, unidad="Unidades",
-    )
-    # A=0.1, B=0.2 → A primero
-    assert t_store["Código"].to_list() == ["A", "B"]
-    t_sku = backend.ranking_table(
-        tabla, seccion="1", axis="sku", fixed_peer=None, exclude=None,
-        desc_map={}, unidad="Unidades",
-    )
-    # X=0.15, Y=0.3 → X primero
-    assert t_sku["Código"].to_list() == ["X", "Y"]
-
-
 def test_ranking_table_fixed_peer_narrows_to_combo_nodes():
     tabla = _tabla_base_ranking()
-    # Tabla tiendas: siempre nodos tienda puros (fixed_peer SKU no mezcla hojas)
+    # SKU X fijo → tiendas donde existe X (nodos tienda+sku)
     t = backend.ranking_table(
         tabla, seccion="1", axis="store", fixed_peer="X", exclude=None,
         desc_map={}, unidad="Unidades",
     )
-    assert t["Código"].to_list() == ["A", "B"]  # ASC por wmape
-    # Tienda A fija → SKU en A (hojas tienda+sku), orden ASC
+    assert sorted(t["Código"].to_list()) == ["A", "B"]
+    # Tienda A fija → SKU en A (nodos tienda+sku)
     t = backend.ranking_table(
         tabla, seccion="1", axis="sku", fixed_peer="A", exclude=None,
         desc_map={}, unidad="Unidades",

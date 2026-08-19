@@ -1,13 +1,29 @@
-import math
+"""Public API for recursive least-squares regression."""
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
-from numba import jit
 from numba.core.registry import CPUDispatcher
-from numpy import exp, sqrt
 
+from rls_opt.kernels import (
+    RLSConvergenceError,
+    log_weighting,
+    numba_outer,
+    rls_in_sample_forecasts,
+    rls_kernel,
+    rls_out_of_sample_forecasts,
+    rls_predict_kernel,
+)
 from rls_opt.priors import RLSConstantPrior, RLSPrior, RLSPriorBase, RLSRelativePrior
+
+# Backwards-compatible private aliases for existing internal consumers.
+_rls = rls_kernel
+_log_weighting = log_weighting
+_rls_predict = rls_predict_kernel
+_numba_outer = numba_outer
+_rls_out_of_sample_forecasts = rls_out_of_sample_forecasts
+_rls_in_sample_forecasts = rls_in_sample_forecasts
 
 
 @dataclass
@@ -23,8 +39,6 @@ class RecursiveLeastSquaresRegression:
     all_coef_: list[np.ndarray] = field(default_factory=list, repr=False)
     errors: list[float] = field(default_factory=list, repr=False)
 
-    # TODO: Add xxt to return values. This value supplies the confidence of each coef value
-
     @property
     def all_coef(self) -> list[np.ndarray]:
         if not self.all_coef_:
@@ -33,30 +47,54 @@ class RecursiveLeastSquaresRegression:
             )
         return self.all_coef_
 
-    def _check_priors(self, priors: Sequence[RLSPriorBase]):
+    def _check_priors(self, priors: Sequence[RLSPriorBase]) -> None:
         num_constant_priors = sum(
             isinstance(prior, RLSConstantPrior) for prior in priors
         )
-        assert num_constant_priors <= 1
-        if num_constant_priors == 1:
-            assert isinstance(priors[0], RLSConstantPrior)
+        if num_constant_priors > 1:
+            raise ValueError("At most one RLSConstantPrior is supported")
+        if num_constant_priors == 1 and not isinstance(priors[0], RLSConstantPrior):
+            raise ValueError("RLSConstantPrior must be the first prior")
 
     def _check_inputs(
         self, x: np.ndarray, y: np.ndarray, priors: np.ndarray, xxt_inv: np.ndarray
     ) -> None:
-        assert x.ndim == 2
+        if x.ndim != 2:
+            raise ValueError("x must be a 2-dimensional array")
         num_rows, num_cols = x.shape
-        assert len(y) == num_rows
-        assert len(priors) == num_cols
+        if y.ndim != 1 or len(y) != num_rows:
+            raise ValueError("y must be 1-dimensional with one value per x row")
+        if len(priors) != num_cols:
+            raise ValueError("priors must contain one value per x column")
+        if xxt_inv.shape != (num_cols, num_cols):
+            raise ValueError("xxt_inv must be square with one row/column per feature")
 
-        if not np.isfinite(x).any():
-            raise ValueError("x is not finite, includes nan or inf")
-        if not np.isfinite(y).any():
-            raise ValueError("y is not finite, includes nan or inf")
-        if not np.isfinite(priors).any():
-            raise ValueError("priors is not finite, includes nan or inf")
-        if not np.isfinite(xxt_inv).any():
-            raise ValueError("xxt_inv is not finite, includes nan or inf")
+        for name, values in (
+            ("x", x),
+            ("y", y),
+            ("priors", priors),
+            ("xxt_inv", xxt_inv),
+        ):
+            if not np.isfinite(values).all():
+                raise ValueError(f"{name} is not finite, includes nan or inf")
+
+    @staticmethod
+    def _validate_solver_parameters(
+        forgetting_factor: float, min_y_to_update: float
+    ) -> None:
+        if not np.isfinite(forgetting_factor) or not 0.0 < forgetting_factor <= 1.0:
+            raise ValueError("forgetting_factor must be finite and satisfy 0 < value <= 1")
+        if not np.isfinite(min_y_to_update) or min_y_to_update <= 0.0:
+            raise ValueError("min_y_to_update must be finite and greater than 0")
+
+    @staticmethod
+    def _validate_metrics_flags(
+        in_sample_metrics: bool, out_sample_metrics: bool
+    ) -> None:
+        if in_sample_metrics or out_sample_metrics:
+            raise NotImplementedError(
+                "in_sample_metrics and out_sample_metrics are not implemented yet"
+            )
 
     def fit(
         self,
@@ -66,8 +104,8 @@ class RecursiveLeastSquaresRegression:
         in_sample_metrics: bool = False,
         out_sample_metrics: bool = False,
     ) -> None:
-        # TODO: Add support for `in_sample_metrics` and `out_sample_metrics`
-
+        self._validate_solver_parameters(self.forgetting_factor, self.min_y_to_update)
+        self._validate_metrics_flags(in_sample_metrics, out_sample_metrics)
         self._check_priors(priors)
 
         coeffs_0 = self._coefficient_seeds(x=x, y=y, priors=priors)
@@ -76,7 +114,7 @@ class RecursiveLeastSquaresRegression:
         if self.check_inputs:
             self._check_inputs(x=x, y=y, priors=coeffs_0, xxt_inv=xxt_inv_0)
 
-        coeffs, all_coeffs, errors = _rls(
+        coeffs, all_coeffs, errors = rls_kernel(
             x=x,
             y=y,
             priors=coeffs_0,
@@ -100,12 +138,14 @@ class RecursiveLeastSquaresRegression:
         in_sample_metrics: bool = False,
         out_sample_metrics: bool = False,
     ) -> None:
-        # TODO: Add support for `in_sample_metrics` and `out_sample_metrics`
-
-        assert x.ndim == 2
+        self._validate_metrics_flags(in_sample_metrics, out_sample_metrics)
+        if x.ndim != 2:
+            raise ValueError("x must be a 2-dimensional array")
         num_rows, num_cols = x.shape
-        assert len(y) == num_rows
-        assert len(priors) == num_cols
+        if y.ndim != 1 or len(y) != num_rows:
+            raise ValueError("y must be 1-dimensional with one value per x row")
+        if len(priors) != num_cols:
+            raise ValueError("priors must contain one value per x column")
 
         if indexors is None:
             indexors = [slice(None, None, None)]
@@ -121,17 +161,14 @@ class RecursiveLeastSquaresRegression:
         if indexors is None:
             indexors = [slice(None, None, None)]
 
+        if len(self.final_coef_) < len(indexors):
+            raise ValueError("Not enough fitted coefficient sets for the requested indexors")
+
         predictions = []
-        for i, indexors in enumerate(indexors):
-            predictions.append(_rls_predict(coeffs=self.final_coef_[i], x=x[indexors]))
+        for i, indexor in enumerate(indexors):
+            predictions.append(rls_predict_kernel(coeffs=self.final_coef_[i], x=x[indexor]))
 
         return predictions
-
-    def _in_sample_metrics(self):
-        pass
-
-    def _out_sample_metrics(self):
-        pass
 
     def _coefficient_seeds(self, x, y, priors: Sequence[RLSPriorBase]) -> np.ndarray:
         coefficients = []
@@ -141,12 +178,8 @@ class RecursiveLeastSquaresRegression:
             elif isinstance(prior, RLSRelativePrior):
                 coefficients.append(prior.coefficient_value(x[:, index]))
             elif isinstance(prior, RLSConstantPrior):
-                # Always will be the last prior
                 x_no_constants = x[:, 1:]
                 priors_no_constant = np.array(coefficients)[::-1]
-                # if (priors_no_constant!=0).sum() == 0: # si es todo cero
-                #     coefficients.append(1)
-                # else:
                 coefficients.append(
                     prior.coefficient_value(
                         x=x_no_constants, y=y, priors_coeffs=priors_no_constant
@@ -161,13 +194,6 @@ class RecursiveLeastSquaresRegression:
         priors: Sequence[RLSPriorBase],
         coefficient_seeds: np.ndarray,
     ) -> np.ndarray:
-        """
-
-        Returns
-        -------
-        xxt_inv_seed: np.ndarray of shape (num_cols, num_cols)
-
-        """
         xxt_inv_seed_diag = []
         for prior, coeff in zip(priors, coefficient_seeds):
             if isinstance(prior, RLSPrior):
@@ -175,295 +201,6 @@ class RecursiveLeastSquaresRegression:
             elif isinstance(prior, RLSRelativePrior):
                 xxt_inv_seed_diag.append(prior.standard_error_value(coeff))
             elif isinstance(prior, RLSConstantPrior):
-                # Always will be the last prior
                 xxt_inv_seed_diag.append(prior.standard_error_value(coeff))
 
         return np.diag(xxt_inv_seed_diag)
-
-
-class RLSConvergenceError(Exception):
-    def __init__(
-        self,
-        message="RLS Solver found an convergence error. Try increasing Forgetting Factor.",
-    ):
-        super().__init__(message)
-        self.message = message
-
-
-@jit(nopython=True, cache=True)
-def _rls(
-    x: np.ndarray,
-    y: np.ndarray,
-    priors: np.ndarray,
-    xxt_inv_seed: np.ndarray,
-    forgetting_factor: float = 1,
-    weighting_function: Callable[[float], float] | None = None,
-    return_all_coeffs: bool = False,
-    min_y_to_update: float = 1e-2,
-) -> tuple[np.ndarray, np.ndarray, list[float]]:
-    """Weighted Recursive Least Squares
-
-    Parameters
-    ----------
-    x : numpy array of shape (num_obs, num_vars)
-        Rows are observations (x[i, :] is observation i)
-
-        The ordering the rows of x is important as the influence of y[i], x[i] will be based on information already
-        learned from y[:i-1], x[:i-1, :]
-        For Example, with timeseries data, it is best to sort x and y by the time dimension in an ascending fashion.
-
-    y : numpy array of shape (num_obs, )
-        Values are realizations y[i] is realization i
-
-    priors : numpy array of shape (num_vars, )
-        TODO: Add doc
-
-    xxt_inv_seed : numpy array of shape (num_vars, num_vars)
-        TODO: Add doc
-
-    weighting_function: numba no python jit function that takes a float and returns a float
-        numba function  signature double(double) or f8(f8)
-        Commonly used functions:
-            sqrt(exp(x) / x)
-
-        TODO: Check weighting_function is proper function type:
-            Use weighting_function.nopython_signatures
-
-    return_all_coeffs: bool, optional. Default is False
-        Flag whether to return all learned
-
-    Returns
-    -------
-    priors : numpy array of shape (num_vars, )
-        Learned Coefficients after
-
-    """
-    assert x.ndim == 2
-    assert y.ndim == 1
-    assert priors.ndim == 1
-    assert xxt_inv_seed.ndim == 2
-
-    num_obs, num_vars = x.shape
-    assert len(y) == num_obs
-    assert len(priors) == num_vars
-    assert xxt_inv_seed.shape == (num_vars, num_vars)
-
-    assert 0.0 < forgetting_factor <= 1.0
-    assert min_y_to_update > 0.0
-
-    B = np.copy(
-        xxt_inv_seed
-    )  # We will refer to xxt_inv_seed as B in later steps to make code more readable:
-    coeffs = np.copy(priors)
-
-    all_coeffs = np.zeros_like(x, dtype=np.float64)
-
-    BxxtwB = np.empty((num_vars, num_vars))
-    oos_error = []
-    for i in range(num_obs):
-        y_i = y[i]
-
-        if y_i > min_y_to_update:
-            x_i = x[i, :]
-            z_i = _rls_predict(coeffs=coeffs, x=x_i)
-
-            if weighting_function is None:
-                xtwB = x_i @ B
-            else:
-                xtwB = (weighting_function(y_i) * x_i) @ B
-
-            Bx = B @ x_i
-            _numba_outer(
-                Bx, xtwB, BxxtwB
-            )  # Re-implement numpy.outer as inplace operation.
-            xtwBx: float = xtwB @ x_i
-            alpha = 1 / (forgetting_factor + xtwBx)
-
-            if math.isnan(alpha):
-                _N = 10000
-                print(
-                    "forgetting_factor of ~"
-                    + str(int(_N * forgetting_factor))
-                    + "/"
-                    + str(_N)
-                    + " is to small. Please increase forgetting_factor."
-                )
-                # We need to print here instead of including the error message in the RLSConvergenceError error as
-                # Numba requires all error message to be compile time constants. See
-                # http://numba.pydata.org/numba-doc/dev/reference/pysupported.html
-                raise RLSConvergenceError()
-
-            B -= alpha * BxxtwB
-            B /= forgetting_factor
-            oos_error.append(y_i - z_i)
-            coeffs += (alpha * (y_i - z_i)) * xtwB
-
-        if return_all_coeffs:
-            # The following for loop is equivalent to
-            # #all_coeffs[i, :] = coeffs
-            for j in range(num_vars):
-                all_coeffs[i, j] = coeffs[j]
-
-    return coeffs, all_coeffs, oos_error
-
-
-@jit(nopython=True, cache=True)
-def _log_weighting(x):
-    return sqrt(exp(x) / x)
-
-
-@jit(nopython=True, cache=True)
-def _rls_predict(coeffs: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """
-
-    Parameters
-    ----------
-    x
-    coeffs
-
-    Returns
-    -------
-
-    """
-    assert x.ndim in [1, 2]
-    assert coeffs.ndim == 1
-
-    if x.ndim == 1:
-        num_obs, num_vars = 1, len(x)
-    else:
-        num_obs, num_vars = x.shape
-
-    assert num_vars == len(coeffs)
-
-    return x @ coeffs
-
-
-@jit(nopython=True, cache=True)
-def _numba_outer(x1: np.ndarray, x2: np.ndarray, out: np.ndarray) -> None:
-    """Re-implements np.outer as an inplace operation at ~10x the speed of np.outer.
-
-    See np.outer for more details.
-    """
-    assert x1.ndim == 1
-    assert x2.ndim == 1
-    len_x1 = len(x1)
-    assert len_x1 == len(x2)
-    assert out.shape == (len_x1, len_x1)
-
-    for i in range(len_x1):
-        for j in range(len_x1):
-            out[i, j] = x1[i] * x2[j]
-
-
-@jit(nopython=True, cache=True)
-def _rls_out_of_sample_forecasts(
-    x: np.ndarray,
-    all_coeffs: np.ndarray,
-    ignore_first_n: int | None = None,
-    forecast_horizon: int = 12,
-) -> list[np.ndarray]:
-    """
-    Parameters
-    ----------
-    x : numpy array of shape (num_obs, num_vars)
-        Rows are observations (x[i, :] is observation i)
-
-        The ordering the rows of x is important as the influence of y[i], x[i] will be based on information already
-        learned from y[:i-1], x[:i-1, :]
-        For Example, with timeseries data, it is best to sort x and y by the time dimension in an ascending fashion.
-
-    all_coeffs : numpy array of shape (num_obs, num_vars)
-        Rows are the coefficients learned on data  (y[:i-1], x[:i-1])
-
-    ignore_first_n : int
-        Defaults to min(num_obs, num_vars)
-        Number of observations to skip before forecasts are calculated
-
-    forecast_horizon : int
-        Defaults to 12
-        Number of observations b
-
-    Returns
-    -------
-    out_of_sample_forecasts : List of num_obs numpy arrays.
-        out_of_sample_forecasts[j] will be forecasts j.
-
-            Therefore for:
-                i) k < ignore_first_n,
-                    the lists will be empty arrays as there are no forecasts.
-                ii) ignore_first_n <= j <= (num_obs-forecast_horizon),
-                    will be numpy arrays of shape (forecast_horizon,)
-                iii) j > num_obs-forecast_horizon
-                    will be numpy arrays of shape (num_obs - j + 1)
-
-        This allows you to access forecast of week j from week i (assuming they are valid according to the above logic)
-            at out_of_sample_forecasts[i][j-i].
-                In other words, based on our data from the first i weeks, our forecast for week j is
-                out_of_sample_forecasts[i][j-i]
-
-    """
-    assert x.ndim == 2
-    assert all_coeffs.ndim == 2
-
-    num_obs, num_vars = x.shape
-    assert all_coeffs.shape == (num_obs, num_vars)
-
-    if ignore_first_n is None:
-        ignore_first_n = min(num_vars, num_obs)
-    else:
-        assert ignore_first_n < num_obs
-
-    assert forecast_horizon < num_obs
-
-    forecasts = []
-    for coeff_index in range(num_obs):
-        index_forecasts = []
-
-        if coeff_index >= ignore_first_n:
-            index_coeffs = all_coeffs[coeff_index, :]
-            for horizon_index in range(
-                coeff_index, min(num_obs, coeff_index + forecast_horizon)
-            ):
-                x_i = x[horizon_index, :]
-                index_forecasts.append(_rls_predict(coeffs=index_coeffs, x=x_i))
-
-        forecasts.append(np.array(index_forecasts))
-
-    return forecasts
-
-
-def _rls_in_sample_forecasts(
-    x: np.ndarray, all_coeffs: np.ndarray, ignore_first_n: int | None = None
-) -> list[np.ndarray]:
-    """
-
-    Parameters
-    ----------
-    x
-    all_coeffs
-    ignore_first_n
-
-    Returns
-    -------
-
-    """
-    assert x.ndim == 2
-    assert all_coeffs.ndim == 2
-
-    num_obs, num_vars = x.shape
-    assert all_coeffs.shape == (num_obs, num_vars)
-
-    if ignore_first_n is None:
-        ignore_first_n = min(num_vars, num_obs)
-    else:
-        assert ignore_first_n < num_obs
-
-    forecasts = []
-    for coeff_index in range(num_obs):
-        if coeff_index >= ignore_first_n:
-            forecasts.append(
-                _rls_predict(all_coeffs[coeff_index, :], x[:coeff_index, :])
-            )
-        else:
-            forecasts.append(np.array([]))
-    return forecasts

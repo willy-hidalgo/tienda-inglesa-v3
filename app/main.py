@@ -23,7 +23,7 @@ import logging
 import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logging.basicConfig(
@@ -188,7 +188,7 @@ def build_default_options(project_root: Path) -> list[MenuOption]:
         MenuOption(
             "4",
             "construir artefactos dashboard (rápido)",
-            [python, str(app / "dashboard_artifacts.py")],
+            [python, str(app / "dashboard_artifacts")],
         ),
         MenuOption(
             "5",

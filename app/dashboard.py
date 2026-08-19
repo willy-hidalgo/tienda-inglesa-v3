@@ -96,13 +96,7 @@ def _cached_section_metrics(
     n_data = backend.spine_n_fechas(unit_df, candidatos)
     if n_data > n_spine:
         n_spine = n_data
-    # Rankings: wMAPE out-of-sample
-    tabla_base = backend.wmape_por_id(
-        candidatos,
-        unit_df,
-        n_fechas_spine=n_spine,
-        period_types=["out_sample"],
-    )
+    tabla_base = backend.wmape_por_id(candidatos, unit_df, n_fechas_spine=n_spine)
     return tabla_base, n_spine
 
 
@@ -484,8 +478,7 @@ st.subheader(f"{_header_label}: **{view.label}**")
 st.markdown("#### Ranking")
 st.caption(
     f"Sección **{view.seccion}** · Unidad: **{view.unidad}** · "
-    f"N puntos totales (spine): **{view.n_spine}** (~5 filas visibles, scroll). "
-    "wMAPE de ranking = **out-of-sample** (bottom-up hojas sku+tienda)."
+    f"N puntos totales (spine): **{view.n_spine}** (~5 filas visibles, scroll)."
 )
 
 
@@ -509,7 +502,7 @@ def _show_ranking(display, key: str, pending_key: str, extract_field: str) -> No
         column_config={
             "Código": st.column_config.TextColumn("Código"),
             "Descripción": st.column_config.TextColumn("Descripción"),
-            "N puntos": st.column_config.NumberColumn("N puntos (días ≠0)"),
+            "N puntos": st.column_config.NumberColumn("N puntos (≠0)"),
             "% ≠0": st.column_config.TextColumn("% ≠0"),
         },
     )
@@ -542,8 +535,7 @@ st.caption(
     f"Sección **{view.seccion}** · Train → {hz.get('train_end')} · "
     f"OOS [{hz.get('test_start')} → {hz.get('test_end')}] · "
     f"Solo-forecast [{hz.get('forecast_start')} → {hz.get('forecast_end')}]. "
-    "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
-    "OOS = period_type out_sample (misma definición que el ranking)."
+    "WMAPE = Σ|y−ŷ|/Σ|y| (excl. y=0)."
 )
 
 c1, c2, c3 = st.columns(3)
