@@ -1,28 +1,12 @@
-"""RLS forecasting runner: fit, prediction and SKU-store derivation."""
+"""RLS forecasting runner and leaf-level derivation."""
 from __future__ import annotations
-
-import gc
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import numpy as np
 import polars as pl
-
 import settings
-from app.forecasting.metrics import compute_wmape
-from app.forecasting.utils import stage_timer as _stage_timer
 from rls_opt import RecursiveLeastSquaresRegression, RLSConstantPrior, RLSPrior
-
-try:
-    from tqdm import tqdm
-except ImportError:  # pragma: no cover
-    class _NoOp:
-        def __init__(self, iterable=None, *a, **k): self._iterable = iterable
-        def __iter__(self): return iter(self._iterable if self._iterable is not None else [])
-        def update(self, n=1): pass
-        def set_postfix_str(self, *a, **k): pass
-        def close(self): pass
-    def tqdm(iterable=None, *a, **k): return _NoOp(iterable, *a, **k)
+from app.forecasting.metrics import compute_wmape
+from app.forecasting.robust_baseline import robust_baseline_forecast, validation_score as robust_validation_score, wmape_np
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +43,6 @@ class RLSForecastRunner:
 
     @staticmethod
     def _compute_wmape(res_df: pl.DataFrame) -> pl.DataFrame:
-        """Backward-compatible wrapper around the pure WMAPE metric."""
         return compute_wmape(res_df)
 
     @staticmethod
@@ -92,19 +75,18 @@ class RLSForecastRunner:
         if RecursiveLeastSquaresRegression is None:
             raise RuntimeError("rls_opt no disponible")
 
-        X_y = train_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
-        # X_y = train_g.select(self._driver_cols).to_numpy().astype(np.float32, order="C")
+        uid = str(train_g["unique_id"][0]) if "unique_id" in train_g.columns else "<unknown>"
+        X_y = self._finite_matrix(
+            train_g, self._driver_cols, uid=uid, stage="RLS fit y"
+        )
         y = train_g["y"].to_numpy()
         log_y = np.log1p(y)
         model_y = self._new_rls(self._min_y_to_update)
         priors_y = self._default_priors(len(self._driver_cols))
         model_y.fit(x=X_y, y=log_y, priors=priors_y)
 
-        X_p = (
-            train_g.select(self._driver_cols_price)
-            .to_numpy()
-            .astype(np.float64, order="C")
-            # .astype(np.float32, order="C")
+        X_p = self._finite_matrix(
+            train_g, self._driver_cols_price, uid=uid, stage="RLS fit value"
         )
         price = train_g["value"].to_numpy()
         log_price = np.log1p(np.clip(price, 0.0, None))
@@ -126,9 +108,8 @@ class RLSForecastRunner:
         if test_g.height == 0:
             return None
 
-        X_y_test = (
-            test_g.select(self._driver_cols).to_numpy().astype(np.float64, order="C")
-            # test_g.select(self._driver_cols).to_numpy().astype(np.float32, order="C")
+        X_y_test = self._finite_matrix(
+            test_g, self._driver_cols, uid=unique_id, stage="RLS predict y"
         )
         log_yhat_test = model_y.predict(X_y_test)
         if self._use_correction_factor:
@@ -137,11 +118,8 @@ class RLSForecastRunner:
         else:
             yhat_test = np.round(np.expm1(log_yhat_test)).ravel()
 
-        X_p_test = (
-            test_g.select(self._driver_cols_price)
-            .to_numpy()
-            .astype(np.float64, order="C")
-            # .astype(np.float32, order="C")
+        X_p_test = self._finite_matrix(
+            test_g, self._driver_cols_price, uid=unique_id, stage="RLS predict value"
         )
         log_pricehat = model_p.predict(X_p_test)
         if self._use_correction_factor:
@@ -184,6 +162,45 @@ class RLSForecastRunner:
 
     def _workers(self) -> int:
         return self._n_jobs if self._n_jobs and self._n_jobs > 1 else 1
+
+
+    @staticmethod
+    def _finite_matrix(
+        df: pl.DataFrame,
+        columns: list[str],
+        *,
+        uid: str,
+        stage: str,
+    ) -> np.ndarray:
+        """Build a finite float64 design matrix for RLS.
+
+        Non-finite driver cells are replaced with 0.0 and reported. This avoids
+        discarding an entire series because ASP/EDP/discount or another driver
+        produced NaN/±inf on intermittent/zero-sales days.
+        """
+        if not columns:
+            return np.empty((df.height, 0), dtype=np.float64)
+
+        matrix = df.select(columns).to_numpy().astype(np.float64, order="C")
+        finite = np.isfinite(matrix)
+        if finite.all():
+            return matrix
+
+        bad = ~finite
+        bad_by_col = {
+            col: int(bad[:, j].sum())
+            for j, col in enumerate(columns)
+            if bad[:, j].any()
+        }
+        logger.warning(
+            "%s %s: %d valores NaN/inf en drivers; imputando 0.0 | columnas=%s",
+            stage,
+            uid,
+            int(bad.sum()),
+            bad_by_col,
+        )
+        matrix[bad] = 0.0
+        return matrix
 
     # ── RLS sección / tienda ──────────────────────────────────────────────
     def fit_and_predict_sections(
@@ -249,47 +266,206 @@ class RLSForecastRunner:
         )
         return res_df, coefs
 
-    # ── SKU+tienda: efecto RLS seleccionado + SES no causal ───────────────
+    # ── Corrección de sesgo OOS / forecast ────────────────────────────────
+    @staticmethod
+    def apply_bias_correction(
+        res_df: pl.DataFrame,
+        *,
+        min_points: int | None = None,
+        clip: tuple[float, float] | None = None,
+        enabled: bool | None = None,
+    ) -> pl.DataFrame:
+        """
+        Escala ŷ en out_sample / forecast_only por el sesgo in-sample de cada serie.
+
+          factor_y = Σ y / Σ ŷ     (in_sample, y>0, ŷ>0, finitos)
+          factor_v = Σ value / Σ valuehat
+
+        - Solo se corrigen out_sample y forecast_only (in_sample queda crudo).
+        - Series con < min_points observaciones válidas → factor = 1.
+        - factor se recorta a `clip` para evitar explosiones en series sparse.
+        """
+        if enabled is None:
+            enabled = bool(getattr(settings, "BIAS_CORRECTION", True))
+        if not enabled or res_df.height == 0:
+            return res_df
+        if "period_type" not in res_df.columns or "unique_id" not in res_df.columns:
+            return res_df
+        if "yhat" not in res_df.columns or "y" not in res_df.columns:
+            return res_df
+
+        if min_points is None:
+            min_points = int(getattr(settings, "BIAS_CORRECTION_MIN_POINTS", 7))
+        if clip is None:
+            clip = tuple(getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)))
+        lo, hi = float(clip[0]), float(clip[1])
+
+        train = res_df.filter(pl.col("period_type") == "in_sample")
+        if train.height == 0:
+            return res_df
+
+        has_value = "value" in res_df.columns and "valuehat" in res_df.columns
+
+        # factor_y por unique_id
+        scored_y = train.filter(
+            pl.col("y").is_not_null()
+            & pl.col("yhat").is_not_null()
+            & pl.col("y").is_finite()
+            & pl.col("yhat").is_finite()
+            & (pl.col("y") > 0)
+            & (pl.col("yhat") > 0)
+        )
+        factors_y = (
+            scored_y.group_by("unique_id")
+            .agg(
+                pl.col("y").sum().alias("_sum_y"),
+                pl.col("yhat").sum().alias("_sum_yhat"),
+                pl.len().alias("_n"),
+            )
+            .with_columns(
+                pl.when((pl.col("_n") >= min_points) & (pl.col("_sum_yhat") > 0))
+                .then((pl.col("_sum_y") / pl.col("_sum_yhat")).clip(lo, hi))
+                .otherwise(1.0)
+                .alias("bias_factor_y")
+            )
+            .select(["unique_id", "bias_factor_y"])
+        )
+
+        if has_value:
+            scored_v = train.filter(
+                pl.col("value").is_not_null()
+                & pl.col("valuehat").is_not_null()
+                & pl.col("value").is_finite()
+                & pl.col("valuehat").is_finite()
+                & (pl.col("value") > 0)
+                & (pl.col("valuehat") > 0)
+            )
+            factors_v = (
+                scored_v.group_by("unique_id")
+                .agg(
+                    pl.col("value").sum().alias("_sum_v"),
+                    pl.col("valuehat").sum().alias("_sum_vhat"),
+                    pl.len().alias("_n"),
+                )
+                .with_columns(
+                    pl.when((pl.col("_n") >= min_points) & (pl.col("_sum_vhat") > 0))
+                    .then((pl.col("_sum_v") / pl.col("_sum_vhat")).clip(lo, hi))
+                    .otherwise(1.0)
+                    .alias("bias_factor_v")
+                )
+                .select(["unique_id", "bias_factor_v"])
+            )
+        else:
+            factors_v = pl.DataFrame(
+                schema={"unique_id": pl.Utf8, "bias_factor_v": pl.Float64}
+            )
+
+        # Base = todos los unique_id del resultado → left join de factores
+        factors = (
+            res_df.select("unique_id")
+            .unique()
+            .join(factors_y, on="unique_id", how="left")
+            .join(factors_v, on="unique_id", how="left")
+            .with_columns(
+                pl.col("bias_factor_y").fill_null(1.0),
+                pl.col("bias_factor_v").fill_null(1.0),
+            )
+        )
+
+        out = res_df.join(factors, on="unique_id", how="left").with_columns(
+            pl.col("bias_factor_y").fill_null(1.0),
+            pl.col("bias_factor_v").fill_null(1.0),
+        )
+
+        is_corr = pl.col("period_type").is_in(["out_sample", "forecast_only"])
+        if "modelo_seleccionado" in out.columns:
+            is_corr = is_corr & ~pl.col("modelo_seleccionado").cast(pl.Utf8).str.starts_with("baseline:")
+        exprs = [
+            pl.when(is_corr)
+            .then(
+                (pl.col("yhat") * pl.col("bias_factor_y"))
+                .clip(lower_bound=0.0)
+                .round(0)
+            )
+            .otherwise(pl.col("yhat"))
+            .alias("yhat"),
+        ]
+        if has_value:
+            exprs.append(
+                pl.when(is_corr)
+                .then(
+                    (pl.col("valuehat") * pl.col("bias_factor_v"))
+                    .clip(lower_bound=0.0)
+                    .round(2)
+                )
+                .otherwise(pl.col("valuehat"))
+                .alias("valuehat")
+            )
+        out = out.with_columns(exprs).drop(
+            [c for c in ("bias_factor_y", "bias_factor_v") if c in out.columns]
+        )
+        return out
+
+    # ── SKU+tienda: efecto RLS seleccionado + SES causal ──────────────────
     @staticmethod
     def _apply_ses(
         df: pl.DataFrame, src_col: str, out_col: str, alpha: float
     ) -> pl.DataFrame:
-        """
-        SES **no causal** por unique_id: s(t) = ewm_mean incluyendo y_neto(t)
-        (sin shift). La causalidad del pipeline la aportan los coeficientes
-        RLS (ajustados solo en train), no el suavizado del residuo.
+        """Causal SES for train and frozen residual state for OOS/forecast.
 
-        Filas forecast_only (sin actuals): se propaga el último estado SES
-        de la parte con actuals.
+        In-sample predictions are one-step-ahead: the state used at t contains
+        residuals only through t-1.  For out_sample/forecast_only, the state is
+        the *final raw SES state from train*, including the last train residual,
+        and remains frozen for the entire horizon.  This avoids both leakage
+        from OOS actuals and the former off-by-one state bug.
         """
         df = df.sort(["unique_id", "ds"])
         has_period = "period_type" in df.columns
-        is_actual = (
-            (pl.col("period_type") != "forecast_only") if has_period else pl.lit(True)
+        is_train = (
+            (pl.col("period_type") == "in_sample") if has_period else pl.lit(True)
         )
 
-        actual = df.filter(is_actual).with_columns(
-            pl.col(src_col)
-            .ewm_mean(alpha=alpha, adjust=False)
-            .over("unique_id")
-            .alias(out_col)
-        )
-        last_state = actual.group_by("unique_id").agg(
-            pl.col(out_col).last().alias("_last_s")
+        train = (
+            df.filter(is_train)
+            .with_columns(
+                pl.col(src_col)
+                .ewm_mean(alpha=alpha, adjust=False)
+                .over("unique_id")
+                .alias("_s_raw")
+            )
+            .with_columns(
+                pl.col("_s_raw")
+                .shift(1)
+                .over("unique_id")
+                .alias("_s_prev")
+            )
+            .with_columns(
+                pl.coalesce(pl.col("_s_prev"), pl.col(src_col))
+                .fill_null(0.0)
+                .alias(out_col)
+            )
         )
 
-        if has_period:
-            forecast = df.filter(~is_actual)
-            if forecast.height:
-                forecast = (
-                    forecast.join(last_state, on="unique_id", how="left")
-                    .with_columns(pl.col("_last_s").fill_null(0.0).alias(out_col))
-                    .drop("_last_s")
-                )
-                return pl.concat([actual, forecast], how="diagonal_relaxed").sort(
-                    ["unique_id", "ds"]
-                )
-        return actual.sort(["unique_id", "ds"])
+        if not has_period:
+            return train.drop(["_s_raw", "_s_prev"]).sort(["unique_id", "ds"])
+
+        # IMPORTANT: use raw final state, not the shifted one-step state.
+        last_state = train.group_by("unique_id").agg(
+            pl.col("_s_raw").last().alias("_last_s")
+        )
+        train = train.drop(["_s_raw", "_s_prev"])
+
+        future = df.filter(~is_train)
+        if future.height:
+            future = (
+                future.join(last_state, on="unique_id", how="left")
+                .with_columns(pl.col("_last_s").fill_null(0.0).alias(out_col))
+                .drop("_last_s")
+            )
+            return pl.concat([train, future], how="diagonal_relaxed").sort(
+                ["unique_id", "ds"]
+            )
+        return train.sort(["unique_id", "ds"])
 
     @staticmethod
     def _select_model_wmape(
@@ -299,58 +475,191 @@ class RLSForecastRunner:
         uid: np.ndarray,
         is_train: np.ndarray,
     ) -> dict[str, str]:
-        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}."""
+        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}.
+
+        Vectorizado con reduceat sobre grupos contiguos de uid (sin loop
+        Python por punto; solo un paso por serie).
+        """
         selection: dict[str, str] = {}
-        # Agrupar índices por uid (solo filas train con y != 0)
         mask = is_train & np.isfinite(y) & (y != 0)
         if not np.any(mask):
             for u in np.unique(uid):
                 selection[str(u)] = "seccion"
             return selection
 
-        # Ordenar por uid para barrido lineal
-        order = np.argsort(uid, kind="mergesort")
-        uid_s = uid[order]
-        y_s = y[order]
-        ys_s = yhat_sec[order]
-        yt_s = yhat_sto[order]
-        m_s = mask[order]
+        # Solo filas train con venta; ordenar por uid
+        idx = np.flatnonzero(mask)
+        uid_m = np.asarray(uid)[idx]
+        order = np.argsort(uid_m, kind="mergesort")
+        uid_s = uid_m[order]
+        y_s = np.asarray(y, dtype=np.float64)[idx][order]
+        ys_s = np.asarray(yhat_sec, dtype=np.float64)[idx][order]
+        yt_s = np.asarray(yhat_sto, dtype=np.float64)[idx][order]
 
-        n = len(uid_s)
-        i = 0
-        while i < n:
-            j = i + 1
-            while j < n and uid_s[j] == uid_s[i]:
-                j += 1
-            m = m_s[i:j]
-            if not np.any(m):
-                selection[str(uid_s[i])] = "seccion"
-                i = j
+        # Bordes de grupo
+        change = np.empty(len(uid_s), dtype=bool)
+        change[0] = True
+        change[1:] = uid_s[1:] != uid_s[:-1]
+        starts = np.flatnonzero(change)
+        # reduceat acumula por grupo
+        sum_abs_y = np.add.reduceat(np.abs(y_s), starts)
+        err_sec = np.add.reduceat(np.abs(y_s - ys_s), starts)
+        err_sto = np.add.reduceat(np.abs(y_s - yt_s), starts)
+        sum_y = np.add.reduceat(y_s, starts)
+        bias_sec = np.add.reduceat(ys_s - y_s, starts)
+        bias_sto = np.add.reduceat(yt_s - y_s, starts)
+
+        uids_grp = uid_s[starts]
+        for k, u in enumerate(uids_grp):
+            denom = float(sum_abs_y[k])
+            if denom == 0.0:
+                selection[str(u)] = "seccion"
                 continue
-            yy = y_s[i:j][m]
-            denom = float(np.abs(yy).sum())
-            if denom == 0:
-                selection[str(uid_s[i])] = "seccion"
-                i = j
-                continue
-            err_sec = float(np.abs(yy - ys_s[i:j][m]).sum())
-            err_sto = float(np.abs(yy - yt_s[i:j][m]).sum())
-            if err_sto < err_sec:
-                selection[str(uid_s[i])] = "tienda"
-            elif err_sto > err_sec:
-                selection[str(uid_s[i])] = "seccion"
+            es, et = float(err_sec[k]), float(err_sto[k])
+            if et < es:
+                selection[str(u)] = "tienda"
+            elif et > es:
+                selection[str(u)] = "seccion"
             else:
-                sum_y = float(yy.sum())
-                if sum_y == 0:
-                    selection[str(uid_s[i])] = "seccion"
+                sy = float(sum_y[k])
+                if sy == 0.0:
+                    selection[str(u)] = "seccion"
                 else:
-                    bias_sec = float((ys_s[i:j][m] - yy).sum()) / sum_y
-                    bias_sto = float((yt_s[i:j][m] - yy).sum()) / sum_y
-                    selection[str(uid_s[i])] = (
-                        "tienda" if abs(bias_sto) <= abs(bias_sec) else "seccion"
+                    selection[str(u)] = (
+                        "tienda"
+                        if abs(float(bias_sto[k]) / sy) <= abs(float(bias_sec[k]) / sy)
+                        else "seccion"
                     )
-            i = j
+
+        # Series sin puntos train con venta → sección por defecto
+        for u in np.unique(uid):
+            su = str(u)
+            if su not in selection:
+                selection[su] = "seccion"
         return selection
+
+    def _apply_leaf_guardrail(
+        self, block: pl.DataFrame, section_id: str
+    ) -> pl.DataFrame:
+        """Replace/clip weak leaf OOS forecasts using a leakage-free baseline.
+
+        A baseline is allowed to replace the RLS+SES candidate only when it
+        beats the model by a configurable margin on the recent train tail.
+        Regardless of replacement, future model forecasts are clipped to a
+        broad multiple of the robust baseline to prevent numerical explosions.
+        """
+        if not bool(getattr(settings, "LEAF_BASELINE_GUARDRAIL", True)):
+            return block
+        required = {"unique_id", "ds", "period_type", "y", "yhat"}
+        if block.height == 0 or not required.issubset(block.columns):
+            return block
+
+        method_map = getattr(settings, "LEAF_BASELINE_METHOD_BY_SECTION", {})
+        method = str(method_map.get(str(section_id), "median_pos56"))
+        val_days = int(getattr(settings, "LEAF_BASELINE_VALIDATION_DAYS", 28))
+        lookback = int(getattr(settings, "LEAF_BASELINE_LOOKBACK_DAYS", 56))
+        min_points = int(getattr(settings, "LEAF_BASELINE_MIN_VALID_POINTS", 7))
+        min_improvement = float(
+            getattr(settings, "LEAF_BASELINE_MIN_IMPROVEMENT", 0.03)
+        )
+        clip_lo, clip_hi = tuple(
+            getattr(settings, "LEAF_BASELINE_CLIP_RATIO", (0.35, 2.50))
+        )
+
+        out = block.sort(["unique_id", "ds"])
+        uids = np.asarray(out["unique_id"].to_list(), dtype=object)
+        periods = np.asarray(out["period_type"].to_list(), dtype=object)
+        dates = out["ds"].to_list()
+        y = out["y"].to_numpy().astype(np.float64, copy=False)
+        yhat = out["yhat"].to_numpy().astype(np.float64, copy=True)
+        model_labels = (
+            np.asarray(out["modelo_seleccionado"].to_list(), dtype=object)
+            if "modelo_seleccionado" in out.columns
+            else np.full(len(out), "rls_ses", dtype=object)
+        )
+
+        if len(uids) == 0:
+            return out
+        change = np.empty(len(uids), dtype=bool)
+        change[0] = True
+        change[1:] = uids[1:] != uids[:-1]
+        starts = np.flatnonzero(change)
+        ends = np.r_[starts[1:], len(uids)]
+
+        replaced = 0
+        clipped = 0
+        for a, b in zip(starts, ends):
+            p = periods[a:b]
+            train_local = np.flatnonzero(p == "in_sample")
+            future_local = np.flatnonzero(
+                (p == "out_sample") | (p == "forecast_only")
+            )
+            if train_local.size < max(val_days + 1, min_points + 1) or future_local.size == 0:
+                continue
+
+            yy = y[a:b]
+            yh = yhat[a:b]
+            dd = dates[a:b]
+            y_train = yy[train_local]
+            d_train = [dd[i] for i in train_local]
+            n_val = min(val_days, len(y_train) - 1)
+            if np.count_nonzero(y_train[-n_val:] > 0) < min_points:
+                continue
+
+            base_score = robust_validation_score(
+                y_train,
+                d_train,
+                method=method,
+                validation_days=n_val,
+                lookback_days=lookback,
+            )
+            model_score = wmape_np(
+                y_train[-n_val:], yh[train_local][-n_val:]
+            )
+            future_dates = [dd[i] for i in future_local]
+            base_future = robust_baseline_forecast(
+                y_train,
+                d_train,
+                future_dates,
+                method=method,
+                lookback_days=lookback,
+            )
+
+            target_idx = a + future_local
+            positive_base = base_future > 0
+            if np.any(positive_base):
+                lower = base_future * float(clip_lo)
+                upper = base_future * float(clip_hi)
+                before = yhat[target_idx].copy()
+                yhat[target_idx] = np.where(
+                    positive_base,
+                    np.clip(yhat[target_idx], lower, upper),
+                    yhat[target_idx],
+                )
+                clipped += int(np.count_nonzero(before != yhat[target_idx]))
+
+            if (
+                np.isfinite(base_score)
+                and np.isfinite(model_score)
+                and base_score <= model_score * (1.0 - min_improvement)
+            ):
+                yhat[target_idx] = np.maximum(0.0, np.round(base_future, 0))
+                model_labels[target_idx] = f"baseline:{method}"
+                replaced += 1
+
+        out = out.with_columns(
+            pl.Series("yhat", yhat).clip(lower_bound=0.0).round(0),
+            pl.Series("modelo_seleccionado", model_labels),
+        )
+        if replaced or clipped:
+            logger.info(
+                "Sección %s: guardrail leaf %s → %d series reemplazadas, %d puntos clip",
+                section_id,
+                method,
+                replaced,
+                clipped,
+            )
+        return out
 
     def derive_sku_store_forecasts(
         self,
@@ -367,21 +676,16 @@ class RLSForecastRunner:
         la reconstrucción del pronóstico ocurre EN LOG-SPACE:
 
           - Todos los períodos (in_sample / out_sample / forecast_only):
-              yhat = expm1(intercept + efecto + SES(log-residuo))
+              yhat = expm1(intercept + efecto + SES_causal(log-residuo))
 
         donde `residuo_log = log1p(y) − (intercept + efecto)`, e `intercept` +
         `efecto` provienen del modelo (sección o tienda) elegido por
-        `_select_model_wmape`. `_apply_ses` calcula el SES sobre TODO el
-        período con actuals (in_sample + out_sample) como una única serie
-        continua, así que `_y_neto_hat`/`_v_neto_hat` ya son válidos también
-        para in_sample: no hace falta (ni es correcto) usar la predicción
-        cruda `_yhat_rls`/`_valuehat_rls` del RLS de sección/tienda para esas
-        filas. Esa predicción cruda vive en la escala del AGREGADO (sección o
-        tienda), no en la de la hoja SKU+tienda, y usarla directamente en
-        in_sample producía un salto de escala de varios órdenes de magnitud
-        entre in_sample y OOS/forecast (yhat/valuehat in-sample en la escala
-        del agregado, OOS ya corregido por el SES). `_yhat_rls`/
-        `_valuehat_rls` se conservan solo como entrada de
+        `_select_model_wmape`. `_apply_ses` calcula el SES **causal** (shift 1)
+        sobre TODO el período con actuals (in_sample + out_sample) como una
+        única serie continua: s(t) solo usa residuales hasta t-1. Así el
+        pronóstico queda alineado en fecha con y(t) (sin adelanto de 1 día).
+
+        `_yhat_rls`/`_valuehat_rls` se conservan solo como entrada de
         `_select_model_wmape` (comparación sección vs. tienda), no como
         salida final.
 
@@ -457,20 +761,14 @@ class RLSForecastRunner:
         store_uids = panel.get_column("_store_uid").unique().to_list()
         frames: list[pl.DataFrame] = []
         has_period = "period_type" in panel.columns
+        # ~150k × 76 × float32 ≈ 45 MiB por matriz; configurable
+        max_rows = int(getattr(settings, "DERIVE_MAX_ROWS_PER_CHUNK", 150_000))
 
-        for si, store_uid in enumerate(store_uids):
-            # Liberar variables temporales explícitamente e invocar garbage collection si la tienda es muy grande
-            coef_store = store_coefs.get(store_uid)
-            if coef_store is None:
-                continue
-
-            sub = panel.filter(pl.col("_store_uid") == store_uid)
+        def _process_sub(sub: pl.DataFrame, coef_store) -> pl.DataFrame | None:
+            """Procesa un bloque (tienda completa o lote de SKUs)."""
             if sub.height == 0:
-                continue
-            elif sub.height > 500_000:
-                gc.collect()
+                return None
 
-            # Un solo to_numpy por bloque de drivers (Float32)
             X_y = np.ascontiguousarray(
                 sub.select(driver_cols).to_numpy(), dtype=np.float32
             )
@@ -478,25 +776,21 @@ class RLSForecastRunner:
                 sub.select(driver_cols_price).to_numpy(), dtype=np.float32
             )
             y = sub["y"].to_numpy().astype(np.float64, copy=False)
-            # y = sub["y"].to_numpy().astype(np.float32, copy=False)
             value = (
                 sub["value"].to_numpy().astype(np.float64, copy=False)
-                # sub["value"].to_numpy().astype(np.float32, copy=False)
                 if "value" in sub.columns
-                else np.zeros_like(y)
+                else np.zeros(len(y), dtype=np.float64)
             )
             uids = sub["unique_id"].to_numpy()
             if has_period:
                 periods = sub["period_type"].to_numpy()
                 is_train = periods == "in_sample"
             else:
-                periods = None
                 is_train = np.ones(len(y), dtype=bool)
 
             coef_y_sto = np.ascontiguousarray(coef_store[0], dtype=np.float32).ravel()
             coef_p_sto = np.ascontiguousarray(coef_store[1], dtype=np.float32).ravel()
 
-            # Predicciones completas RLS (auditoría + selección)
             yhat_sec = np.round(np.expm1(X_y @ coef_y_sec)).ravel()
             yhat_sto = np.round(np.expm1(X_y @ coef_y_sto)).ravel()
             valuehat_sec = np.round(np.expm1(X_p @ coef_p_sec), 2).ravel()
@@ -511,7 +805,6 @@ class RLSForecastRunner:
             yhat_rls = np.where(use_sto, yhat_sto, yhat_sec)
             valuehat_rls = np.where(use_sto, valuehat_sto, valuehat_sec)
 
-            # Efecto sin intercepto del modelo elegido (vistas, sin copiar X)
             effect_y = np.where(
                 use_sto,
                 X_y[:, idx_y] @ coef_y_sto[idx_y],
@@ -522,7 +815,6 @@ class RLSForecastRunner:
                 X_p[:, idx_p] @ coef_p_sto[idx_p],
                 X_p[:, idx_p] @ coef_p_sec_fx,
             )
-            # Interceptos del modelo log seccionado por serie (uno por fila).
             intercept_y = np.where(
                 use_sto,
                 coef_y_sto[intercept_idx_y],
@@ -535,10 +827,6 @@ class RLSForecastRunner:
             )
             del X_y, X_p
 
-            # Residuo EN LOG-SPACE (modelo RLS ajustado sobre log1p):
-            #   log1p(y) − (intercept + efecto de drivers)
-            # Antes se restaba effect (log-space) de y (lineal), lo que producía
-            # un "y_neto" incoherente y pronósticos 0/negativos en OOS/fcst.
             with np.errstate(divide="ignore", invalid="ignore"):
                 log_y = np.log1p(np.clip(y, 0.0, None))
                 log_v = np.log1p(np.clip(value, 0.0, None))
@@ -567,25 +855,12 @@ class RLSForecastRunner:
             )
             del yhat_sec, yhat_sto, valuehat_sec, valuehat_sto
             del yhat_rls, valuehat_rls, effect_y, effect_v, intercept_y, intercept_v
+            del y, value, use_sto, log_y, log_v, log_resid_y, log_resid_v
 
             block = self._apply_ses(block, "_y_neto", "_y_neto_hat", alpha)
             block = self._apply_ses(block, "_v_neto", "_v_neto_hat", alpha)
 
             if has_period:
-                # Reconstrucción en log-space: expm1(intercept + efecto + SES(residuo)).
-                # Se aplica IGUAL para in_sample/out_sample/forecast_only.
-                #
-                # Antes, in_sample usaba directamente `_yhat_rls` (predicción cruda
-                # del RLS de sección/tienda, ajustado sobre el y/value AGREGADO de
-                # ese nivel). Esa predicción vive en la escala del agregado
-                # (sección o tienda), no en la escala de la hoja SKU+tienda, y por
-                # eso el gráfico mostraba yhat/valuehat in-sample varios órdenes de
-                # magnitud por encima de los actuals, con un salto abrupto al pasar
-                # a OOS (que sí usaba la reconstrucción con SES).
-                # `_y_neto_hat`/`_v_neto_hat` ya están definidos para in_sample y
-                # out_sample por igual (`_apply_ses` trata todo el período con
-                # actuals como una sola serie continua), así que no hace falta
-                # ninguna rama especial: usar la misma fórmula corrige la escala.
                 block = block.with_columns(
                     (
                         (
@@ -631,9 +906,81 @@ class RLSForecastRunner:
                 )
                 if c in block.columns
             ]
-            frames.append(block.drop(drop_tmp))
-            del sub, block, y, value, use_sto
-            if (si + 1) % 5 == 0:
+            out_b = block.drop(drop_tmp)
+            out_b = self._apply_leaf_guardrail(out_b, section_id)
+            del block
+            return out_b
+
+        for si, store_uid in enumerate(store_uids):
+            coef_store = store_coefs.get(store_uid)
+            if coef_store is None:
+                continue
+
+            sub = panel.filter(pl.col("_store_uid") == store_uid)
+            if sub.height == 0:
+                continue
+
+            if sub.height <= max_rows:
+                batches = [sub]
+            else:
+                uid_list = sub.get_column("unique_id").unique().to_list()
+                n_uid = len(uid_list)
+                avg = max(1, sub.height // max(1, n_uid))
+                batch_uids = max(1, max_rows // avg)
+                batches = [
+                    sub.filter(pl.col("unique_id").is_in(uid_list[i : i + batch_uids]))
+                    for i in range(0, n_uid, batch_uids)
+                ]
+                logger.info(
+                    "  tienda %s: %d filas / %d SKU → %d lotes (≤%d filas)",
+                    store_uid,
+                    sub.height,
+                    n_uid,
+                    len(batches),
+                    max_rows,
+                )
+
+            for bi, chunk in enumerate(batches):
+                out_b = None
+                try:
+                    out_b = _process_sub(chunk, coef_store)
+                except Exception as e:
+                    msg = str(e)
+                    is_mem = isinstance(e, MemoryError) or (
+                        "Unable to allocate" in msg
+                        or "ArrayMemoryError" in type(e).__name__
+                    )
+                    if not is_mem:
+                        raise
+                    logger.warning(
+                        "MemoryError %s lote %d (%d filas); fallback SKU a SKU: %s",
+                        store_uid,
+                        bi,
+                        chunk.height,
+                        msg[:120],
+                    )
+                    for one_uid in chunk.get_column("unique_id").unique().to_list():
+                        one = chunk.filter(pl.col("unique_id") == one_uid)
+                        try:
+                            part = _process_sub(one, coef_store)
+                        except Exception as e2:
+                            logger.error("SKU %s omitido: %s", one_uid, e2)
+                            part = None
+                        if part is not None and part.height:
+                            frames.append(part)
+                        del one, part
+                        gc.collect()
+                if out_b is not None and out_b.height:
+                    frames.append(out_b)
+                del chunk, out_b
+                if (bi + 1) % 3 == 0:
+                    gc.collect()
+
+            del sub, batches
+            if (si + 1) % 2 == 0:
+                gc.collect()
+            if len(frames) >= 20:
+                frames = [pl.concat(frames, how="vertical")]
                 gc.collect()
 
         if not frames:

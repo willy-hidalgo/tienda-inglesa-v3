@@ -1,4 +1,4 @@
-"""Forecasting configuration."""
+"""Forecast configuration contract."""
 
 from __future__ import annotations
 

@@ -1,12 +1,13 @@
-"""Hierarchical aggregation for forecasting."""
+"""Hierarchical Polars aggregation."""
 
 from __future__ import annotations
 
 import polars as pl
 
 import settings
+from app.forecasting.utils import _collect_streaming as collect_streaming
+from app.forecasting.utils import _lf_columns as lf_columns
 
-from .utils import collect_streaming, lf_columns
 
 class DataAggregator:
     """

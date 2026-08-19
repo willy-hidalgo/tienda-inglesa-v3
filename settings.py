@@ -2,11 +2,21 @@
 Configuración central del proyecto de forecasting jerárquico RLS.
 Secciones 1 y 23 · niveles: sección → SKU → local (tienda).
 """
+
 from __future__ import annotations
 
 import datetime as dt
 import os
 from pathlib import Path
+
+# ── Flag de modelo a nivel hoja ──────────────────────────────────────────────
+DEMO_MODE = True  # os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# Corrección de sesgo OOS/forecast: factor = Σy/Σŷ en in_sample (por unique_id).
+# Se aplica solo a out_sample y forecast_only (in_sample queda crudo).
+BIAS_CORRECTION: bool = True
+BIAS_CORRECTION_MIN_POINTS: int = 7
+BIAS_CORRECTION_CLIP: tuple[float, float] = (0.5, 2.0)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rutas (ancladas al propio archivo → independientes del cwd)
@@ -40,23 +50,36 @@ TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
 ROLLING_HORIZON_DAYS = 28  # yhat28 / valuehat28 walk-forward
 COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat28
-                             # (el dashboard detecta la ausencia de estas
-                             # columnas en el parquet para ocultar el control
-                             # de selección de series y la sección de métricas
-                             # rolling28; ver README § Rolling 28d). Desde el
-                             # cambio de arquitectura (RLS solo a nivel
-                             # sección), el rolling28 SOLO se calcula para los
-                             # nodos de sección — ver README § Modelo jerárquico.
+# (el dashboard detecta la ausencia de estas
+# columnas en el parquet para ocultar el control
+# de selección de series y la sección de métricas
+# rolling28; ver README § Rolling 28d). Desde el
+# cambio de arquitectura (RLS solo a nivel
+# sección), el rolling28 SOLO se calcula para los
+# nodos de sección — ver README § Modelo jerárquico.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Modelo jerárquico: RLS solo a nivel sección; tienda/sku/tienda+sku se
 # derivan sin RLS (efecto de drivers + suavización exponencial sobre el
 # residuo). Ver README § Modelo jerárquico para el detalle del método.
 # ─────────────────────────────────────────────────────────────────────────────
-SES_ALPHA = 0.1  # alpha fijo de la suavización exponencial simple (SES)
-                 # aplicada sobre "y_neto" (y menos el efecto de los drivers
-                 # de la sección) para obtener yhat en nodos tienda/sku/
-                 # tienda+sku. Fijo (no auto-tuneado) por velocidad.
+SES_ALPHA: float = 0.2  # 0.20  # residual SES: valor conservador; 0.74 era demasiado reactivo en backtest
+OOS_FREEZE_RESIDUAL_STATE: bool = True
+LEAF_BASELINE_GUARDRAIL: bool = True
+LEAF_BASELINE_METHOD_BY_SECTION: dict[str, str] = {
+    "1": "median_pos56",
+    "23": "weekday_pos8",
+}
+LEAF_BASELINE_VALIDATION_DAYS: int = 28
+LEAF_BASELINE_LOOKBACK_DAYS: int = 56
+LEAF_BASELINE_MIN_VALID_POINTS: int = 7
+LEAF_BASELINE_MIN_IMPROVEMENT: float = 0.03
+LEAF_BASELINE_CLIP_RATIO: tuple[float, float] = (0.35, 2.50)
+USE_SES: bool = True
+
+# aplicada sobre "y_neto" (y menos el efecto de los drivers
+# de la sección) para obtener yhat en nodos tienda/sku/
+# tienda+sku. Fijo (no auto-tuneado) por velocidad.
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
 FECHAS_TEST = (TEST_START, TEST_END)
@@ -185,6 +208,13 @@ HOLIDAYS = {
         "window_after_days": 2,
         "active": 1,
     },
+    "promo_feb": {
+        "month": 2,
+        "day": 17,
+        "window_before_days": 2,
+        "window_after_days": 2,
+        "active": 1,
+    },
     "promo_mar": {
         "month": 3,
         "day": 12,
@@ -192,11 +222,50 @@ HOLIDAYS = {
         "window_after_days": 5,
         "active": 1,
     },
+    "promo_abr": {
+        "month": 4,
+        "day": 22,
+        "window_before_days": 2,
+        "window_after_days": 1,
+        "active": 1,
+    },
+    "promo_abr_2": {
+        "month": 4,
+        "day": 30,
+        "window_before_days": 1,
+        "window_after_days": 1,
+        "active": 1,
+    },
+    "promo_may": {
+        "rule": "1nd_sunday_may",
+        "relative_ocurrence": 1,
+        "absolute_weekday": 7,
+        "absolute_month": 5,
+        "window_before_days": 2,
+        "window_after_days": 2,
+        "active": 1,
+    },
+    "promo_may_2": {
+        "rule": "4nd_sunday_may",
+        "relative_ocurrence": 4,
+        "absolute_weekday": 7,
+        "absolute_month": 5,
+        "window_before_days": 2,
+        "window_after_days": 2,
+        "active": 1,
+    },
     "promo_sep": {
         "month": 9,
         "day": 3,
         "window_before_days": 1,
         "window_after_days": 15,
+        "active": 1,
+    },
+    "promo_oct": {
+        "month": 10,
+        "day": 1,
+        "window_before_days": 1,
+        "window_after_days": 1,
         "active": 1,
     },
     "promo_nov": {
@@ -293,8 +362,7 @@ def section_horizons(seccion: str, first_data: dt.date | None = None) -> dict:
     forecast_end = cfg.get("forecast_end") or (
         test_end + dt.timedelta(days=METRIC_HORIZON_DAYS)
     )
-    if forecast_end < forecast_start:
-        forecast_end = forecast_start
+    forecast_end = max(forecast_end, forecast_start)
     return {
         "train_start": train_start,
         "train_end": train_end,

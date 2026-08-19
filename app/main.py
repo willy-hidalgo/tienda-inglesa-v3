@@ -23,7 +23,7 @@ import logging
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logging.basicConfig(
@@ -82,7 +82,7 @@ class PipelineCLI:
         """Pregunta workers; Enter conserva el default."""
         default = self._default_n_jobs
         hint = f" [{default}]" if default else " [secuencial]"
-        raw = input(f"Nº de procesos paralelos para RLS (--n-jobs){hint}: ").strip()
+        raw = input(f"Nº de threads paralelos para RLS (--n-jobs){hint}: ").strip()
         if not raw:
             return default
         try:
@@ -134,7 +134,7 @@ class PipelineCLI:
             self._render_menu()
             try:
                 choice = self._prompt_choice()
-            except EOFError, KeyboardInterrupt:
+            except (EOFError, KeyboardInterrupt):
                 print("\nSaliendo...")
                 return
 
@@ -188,7 +188,7 @@ def build_default_options(project_root: Path) -> list[MenuOption]:
         MenuOption(
             "4",
             "construir artefactos dashboard (rápido)",
-            [python, str(app / "dashboard_artifacts")],
+            [python, str(app / "dashboard_artifacts.py")],
         ),
         MenuOption(
             "5",
@@ -215,7 +215,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Workers para forecasts RLS (ProcessPool). "
+            "Workers para forecasts RLS (threads por tienda). "
             "También: env FORECAST_N_JOBS. Default: secuencial."
         ),
     )

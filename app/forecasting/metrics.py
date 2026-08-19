@@ -1,11 +1,9 @@
-"""Forecasting evaluation metrics.
-
-Pure metric functions extracted from the forecasting runner.
-"""
+"""Forecast accuracy metrics."""
 
 from __future__ import annotations
 
 import polars as pl
+
 
 def compute_wmape(res_df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -44,9 +42,7 @@ def compute_wmape(res_df: pl.DataFrame) -> pl.DataFrame:
         & (pl.col("y") != 0)
     )
     if "period_type" in leaves.columns:
-        leaves = leaves.filter(
-            pl.col("period_type").is_in(["in_sample", "out_sample"])
-        )
+        leaves = leaves.filter(pl.col("period_type").is_in(["in_sample", "out_sample"]))
     else:
         leaves = leaves.with_columns(pl.lit("in_sample").alias("period_type"))
 

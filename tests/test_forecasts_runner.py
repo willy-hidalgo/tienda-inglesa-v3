@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-from forecasts import RLSForecastRunner
+from app.forecasting.runner import RLSForecastRunner
 
 try:
     from rls_opt import RecursiveLeastSquaresRegression
@@ -33,17 +33,22 @@ except ImportError:  # pragma: no cover
     RecursiveLeastSquaresRegression = None
 
 
-def _manual_ses(values: list[float], alpha: float) -> list[float]:
-    """Referencia en Python puro de la SES no causal (ewm_mean adjust=False):
-    s_t = alpha*x_t + (1-alpha)*s_{t-1}, con s_0 = x_0. El pronóstico es s_t
-    (incluye la observación actual; la causalidad del pipeline la aportan los
-    coeficientes RLS ajustados solo en train, no el suavizado del residuo)."""
-    s = []
+def _manual_ses_raw(values: list[float], alpha: float) -> list[float]:
+    """Estado SES raw que incorpora la observación actual."""
+    states = []
     prev = None
     for x in values:
         prev = x if prev is None else alpha * x + (1 - alpha) * prev
-        s.append(prev)
-    return s
+        states.append(prev)
+    return states
+
+
+def _manual_ses_causal(values: list[float], alpha: float) -> list[float]:
+    """One-step-ahead: en t usa el estado disponible al cierre de t-1."""
+    raw = _manual_ses_raw(values, alpha)
+    if not raw:
+        return []
+    return [values[0]] + raw[:-1]
 
 
 def test_apply_ses_matches_manual_recursion():
@@ -57,7 +62,7 @@ def test_apply_ses_matches_manual_recursion():
         }
     )
     out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", alpha)
-    expected = _manual_ses(values, alpha)
+    expected = _manual_ses_causal(values, alpha)
     assert out.sort("ds")["_x_hat"].to_list() == pytest.approx(expected, rel=1e-9, abs=1e-9)
 
 
@@ -76,8 +81,8 @@ def test_apply_ses_two_series_independent():
     out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", 0.2)
     got_a = out.filter(pl.col("unique_id") == "a").sort("ds")["_x_hat"].to_list()
     got_b = out.filter(pl.col("unique_id") == "b").sort("ds")["_x_hat"].to_list()
-    assert got_a == pytest.approx(_manual_ses(vals_a, 0.2))
-    assert got_b == pytest.approx(_manual_ses(vals_b, 0.2))
+    assert got_a == pytest.approx(_manual_ses_causal(vals_a, 0.2))
+    assert got_b == pytest.approx(_manual_ses_causal(vals_b, 0.2))
 
 
 def test_apply_ses_forecast_only_holds_state_constant():
@@ -95,13 +100,32 @@ def test_apply_ses_forecast_only_holds_state_constant():
     df = pl.DataFrame({"unique_id": ["a"] * len(dates), "ds": dates, "_x": values, "period_type": period_types})
     out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", alpha).sort("ds")
 
-    s = _manual_ses(actual_vals, alpha)
+    s = _manual_ses_raw(actual_vals, alpha)
     forecast_hat = out.filter(pl.col("period_type") == "forecast_only")["_x_hat"].to_list()
     assert forecast_hat == pytest.approx([s[-1]] * n_forecast, rel=1e-9, abs=1e-9)
 
     actual_hat = out.filter(pl.col("period_type") != "forecast_only")["_x_hat"].to_list()
-    assert actual_hat == pytest.approx(s, rel=1e-9, abs=1e-9)
+    assert actual_hat == pytest.approx(_manual_ses_causal(actual_vals, alpha), rel=1e-9, abs=1e-9)
 
+
+def test_apply_ses_out_sample_does_not_update_state():
+    """OOS completo debe usar solo información disponible al final del train."""
+    train_vals = [10.0, 12.0, 8.0, 15.0]
+    oos_vals = [999.0, -500.0, 250.0]
+    alpha = 0.25
+    dates = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(7)]
+    df = pl.DataFrame(
+        {
+            "unique_id": ["a"] * 7,
+            "ds": dates,
+            "_x": train_vals + oos_vals,
+            "period_type": ["in_sample"] * 4 + ["out_sample"] * 3,
+        }
+    )
+    out = RLSForecastRunner._apply_ses(df, "_x", "_x_hat", alpha).sort("ds")
+    expected_state = _manual_ses_raw(train_vals, alpha)[-1]
+    got = out.filter(pl.col("period_type") == "out_sample")["_x_hat"].to_list()
+    assert got == pytest.approx([expected_state] * 3, rel=1e-9, abs=1e-9)
 
 def test_derive_sku_store_matches_manual_reference():
     """

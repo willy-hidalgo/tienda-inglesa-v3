@@ -1,4 +1,4 @@
-"""Calendar and holiday feature engineering."""
+"""Calendar and retail feature engineering."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import datetime as dt
 
 import polars as pl
 
-from .calendar import HolidayCalendar
+from app.forecasting.calendar import HolidayCalendar
+
 
 class CalendarFeatureBuilder:
     _RAMP_HOLIDAYS = {"mothers_day", "fathers_day"}

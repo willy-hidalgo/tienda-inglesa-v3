@@ -1,13 +1,11 @@
-"""Holiday calendar construction for forecasting features."""
+"""Holiday calendar for forecasting."""
 
 from __future__ import annotations
 
 import datetime as dt
-import logging
 
 from dateutil.easter import easter
 
-logger = logging.getLogger(__name__)
 
 class HolidayCalendar:
     _YEARS_BACK = 6

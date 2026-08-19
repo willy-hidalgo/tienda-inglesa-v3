@@ -1,14 +1,15 @@
-"""End-to-end forecasting pipeline orchestration."""
+"""Forecast pipeline orchestration."""
+
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import numpy as np
 import polars as pl
+from tqdm import tqdm
 
 import settings
 from app.forecasting.aggregation import DataAggregator
@@ -17,23 +18,11 @@ from app.forecasting.config import ForecastConfig
 from app.forecasting.features import CalendarFeatureBuilder
 from app.forecasting.panel import densify_section_panel
 from app.forecasting.runner import RLSForecastRunner
-from app.forecasting.utils import collect_streaming as _collect_streaming
-from app.forecasting.utils import lf_columns as _lf_columns
-from app.forecasting.utils import stage_timer as _stage_timer
+from app.forecasting.utils import _collect_streaming, _lf_columns, _stage_timer
 from rls_opt.edp import decompose_price
 
-try:
-    from tqdm import tqdm
-except ImportError:  # pragma: no cover
-    class _NoOp:
-        def __init__(self, iterable=None, *a, **k): self._iterable = iterable
-        def __iter__(self): return iter(self._iterable if self._iterable is not None else [])
-        def update(self, n=1): pass
-        def set_postfix_str(self, *a, **k): pass
-        def close(self): pass
-    def tqdm(iterable=None, *a, **k): return _NoOp(iterable, *a, **k)
-
 logger = logging.getLogger(__name__)
+
 
 class RLSForecastPipeline:
     def __init__(
@@ -131,7 +120,11 @@ class RLSForecastPipeline:
         end: dt.date,
         template: pl.DataFrame,
     ) -> pl.DataFrame:
-        """Genera filas ds para [start, end] por unique_id (y=0). Grid vía np.repeat/tile."""
+        """Genera filas ds para [start, end] por unique_id (y=0, value=0).
+
+        No incluye asp/edp/discount: se rellenan después con carry-forward
+        desde train/OOS vía `_carry_forward_prices`.
+        """
         n_days = (end - start).days + 1
         n_uid = len(unique_ids)
         if n_days <= 0 or n_uid == 0:
@@ -165,6 +158,61 @@ class RLSForecastPipeline:
             pl.lit(1).cast(pl.Int8).alias("intercept"),
             pl.lit(0).cast(pl.UInt32).alias("conteo_sku"),
         )
+
+    @staticmethod
+    def _carry_forward_prices(
+        history: pl.DataFrame, grid: pl.DataFrame
+    ) -> pl.DataFrame:
+        """
+        Propaga el último estado de precio (asp / edp / discount) por unique_id
+        al grid de forecast-only.
+
+        Sin esto el RLS recibe precio=0 en el tramo sin actuals y el nivel de
+        yhat se infla (elasticidad a precio → demanda artificialmente alta).
+
+        Regla: último día con y>0 de cada serie; si no hay ventas, último día
+        con asp/edp no nulo; si tampoco, 0.
+        """
+        price_cols = [c for c in ("asp", "edp", "discount") if c in history.columns]
+        if grid.height == 0:
+            return grid
+        if not price_cols or history.height == 0:
+            return grid.with_columns(
+                [pl.lit(0.0).alias(c) for c in ("asp", "edp", "discount")]
+            )
+
+        cols = ["unique_id", "ds"] + price_cols
+        if "y" in history.columns:
+            cols.append("y")
+        hist = history.select([c for c in cols if c in history.columns])
+
+        if "y" in hist.columns:
+            with_sales = hist.filter(pl.col("y") > 0)
+            base = with_sales if with_sales.height else hist
+        else:
+            base = hist
+
+        # Preferir filas con algún precio observado > 0
+        priced = base.filter(
+            pl.any_horizontal(
+                [(pl.col(c).is_not_null() & (pl.col(c) > 0)) for c in price_cols]
+            )
+        )
+        if priced.height:
+            base = priced
+
+        last = (
+            base.sort("ds")
+            .group_by("unique_id")
+            .agg([pl.col(c).last().alias(c) for c in price_cols])
+        )
+        out = grid.join(last, on="unique_id", how="left")
+        out = out.with_columns([pl.col(c).fill_null(0.0) for c in price_cols])
+        # Columnas de precio que no estaban en history (defensa)
+        for c in ("asp", "edp", "discount"):
+            if c not in out.columns:
+                out = out.with_columns(pl.lit(0.0).alias(c))
+        return out
 
     @staticmethod
     def _calculate_edp_per_series(df: pl.DataFrame) -> pl.DataFrame:
@@ -418,7 +466,7 @@ class RLSForecastPipeline:
                 ).sort("ds")
             logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
 
-        # ── Forecast-only (calendario sintético) ───────────────────────────────
+        # ── Forecast-only (calendario sintético + carry-forward de precios) ───
         uids = df_train["unique_id"].unique().to_list()
         fcst_start = hz["forecast_start"]
         fcst_end = hz["forecast_end"]
@@ -433,6 +481,29 @@ class RLSForecastPipeline:
                 uids, fcst_start, fcst_end, df_train
             )
             if df_fcst_raw.height:
+                # Historial de precios: train + OOS (si hay). Sin esto asp/edp/
+                # discount quedan en 0 y el RLS infla el nivel de yhat.
+                price_history = df_train
+                if df_oos.height:
+                    price_history = pl.concat(
+                        [df_train, df_oos], how="diagonal_relaxed"
+                    )
+                df_fcst_raw = self._carry_forward_prices(price_history, df_fcst_raw)
+                n_with_price = (
+                    int(
+                        df_fcst_raw.filter((pl.col("edp") > 0) | (pl.col("asp") > 0))[
+                            "unique_id"
+                        ].n_unique()
+                    )
+                    if "edp" in df_fcst_raw.columns
+                    else 0
+                )
+                logger.info(
+                    "Sección %s: carry-forward precios → %d/%d series con edp/asp>0",
+                    seccion,
+                    n_with_price,
+                    len(uids),
+                )
                 df_fcst = self._feature_builder.extract_drivers(
                     df_fcst_raw.with_columns(pl.lit(1).alias("intercept")),
                     req_columns=driver_cols,
@@ -601,62 +672,118 @@ class RLSForecastPipeline:
             if store_results
             else pl.DataFrame()
         )
+        print("\n")
         logger.info(
             "Sección %s: %d filas de pronósticos a nivel tienda",
             seccion,
             res_store.height,
         )
 
-        # ── 3) Derivación SKU+tienda (train+OOS+fcst; tienda a tienda) ────────
+        # ── 3) SKU+tienda ─────────────────────────────────────────────────────
+        # USE_SES=True  → efecto(coefs sección/tienda elegidos) + SES causal
+        # USE_SES=False → RLS puro por serie sku+tienda (igual que sección/tienda)
         res_derived = pl.DataFrame()
         is_sku_store = (
             pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2
         )
-        # Filtrar SKU+tienda ANTES de concat para no inflar el panel
-        parts_sku: list[pl.DataFrame] = []
-        tr = df_train.filter(is_sku_store)
-        if tr.height:
-            parts_sku.append(tr.with_columns(pl.lit("in_sample").alias("period_type")))
-        if df_oos.height:
-            oo = df_oos.filter(is_sku_store)
-            if oo.height:
-                parts_sku.append(
-                    oo.with_columns(pl.lit("out_sample").alias("period_type"))
-                )
-        if df_fcst.height:
-            fc = df_fcst.filter(is_sku_store)
-            if fc.height:
-                parts_sku.append(
-                    fc.with_columns(pl.lit("forecast_only").alias("period_type"))
-                )
+        use_ses = bool(getattr(settings, "USE_SES", True))
 
-        if parts_sku and section_coefs and store_coefs:
-            sku_level = pl.concat(parts_sku, how="diagonal_relaxed")
-            del parts_sku
-            if meta:
-                sku_level = sku_level.with_columns(
-                    [pl.lit(v).alias(k) for k, v in meta.items()]
+        if use_ses:
+            # Filtrar SKU+tienda ANTES de concat para no inflar el panel
+            parts_sku: list[pl.DataFrame] = []
+            tr = df_train.filter(is_sku_store)
+            if tr.height:
+                parts_sku.append(
+                    tr.with_columns(pl.lit("in_sample").alias("period_type"))
                 )
-            logger.info(
-                "Sección %s: %d filas SKU+tienda (train+OOS+fcst)",
-                seccion,
-                sku_level.height,
-            )
-            with _stage_timer(f"{seccion}: derivación SKU+tienda (por tienda)"):
-                res_derived = runner.derive_sku_store_forecasts(
-                    sku_level,
+            if df_oos.height:
+                oo = df_oos.filter(is_sku_store)
+                if oo.height:
+                    parts_sku.append(
+                        oo.with_columns(pl.lit("out_sample").alias("period_type"))
+                    )
+            if df_fcst.height:
+                fc = df_fcst.filter(is_sku_store)
+                if fc.height:
+                    parts_sku.append(
+                        fc.with_columns(pl.lit("forecast_only").alias("period_type"))
+                    )
+
+            if parts_sku and section_coefs and store_coefs:
+                sku_level = pl.concat(parts_sku, how="diagonal_relaxed")
+                del parts_sku
+                if meta:
+                    sku_level = sku_level.with_columns(
+                        [pl.lit(v).alias(k) for k, v in meta.items()]
+                    )
+                logger.info(
+                    "Sección %s: %d filas SKU+tienda (train+OOS+fcst) [USE_SES=True]",
                     seccion,
-                    section_coefs,
-                    store_coefs,
+                    sku_level.height,
                 )
-            del sku_level
-            logger.info(
-                "Sección %s: %d filas derivadas SKU+tienda",
-                seccion,
-                res_derived.height,
-            )
+                with _stage_timer(f"{seccion}: derivación SKU+tienda SES (por tienda)"):
+                    res_derived = runner.derive_sku_store_forecasts(
+                        sku_level,
+                        seccion,
+                        section_coefs,
+                        store_coefs,
+                    )
+                del sku_level
+                logger.info(
+                    "Sección %s: %d filas derivadas SKU+tienda (SES)",
+                    seccion,
+                    res_derived.height,
+                )
+            else:
+                del parts_sku
         else:
-            del parts_sku
+            # RLS puro a nivel sku+tienda (mismo camino que sección / tienda)
+            train_sku = df_train.filter(is_sku_store)
+            sku_ids = (
+                train_sku.get_column("unique_id").unique().to_list()
+                if train_sku.height
+                else []
+            )
+            if sku_ids:
+                targets_sku = {
+                    name: df.filter(is_sku_store) for name, df in targets.items()
+                }
+                logger.info(
+                    "Sección %s: RLS puro SKU+tienda (%d series) [USE_SES=False]",
+                    seccion,
+                    len(sku_ids),
+                )
+                with _stage_timer(f"{seccion}: RLS sku+tienda ({len(sku_ids)} series)"):
+                    res_sku, _sku_coefs = runner.fit_and_predict_sections(
+                        train_sku,
+                        targets_sku,
+                        sku_ids,
+                        desc=f"{seccion} RLS sku+tienda",
+                        meta=meta,
+                    )
+                if res_sku.height:
+                    res_derived = res_sku.with_columns(
+                        pl.when(pl.col("period_type") == "forecast_only")
+                        .then(0.0)
+                        .otherwise(pl.col("y"))
+                        .alias("y"),
+                        pl.when(pl.col("period_type") == "forecast_only")
+                        .then(0.0)
+                        .otherwise(pl.col("value"))
+                        .alias("value"),
+                        pl.lit(None).cast(pl.Float64).alias("driver_effect"),
+                        pl.lit(None).cast(pl.Float64).alias("driver_effect_value"),
+                        pl.lit("rls_propio").alias("modelo_seleccionado"),
+                    )
+                logger.info(
+                    "Sección %s: %d filas RLS puro SKU+tienda",
+                    seccion,
+                    res_derived.height,
+                )
+            else:
+                logger.warning(
+                    "Sección %s: sin series sku+tienda para RLS puro", seccion
+                )
 
         # ── Combinar resultados ────────────────────────────────────────────────
         res_df = pl.concat(
@@ -666,24 +793,43 @@ class RLSForecastPipeline:
         if not res_df.height:
             return pl.DataFrame(), pl.DataFrame(), driver_cols
 
+        # Corrección de sesgo OOS/forecast (factor in-sample por unique_id)
+        if getattr(settings, "BIAS_CORRECTION", True):
+            with _stage_timer(f"{seccion}: bias correction OOS"):
+                res_df = RLSForecastRunner.apply_bias_correction(res_df)
+            logger.info(
+                "Sección %s: bias correction OOS aplicada (min_points=%s, clip=%s)",
+                seccion,
+                getattr(settings, "BIAS_CORRECTION_MIN_POINTS", 7),
+                getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)),
+            )
+
         wmapes_df = RLSForecastRunner._compute_wmape(res_df)
         return res_df, wmapes_df, driver_cols
 
     def run(self) -> tuple[pl.DataFrame, pl.DataFrame]:
+        active_sections = list(settings.FOCUS_SECTIONS)
+        total_steps = 2 + len(active_sections)  # carga + cada sección + consolidación
         stages = tqdm(
-            total=3,
+            total=total_steps,
             desc="Pipeline RLS",
             unit="etapa",
-            bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",  # Estructura del texto
-            ncols=50,  # Controla el ancho total
-            ascii="░█",  # Define los caracteres de llenado (vacío/lleno)
+            bar_format="{bar} [{n_fmt}/{total_fmt}] {desc}...",
+            ncols=70,
+            ascii="░█",
         )
+        completed = 0
 
         def _advance(label: str) -> None:
+            nonlocal completed
+            completed += 1
             stages.set_postfix_str(label)
             stages.update(1)
+            pct = 100.0 * completed / total_steps
+            logger.info("PROGRESO %.0f%% | %s", pct, label)
 
         pipeline_t0 = time.perf_counter()
+        logger.info("PROGRESO 0%% | iniciando pipeline RLS")
 
         self._calendar = HolidayCalendar(self._cfg.holidays, self._cfg.now_year)
         self._feature_builder = CalendarFeatureBuilder(self._calendar)
@@ -697,6 +843,7 @@ class RLSForecastPipeline:
         for seccion in settings.FOCUS_SECTIONS:
             if seccion not in first_by_sec:
                 logger.warning("Sin datos para sección %s; se omite.", seccion)
+                _advance(f"sección {seccion} omitida")
                 continue
             sec_t0 = time.perf_counter()
             res, wm, driver_cols = self._run_section(
@@ -711,7 +858,7 @@ class RLSForecastPipeline:
                 self._write_checkpoint(seccion, res)
             if wm.height:
                 all_wm.append(wm)
-        _advance("forecast por sección listo")
+            _advance(f"sección {seccion} completada")
 
         res_df = (
             pl.concat(all_res, how="diagonal_relaxed") if all_res else pl.DataFrame()

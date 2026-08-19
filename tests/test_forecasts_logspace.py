@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-from forecasts import RLSForecastRunner  # noqa: E402
+from app.forecasting.runner import RLSForecastRunner  # noqa: E402
 
 
 def _ses_non_causal(values, alpha):
