@@ -76,9 +76,7 @@ class RLSForecastRunner:
             raise RuntimeError("rls_opt no disponible")
 
         uid = str(train_g["unique_id"][0]) if "unique_id" in train_g.columns else "<unknown>"
-        X_y = self._finite_matrix(
-            train_g, self._driver_cols, uid=uid, stage="RLS fit y"
-        )
+        X_y = self._finite_matrix(train_g, self._driver_cols, uid=uid, stage="RLS fit y")
         y = train_g["y"].to_numpy()
         log_y = np.log1p(y)
         model_y = self._new_rls(self._min_y_to_update)
@@ -172,20 +170,13 @@ class RLSForecastRunner:
         uid: str,
         stage: str,
     ) -> np.ndarray:
-        """Build a finite float64 design matrix for RLS.
-
-        Non-finite driver cells are replaced with 0.0 and reported. This avoids
-        discarding an entire series because ASP/EDP/discount or another driver
-        produced NaN/±inf on intermittent/zero-sales days.
-        """
+        """Build a finite float64 design matrix for RLS with diagnostics."""
         if not columns:
             return np.empty((df.height, 0), dtype=np.float64)
-
         matrix = df.select(columns).to_numpy().astype(np.float64, order="C")
         finite = np.isfinite(matrix)
         if finite.all():
             return matrix
-
         bad = ~finite
         bad_by_col = {
             col: int(bad[:, j].sum())
@@ -194,10 +185,7 @@ class RLSForecastRunner:
         }
         logger.warning(
             "%s %s: %d valores NaN/inf en drivers; imputando 0.0 | columnas=%s",
-            stage,
-            uid,
-            int(bad.sum()),
-            bad_by_col,
+            stage, uid, int(bad.sum()), bad_by_col,
         )
         matrix[bad] = 0.0
         return matrix
@@ -306,7 +294,8 @@ class RLSForecastRunner:
 
         has_value = "value" in res_df.columns and "valuehat" in res_df.columns
 
-        # factor_y por unique_id
+        # factor_y por unique_id. El factor solo se conserva si también reduce
+        # el error absoluto ponderado (numerador del WMAPE) en train.
         scored_y = train.filter(
             pl.col("y").is_not_null()
             & pl.col("yhat").is_not_null()
@@ -315,16 +304,47 @@ class RLSForecastRunner:
             & (pl.col("y") > 0)
             & (pl.col("yhat") > 0)
         )
-        factors_y = (
+        candidate_y = (
             scored_y.group_by("unique_id")
             .agg(
                 pl.col("y").sum().alias("_sum_y"),
                 pl.col("yhat").sum().alias("_sum_yhat"),
+                (pl.col("y") - pl.col("yhat")).abs().sum().alias("_ae_raw"),
                 pl.len().alias("_n"),
             )
             .with_columns(
                 pl.when((pl.col("_n") >= min_points) & (pl.col("_sum_yhat") > 0))
                 .then((pl.col("_sum_y") / pl.col("_sum_yhat")).clip(lo, hi))
+                .otherwise(1.0)
+                .alias("_candidate_factor_y")
+            )
+        )
+        corrected_y = (
+            scored_y.join(
+                candidate_y.select(["unique_id", "_candidate_factor_y"]),
+                on="unique_id",
+                how="left",
+            )
+            .group_by("unique_id")
+            .agg(
+                (
+                    pl.col("y")
+                    - pl.col("yhat") * pl.col("_candidate_factor_y")
+                )
+                .abs()
+                .sum()
+                .alias("_ae_corr")
+            )
+        )
+        factors_y = (
+            candidate_y.join(corrected_y, on="unique_id", how="left")
+            .with_columns(
+                pl.when(
+                    (pl.col("_n") >= min_points)
+                    & pl.col("_ae_corr").is_not_null()
+                    & (pl.col("_ae_corr") < pl.col("_ae_raw"))
+                )
+                .then(pl.col("_candidate_factor_y"))
                 .otherwise(1.0)
                 .alias("bias_factor_y")
             )
@@ -340,16 +360,47 @@ class RLSForecastRunner:
                 & (pl.col("value") > 0)
                 & (pl.col("valuehat") > 0)
             )
-            factors_v = (
+            candidate_v = (
                 scored_v.group_by("unique_id")
                 .agg(
                     pl.col("value").sum().alias("_sum_v"),
                     pl.col("valuehat").sum().alias("_sum_vhat"),
+                    (pl.col("value") - pl.col("valuehat")).abs().sum().alias("_ae_raw"),
                     pl.len().alias("_n"),
                 )
                 .with_columns(
                     pl.when((pl.col("_n") >= min_points) & (pl.col("_sum_vhat") > 0))
                     .then((pl.col("_sum_v") / pl.col("_sum_vhat")).clip(lo, hi))
+                    .otherwise(1.0)
+                    .alias("_candidate_factor_v")
+                )
+            )
+            corrected_v = (
+                scored_v.join(
+                    candidate_v.select(["unique_id", "_candidate_factor_v"]),
+                    on="unique_id",
+                    how="left",
+                )
+                .group_by("unique_id")
+                .agg(
+                    (
+                        pl.col("value")
+                        - pl.col("valuehat") * pl.col("_candidate_factor_v")
+                    )
+                    .abs()
+                    .sum()
+                    .alias("_ae_corr")
+                )
+            )
+            factors_v = (
+                candidate_v.join(corrected_v, on="unique_id", how="left")
+                .with_columns(
+                    pl.when(
+                        (pl.col("_n") >= min_points)
+                        & pl.col("_ae_corr").is_not_null()
+                        & (pl.col("_ae_corr") < pl.col("_ae_raw"))
+                    )
+                    .then(pl.col("_candidate_factor_v"))
                     .otherwise(1.0)
                     .alias("bias_factor_v")
                 )
@@ -468,6 +519,131 @@ class RLSForecastRunner:
         return train.sort(["unique_id", "ds"])
 
     @staticmethod
+    def _apply_ses_tuned(
+        df: pl.DataFrame,
+        src_col: str,
+        out_col: str,
+        *,
+        actual_col: str,
+        base_log_cols: tuple[str, ...],
+        default_alpha: float,
+    ) -> pl.DataFrame:
+        """Tune SES alpha per unique_id using only the tail of train.
+
+        Candidate alphas are scored on one-step-ahead forecasts reconstructed in
+        the original target space, using client WMAPE (y==0 excluded). OOS and
+        forecast-only keep the final train state frozen, so there is no leakage.
+        """
+        if df.height == 0:
+            return df
+        out = df.sort(["unique_id", "ds"])
+        uids = np.asarray(out["unique_id"].to_list(), dtype=object)
+        periods = (
+            np.asarray(out["period_type"].to_list(), dtype=object)
+            if "period_type" in out.columns
+            else np.full(out.height, "in_sample", dtype=object)
+        )
+        residual = out[src_col].to_numpy().astype(np.float64, copy=False)
+        actual = out[actual_col].to_numpy().astype(np.float64, copy=False)
+        base_log = np.zeros(out.height, dtype=np.float64)
+        for col in base_log_cols:
+            base_log += out[col].to_numpy().astype(np.float64, copy=False)
+
+        candidates = tuple(
+            float(a) for a in getattr(
+                settings, "SES_ALPHA_CANDIDATES",
+                (0.05, 0.10, 0.20, 0.35, 0.50, 0.70),
+            )
+            if 0.0 < float(a) <= 1.0
+        )
+        if not candidates:
+            candidates = (float(default_alpha),)
+        val_days = int(getattr(settings, "SES_TUNE_VALIDATION_DAYS", 28))
+        min_points = int(getattr(settings, "SES_TUNE_MIN_VALID_POINTS", 7))
+
+        pred_state = np.zeros(out.height, dtype=np.float64)
+        alpha_used = np.full(out.height, float(default_alpha), dtype=np.float64)
+
+        change = np.empty(len(uids), dtype=bool)
+        change[0] = True
+        change[1:] = uids[1:] != uids[:-1]
+        starts = np.flatnonzero(change)
+        ends = np.r_[starts[1:], len(uids)]
+
+        tuned = 0
+        for a, b in zip(starts, ends):
+            p = periods[a:b]
+            train_idx = np.flatnonzero(p == "in_sample")
+            future_idx = np.flatnonzero(p != "in_sample")
+            if train_idx.size == 0:
+                continue
+
+            r = residual[a:b]
+            y = actual[a:b]
+            base = base_log[a:b]
+            best_alpha = float(default_alpha)
+            best_score = float("inf")
+
+            # Score each alpha on recent train only.
+            for alpha in candidates:
+                states = np.empty(train_idx.size, dtype=np.float64)
+                state = None
+                for j, local_i in enumerate(train_idx):
+                    rv = r[local_i]
+                    if not np.isfinite(rv):
+                        rv = 0.0
+                    states[j] = rv if state is None else state
+                    state = rv if state is None else alpha * rv + (1.0 - alpha) * state
+
+                n_val = min(val_days, max(0, train_idx.size - 1))
+                if n_val < 1:
+                    continue
+                val_local = train_idx[-n_val:]
+                val_states = states[-n_val:]
+                y_val = y[val_local]
+                pred_val = np.maximum(
+                    0.0,
+                    np.expm1(base[val_local] + val_states),
+                )
+                mask = np.isfinite(y_val) & np.isfinite(pred_val) & (y_val != 0.0)
+                if int(mask.sum()) < min_points:
+                    continue
+                denom = float(np.abs(y_val[mask]).sum())
+                if denom <= 0:
+                    continue
+                score = float(np.abs(y_val[mask] - pred_val[mask]).sum() / denom)
+                if score < best_score:
+                    best_score = score
+                    best_alpha = float(alpha)
+
+            # Generate train one-step states and freeze the final train state.
+            state = None
+            for local_i in train_idx:
+                rv = r[local_i]
+                if not np.isfinite(rv):
+                    rv = 0.0
+                pred_state[a + local_i] = rv if state is None else state
+                state = rv if state is None else best_alpha * rv + (1.0 - best_alpha) * state
+            frozen = 0.0 if state is None or not np.isfinite(state) else float(state)
+            for local_i in future_idx:
+                pred_state[a + local_i] = frozen
+            alpha_used[a:b] = best_alpha
+            if abs(best_alpha - float(default_alpha)) > 1e-12:
+                tuned += 1
+
+        result = out.with_columns(
+            pl.Series(out_col, pred_state),
+            pl.Series(f"{out_col}_alpha", alpha_used),
+        )
+        if tuned:
+            logger.info(
+                "SES adaptativo %s: %d series con alpha distinto del default %.2f",
+                actual_col, tuned, float(default_alpha),
+            )
+        return result
+
+
+    @staticmethod
     def _select_model_wmape(
         y: np.ndarray,
         yhat_sec: np.ndarray,
@@ -555,7 +731,15 @@ class RLSForecastRunner:
             return block
 
         method_map = getattr(settings, "LEAF_BASELINE_METHOD_BY_SECTION", {})
-        method = str(method_map.get(str(section_id), "median_pos56"))
+        fallback_method = str(method_map.get(str(section_id), "median_pos56"))
+        methods = tuple(
+            str(m)
+            for m in getattr(
+                settings,
+                "LEAF_BASELINE_CANDIDATES",
+                (fallback_method,),
+            )
+        ) or (fallback_method,)
         val_days = int(getattr(settings, "LEAF_BASELINE_VALIDATION_DAYS", 28))
         lookback = int(getattr(settings, "LEAF_BASELINE_LOOKBACK_DAYS", 56))
         min_points = int(getattr(settings, "LEAF_BASELINE_MIN_VALID_POINTS", 7))
@@ -606,13 +790,26 @@ class RLSForecastRunner:
             if np.count_nonzero(y_train[-n_val:] > 0) < min_points:
                 continue
 
-            base_score = robust_validation_score(
-                y_train,
-                d_train,
-                method=method,
-                validation_days=n_val,
-                lookback_days=lookback,
-            )
+            # Challenger adaptativo: elegir el mejor baseline por serie usando
+            # exclusivamente la cola de train. No se fija un método por sección.
+            scored_methods: list[tuple[float, str]] = []
+            for candidate in methods:
+                try:
+                    score = robust_validation_score(
+                        y_train,
+                        d_train,
+                        method=candidate,
+                        validation_days=n_val,
+                        lookback_days=lookback,
+                    )
+                except ValueError:
+                    continue
+                if np.isfinite(score):
+                    scored_methods.append((float(score), candidate))
+            if not scored_methods:
+                continue
+            base_score, method = min(scored_methods, key=lambda x: x[0])
+
             model_score = wmape_np(
                 y_train[-n_val:], yh[train_local][-n_val:]
             )
@@ -626,24 +823,20 @@ class RLSForecastRunner:
             )
 
             target_idx = a + future_local
-            positive_base = base_future > 0
-            if np.any(positive_base):
-                lower = base_future * float(clip_lo)
-                upper = base_future * float(clip_hi)
-                before = yhat[target_idx].copy()
-                yhat[target_idx] = np.where(
-                    positive_base,
-                    np.clip(yhat[target_idx], lower, upper),
-                    yhat[target_idx],
-                )
-                clipped += int(np.count_nonzero(before != yhat[target_idx]))
-
-            if (
+            baseline_wins = (
                 np.isfinite(base_score)
                 and np.isfinite(model_score)
                 and base_score <= model_score * (1.0 - min_improvement)
-            ):
-                yhat[target_idx] = np.maximum(0.0, np.round(base_future, 0))
+            )
+
+            # IMPORTANTE: nunca recortar un RLS que ganó la validación. La
+            # versión anterior hacía clipping incondicional y podía aumentar
+            # el WMAPE OOS. Solo el challenger ganador puede reemplazar.
+            if baseline_wins:
+                before = yhat[target_idx].copy()
+                replacement = np.maximum(0.0, np.round(base_future, 0))
+                yhat[target_idx] = replacement
+                clipped += int(np.count_nonzero(before != replacement))
                 model_labels[target_idx] = f"baseline:{method}"
                 replaced += 1
 
@@ -653,9 +846,8 @@ class RLSForecastRunner:
         )
         if replaced or clipped:
             logger.info(
-                "Sección %s: guardrail leaf %s → %d series reemplazadas, %d puntos clip",
+                "Sección %s: guardrail adaptativo → %d series reemplazadas, %d puntos cambiados",
                 section_id,
-                method,
                 replaced,
                 clipped,
             )
@@ -857,8 +1049,22 @@ class RLSForecastRunner:
             del yhat_rls, valuehat_rls, effect_y, effect_v, intercept_y, intercept_v
             del y, value, use_sto, log_y, log_v, log_resid_y, log_resid_v
 
-            block = self._apply_ses(block, "_y_neto", "_y_neto_hat", alpha)
-            block = self._apply_ses(block, "_v_neto", "_v_neto_hat", alpha)
+            block = self._apply_ses_tuned(
+                block,
+                "_y_neto",
+                "_y_neto_hat",
+                actual_col="y",
+                base_log_cols=("_intercept_y", "driver_effect"),
+                default_alpha=alpha,
+            )
+            block = self._apply_ses_tuned(
+                block,
+                "_v_neto",
+                "_v_neto_hat",
+                actual_col="value",
+                base_log_cols=("_intercept_v", "driver_effect_value"),
+                default_alpha=alpha,
+            )
 
             if has_period:
                 block = block.with_columns(

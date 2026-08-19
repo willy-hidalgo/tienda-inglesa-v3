@@ -271,6 +271,15 @@ _is_valor = unidad.startswith("Valor")
 _opt_yhat = "valuehat" if _is_valor else "yhat"
 _opt_yhat28 = "valuehat28" if _is_valor else "yhat28"
 
+# Unidad y frecuencia gobiernan TODO el ViewModel. Limpiamos únicamente
+# eventos pendientes de tablas de un estado anterior; tienda/SKU permanecen
+# seleccionados para que la comparación entre unidades sea directa.
+_view_mode = (unidad, freq)
+if st.session_state.get("_prev_view_mode") != _view_mode:
+    st.session_state.pop("_pending_tienda", None)
+    st.session_state.pop("_pending_sku", None)
+    st.session_state["_prev_view_mode"] = _view_mode
+
 if use_fast:
     dataset_has_rolling28 = bool(index.get("has_rolling28"))
 else:
@@ -321,7 +330,10 @@ def label_for(uid: str) -> str:
 st.sidebar.markdown("### Filtros")
 
 if st.sidebar.button("🔄 Reiniciar filtros"):
-    for k in ("sel_tienda", "sel_sku", "_last_touched", "_prev_seccion"):
+    for k in (
+        "sel_tienda", "sel_sku", "_last_touched", "_prev_seccion",
+        "_prev_view_mode", "_pending_tienda", "_pending_sku",
+    ):
         st.session_state.pop(k, None)
     st.rerun()
 
@@ -470,6 +482,16 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # Render
 # ─────────────────────────────────────────────────────────────────────────────
+_view_signature = "|".join(
+    [
+        str(view.unidad),
+        str(view.freq),
+        str(view.seccion),
+        str(view.store or "*"),
+        str(view.sku or "*"),
+    ]
+)
+
 if view.store_context:
     st.caption(f"📍 Tienda: {view.store_context}")
 
@@ -525,14 +547,14 @@ with col_t:
     st.markdown("**Tiendas**")
     _show_ranking(
         view.ranking_tiendas,
-        f"tabla_tiendas_{view.selected_id}",
+        f"tabla_tiendas_{_view_signature}",
         "_pending_tienda",
         "store",
     )
 with col_s:
     st.markdown("**SKU**")
     _show_ranking(
-        view.ranking_skus, f"tabla_skus_{view.selected_id}", "_pending_sku", "sku"
+        view.ranking_skus, f"tabla_skus_{_view_signature}", "_pending_sku", "sku"
     )
 
 hz = view.horizons

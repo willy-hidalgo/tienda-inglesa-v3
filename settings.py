@@ -63,17 +63,30 @@ COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat2
 # derivan sin RLS (efecto de drivers + suavización exponencial sobre el
 # residuo). Ver README § Modelo jerárquico para el detalle del método.
 # ─────────────────────────────────────────────────────────────────────────────
-SES_ALPHA: float = 0.2  # 0.20  # residual SES: valor conservador; 0.74 era demasiado reactivo en backtest
+SES_ALPHA: float = 0.20  # fallback; el alpha efectivo se selecciona por serie en train
+SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.05, 0.10, 0.20, 0.35, 0.50, 0.70)
+SES_TUNE_VALIDATION_DAYS: int = 28
+SES_TUNE_MIN_VALID_POINTS: int = 7
 OOS_FREEZE_RESIDUAL_STATE: bool = True
 LEAF_BASELINE_GUARDRAIL: bool = True
 LEAF_BASELINE_METHOD_BY_SECTION: dict[str, str] = {
+    # Compatibilidad; el guardrail evalúa todos los candidatos por serie.
     "1": "median_pos56",
     "23": "weekday_pos8",
 }
+LEAF_BASELINE_CANDIDATES: tuple[str, ...] = (
+    "median_pos28",
+    "median_pos56",
+    "median_pos84",
+    "weekday_pos4",
+    "weekday_pos8",
+    "weekday_pos12",
+    "seasonal_naive7",
+)
 LEAF_BASELINE_VALIDATION_DAYS: int = 28
 LEAF_BASELINE_LOOKBACK_DAYS: int = 56
 LEAF_BASELINE_MIN_VALID_POINTS: int = 7
-LEAF_BASELINE_MIN_IMPROVEMENT: float = 0.03
+LEAF_BASELINE_MIN_IMPROVEMENT: float = 0.05
 LEAF_BASELINE_CLIP_RATIO: tuple[float, float] = (0.35, 2.50)
 USE_SES: bool = True
 

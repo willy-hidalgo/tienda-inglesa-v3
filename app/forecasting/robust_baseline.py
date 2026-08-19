@@ -3,15 +3,19 @@
 The functions in this module are deliberately NumPy/Python-only.  They are
 small, deterministic and easy to test independently of Polars/Streamlit.
 """
-
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import date
+from typing import Iterable, Sequence
+import re
 
 import numpy as np
 
-SUPPORTED_METHODS = ("median_pos56", "weekday_pos8")
+SUPPORTED_METHODS = (
+    "median_pos28", "median_pos56", "median_pos84",
+    "weekday_pos4", "weekday_pos8", "weekday_pos12",
+    "seasonal_naive7",
+)
 
 
 def wmape_np(y: Sequence[float], yhat: Sequence[float]) -> float:
@@ -30,6 +34,16 @@ def _positive_median(values: np.ndarray) -> float:
     return float(np.median(x)) if x.size else 0.0
 
 
+def _method_lookback(method: str, default_days: int) -> int:
+    m = re.search(r"(\d+)$", method)
+    if not m:
+        return int(default_days)
+    n = int(m.group(1))
+    if method.startswith("weekday_pos"):
+        return max(7, n * 7)
+    return n
+
+
 def robust_baseline_forecast(
     y_history: Sequence[float],
     history_dates: Sequence[date],
@@ -38,14 +52,7 @@ def robust_baseline_forecast(
     method: str,
     lookback_days: int = 56,
 ) -> np.ndarray:
-    """Forecast from information available strictly before ``future_dates``.
-
-    ``median_pos56`` is a robust positive-sales level. ``weekday_pos8`` uses
-    the median of positive sales for the same weekday over the recent window,
-    with the robust level as fallback.  This matches the client's WMAPE rule,
-    which excludes y==0 from scoring, and avoids a highly reactive leaf-level
-    SES on sparse retail demand.
-    """
+    """Leakage-free robust forecast from history strictly before the horizon."""
     if method not in SUPPORTED_METHODS:
         raise ValueError(f"Unsupported baseline method: {method!r}")
     y = np.asarray(y_history, dtype=np.float64)
@@ -54,12 +61,22 @@ def robust_baseline_forecast(
     if y.size == 0:
         return np.zeros(len(future_dates), dtype=np.float64)
 
-    n = min(int(lookback_days), y.size)
-    recent = y[-n:]
-    recent_dates = history_dates[-n:]
+    if method == "seasonal_naive7":
+        recent = y[-7:] if y.size >= 7 else y
+        recent = np.where(np.isfinite(recent), recent, 0.0)
+        if recent.size == 0:
+            return np.zeros(len(future_dates), dtype=np.float64)
+        return np.asarray(
+            [max(0.0, float(recent[i % recent.size])) for i in range(len(future_dates))],
+            dtype=np.float64,
+        )
+
+    lb = min(_method_lookback(method, lookback_days), y.size)
+    recent = y[-lb:]
+    recent_dates = history_dates[-lb:]
     fallback = _positive_median(recent)
 
-    if method == "median_pos56":
+    if method.startswith("median_pos"):
         return np.full(len(future_dates), fallback, dtype=np.float64)
 
     by_weekday: dict[int, list[float]] = {i: [] for i in range(7)}
@@ -71,7 +88,6 @@ def robust_baseline_forecast(
         for dow, vals in by_weekday.items()
     }
     return np.asarray([profile[d.weekday()] for d in future_dates], dtype=np.float64)
-
 
 def validation_score(
     y_history: Sequence[float],

@@ -134,11 +134,10 @@ def _ranking_from_metrics(
         (pl.col("seccion") == seccion) & (pl.col("unidad") == unidad)
     )
     if base.height == 0:
-        # Fallback sin multiplicar unidades: tomar una sola unidad si hay varias
-        base = metrics.filter(pl.col("seccion") == seccion)
-        if "unidad" in base.columns and base.height:
-            base = base.unique(subset=["unique_id"], keep="first")
-    if base.height == 0:
+        # La unidad seleccionada es parte del contrato del dashboard.
+        # Nunca reutilizar métricas de otra unidad: eso desincroniza ranking,
+        # KPIs y gráfico. Si faltan artefactos de la unidad, devolver vacío y
+        # obligar a regenerarlos.
         return empty
 
     # Defensa: metrics mal generados no deben duplicar filas del ranking

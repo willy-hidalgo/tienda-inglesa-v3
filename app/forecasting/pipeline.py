@@ -1,28 +1,24 @@
 """Forecast pipeline orchestration."""
-
 from __future__ import annotations
-
 import datetime as dt
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from pathlib import Path
 import numpy as np
 import polars as pl
-from tqdm import tqdm
-
 import settings
+from rls_opt.edp import decompose_price
+from tqdm import tqdm
 from app.forecasting.aggregation import DataAggregator
 from app.forecasting.calendar import HolidayCalendar
 from app.forecasting.config import ForecastConfig
 from app.forecasting.features import CalendarFeatureBuilder
 from app.forecasting.panel import densify_section_panel
 from app.forecasting.runner import RLSForecastRunner
-from app.forecasting.utils import _collect_streaming, _lf_columns, _stage_timer
-from rls_opt.edp import decompose_price
+from app.forecasting.utils import _stage_timer, _collect_streaming, _lf_columns
 
 logger = logging.getLogger(__name__)
-
 
 class RLSForecastPipeline:
     def __init__(
@@ -336,6 +332,31 @@ class RLSForecastPipeline:
             # pl.Series("discount", np.asarray(discount, dtype=np.float32)),
         )
 
+
+    @staticmethod
+    def _sanitize_numeric_drivers(df: pl.DataFrame) -> pl.DataFrame:
+        """Replace NaN/±inf/null in numerical drivers before feature extraction.
+
+        EDP/ASP/discount can become non-finite on intermittent or zero-sales
+        rows.  RLS requires a finite design matrix, so sanitise at the source
+        while keeping the rows (dropping them would bias sparse retail series).
+        """
+        if df.height == 0:
+            return df
+        cols = [c for c in ("asp", "edp", "discount") if c in df.columns]
+        if not cols:
+            return df
+        exprs = []
+        for c in cols:
+            exprs.append(
+                pl.when(pl.col(c).is_not_null() & pl.col(c).is_finite())
+                .then(pl.col(c))
+                .otherwise(0.0)
+                .cast(pl.Float64)
+                .alias(c)
+            )
+        return df.with_columns(exprs)
+
     def _run_section(
         self,
         selected: pl.LazyFrame | pl.DataFrame,
@@ -399,7 +420,9 @@ class RLSForecastPipeline:
         )
 
         with _stage_timer(f"{seccion}: EDP train"):
-            df_train = self._calculate_edp(df_train)
+            df_train = self._sanitize_numeric_drivers(
+                self._calculate_edp(df_train)
+            )
 
         with _stage_timer(f"{seccion}: features train"):
             df_train = self._feature_builder.extract_drivers(
@@ -459,7 +482,9 @@ class RLSForecastPipeline:
 
         if df_oos.height:
             with _stage_timer(f"{seccion}: EDP OOS"):
-                df_oos = self._calculate_edp(df_oos)
+                df_oos = self._sanitize_numeric_drivers(
+                    self._calculate_edp(df_oos)
+                )
             with _stage_timer(f"{seccion}: features OOS"):
                 df_oos = self._feature_builder.extract_drivers(
                     df_oos, req_columns=driver_cols
@@ -488,7 +513,9 @@ class RLSForecastPipeline:
                     price_history = pl.concat(
                         [df_train, df_oos], how="diagonal_relaxed"
                     )
-                df_fcst_raw = self._carry_forward_prices(price_history, df_fcst_raw)
+                df_fcst_raw = self._sanitize_numeric_drivers(
+                    self._carry_forward_prices(price_history, df_fcst_raw)
+                )
                 n_with_price = (
                     int(
                         df_fcst_raw.filter((pl.col("edp") > 0) | (pl.col("asp") > 0))[
