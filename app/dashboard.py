@@ -6,6 +6,7 @@ Sin artefactos: fallback legacy (lento) sobre forecast.parquet completo.
 
 Modelo de filtros: Sección obligatoria; Tienda y SKU independientes.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -94,8 +95,7 @@ def _cached_section_metrics(
         uid for uid in all_ids_tuple if uid == seccion or uid.startswith(f"{seccion}||")
     ]
     n_data = backend.spine_n_fechas(unit_df, candidatos)
-    if n_data > n_spine:
-        n_spine = n_data
+    n_spine = max(n_spine, n_data)
     # Rankings: wMAPE out-of-sample
     tabla_base = backend.wmape_por_id(
         candidatos,
@@ -170,9 +170,7 @@ def _cached_fast_state(
     metrics = _load_metrics(mtime_key, forecast_path)
     selected_id = settings.make_unique_id(seccion, store=store, sku=sku)
     has_value = bool(index.get("has_value"))
-    df_daily = _cached_series(
-        mtime_key, forecast_path, selected_id, unidad, has_value
-    )
+    df_daily = _cached_series(mtime_key, forecast_path, selected_id, unidad, has_value)
     return prepare_dashboard_state_fast(
         index=index,
         metrics=metrics,
@@ -225,9 +223,7 @@ else:
                     res_df = _load_parquet(forecast_path_str, _mtime_key)
                 else:
                     use_fast = True
-                    st.sidebar.success(
-                        f"Artefactos listos · {default_path.name}"
-                    )
+                    st.sidebar.success(f"Artefactos listos · {default_path.name}")
             except Exception as exc:  # noqa: BLE001
                 st.sidebar.warning(f"No se pudieron cargar artefactos: {exc}")
                 use_fast = False
@@ -293,7 +289,9 @@ if dataset_has_rolling28:
     )
     if not series_forecast:
         series_forecast = [_opt_yhat]
-        st.sidebar.warning(f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}».")
+        st.sidebar.warning(
+            f"Debe quedar al menos una serie; se mantiene «{_opt_yhat}»."
+        )
     show_yhat = _opt_yhat in series_forecast
     show_yhat28 = _opt_yhat28 in series_forecast
 else:
@@ -390,18 +388,18 @@ store_sel = st.sidebar.selectbox(
     tienda_opts,
     key="sel_tienda",
     on_change=_touch_tienda,
-    format_func=lambda x: x
-    if x == _SENTINEL_TIENDA
-    else label_for(settings.make_unique_id(seccion, store=x)),
+    format_func=lambda x: (
+        x
+        if x == _SENTINEL_TIENDA
+        else label_for(settings.make_unique_id(seccion, store=x))
+    ),
 )
 store_sel_val = None if store_sel == _SENTINEL_TIENDA else store_sel
 
 if use_fast:
     if last_touched == "tienda" and store_sel_val is not None:
         sku_opts = [_SENTINEL_SKU] + list(
-            (index.get("skus_for_store") or {})
-            .get(seccion, {})
-            .get(store_sel_val, [])
+            (index.get("skus_for_store") or {}).get(seccion, {}).get(store_sel_val, [])
         )
     else:
         sku_opts = [_SENTINEL_SKU] + list(
@@ -424,9 +422,9 @@ sku_sel = st.sidebar.selectbox(
     sku_opts,
     key="sel_sku",
     on_change=_touch_sku,
-    format_func=lambda x: x
-    if x == _SENTINEL_SKU
-    else label_for(settings.make_unique_id(seccion, sku=x)),
+    format_func=lambda x: (
+        x if x == _SENTINEL_SKU else label_for(settings.make_unique_id(seccion, sku=x))
+    ),
 )
 sku_sel_val = None if sku_sel == _SENTINEL_SKU else sku_sel
 
@@ -535,29 +533,46 @@ with col_s:
         view.ranking_skus, f"tabla_skus_{view.selected_id}", "_pending_sku", "sku"
     )
 
+# hz = view.horizons
+# st.markdown("#### Métricas")
+# st.caption(
+#     f"Agregación: **{view.freq}** · Unidad: **{view.unidad}** · "
+#     f"Sección **{view.seccion}** · Train → {hz.get('train_end')} · "
+#     f"OOS [{hz.get('test_start')} → {hz.get('test_end')}] · "
+#     f"Solo-forecast [{hz.get('forecast_start')} → {hz.get('forecast_end')}]. "
+#     "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
+#     "OOS = period_type out_sample (misma definición que el ranking)."
+# )
+
+# c1, c2, c3 = st.columns(3)
+# for col, title, key in (
+#     (c1, "In-sample", "in"),
+#     (c2, "Out-sample", "out"),
+#     (c3, "Total (hasta test_end)", "total"),
+# ):
+#     m = view.metrics[key]
+#     with col:
+#         st.markdown(f"**{title}**")
+#         st.metric("wMAPE", f"{m['wmape']:.2%}")
+#         st.metric("BIAS", f"{m['bias']:+.2%}")
+#         st.caption(f"{m['n']} períodos")
+
 hz = view.horizons
-st.markdown("#### Métricas")
+
+st.markdown("#### Métricas Out-of-Sample")
 st.caption(
-    f"Agregación: **{view.freq}** · Unidad: **{view.unidad}** · "
-    f"Sección **{view.seccion}** · Train → {hz.get('train_end')} · "
+    f"Agregación: **{view.freq}** · "
+    f"Unidad: **{view.unidad}** · "
+    f"Sección **{view.seccion}** · "
     f"OOS [{hz.get('test_start')} → {hz.get('test_end')}] · "
-    f"Solo-forecast [{hz.get('forecast_start')} → {hz.get('forecast_end')}]. "
-    "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
-    "OOS = period_type out_sample (misma definición que el ranking)."
+    "wMAPE = Σ|y−ŷ| / Σ|y|"
 )
 
-c1, c2, c3 = st.columns(3)
-for col, title, key in (
-    (c1, "In-sample", "in"),
-    (c2, "Out-sample", "out"),
-    (c3, "Total (hasta test_end)", "total"),
-):
-    m = view.metrics[key]
-    with col:
-        st.markdown(f"**{title}**")
-        st.metric("wMAPE", f"{m['wmape']:.2%}")
-        st.metric("BIAS", f"{m['bias']:+.2%}")
-        st.caption(f"{m['n']} períodos")
+m = view.metrics["out"]
+
+st.metric("wMAPE", f"{m['wmape']:.2%}", f"{m['bias']:+.2%}")
+
+st.caption(f"{m['n']} períodos")
 
 if view.has_rolling28:
     st.markdown("#### Métricas Rolling 28d (`yhat28`)")
