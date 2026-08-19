@@ -154,16 +154,13 @@ class SectionDemandSelector:
     @staticmethod
     def select_best_skus(df: pl.DataFrame) -> pl.DataFrame:
         best_skus = [
-            "595394",
-            "413180",
-            "274417",
-            "454372",
             "567332",
-            "568160",
-            "541427",
+            "274417",
             "58905",
+            "541427",
+            "568160",
+            "454372",
             "240836",
-            "401006",
         ]
 
         return df.filter(pl.col("SKU_ID").is_in(best_skus))
