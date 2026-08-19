@@ -63,7 +63,7 @@ COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat2
 # derivan sin RLS (efecto de drivers + suavización exponencial sobre el
 # residuo). Ver README § Modelo jerárquico para el detalle del método.
 # ─────────────────────────────────────────────────────────────────────────────
-SES_ALPHA: float = 0.74  # alpha fijo de la suavización exponencial simple (SES)
+SES_ALPHA: float = 0.9  # alpha fijo de la suavización exponencial simple (SES)
 USE_SES: bool = True
 
 # aplicada sobre "y_neto" (y menos el efecto de los drivers
