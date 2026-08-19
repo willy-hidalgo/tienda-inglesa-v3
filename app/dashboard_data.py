@@ -538,8 +538,12 @@ def prepare_dashboard_state(
         if n_spine is None:
             n_spine = n_spine_calc
         if tabla_base is None:
+            # Rankings reportan wMAPE out-of-sample
             tabla_base = backend.wmape_por_id(
-                candidatos, unit_df, n_fechas_spine=n_spine
+                candidatos,
+                unit_df,
+                n_fechas_spine=n_spine,
+                period_types=["out_sample"],
             )
 
     ranking_tiendas = backend.ranking_table(

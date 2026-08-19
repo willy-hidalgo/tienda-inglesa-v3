@@ -7,17 +7,24 @@ Niveles: sección, tienda, sku-tienda
 Modelo por periodo y nivel:
   - In-sample (train) — los 3 niveles usan RLS:
       · sección / tienda: modelo RLS propio
-      · sku+tienda: coeficientes de sección o tienda (mejor WMAPE in-sample)
+      · sku+tienda (USE_SES=True): coeficientes de sección o tienda (mejor WMAPE in-sample)
+      · sku+tienda (USE_SES=False): modelo RLS propio por serie (igual que sección/tienda)
   - OOS (test) y forecast-only:
       · sección / tienda: sigue RLS (mismos coeficientes de train)
-      · sku+tienda: efecto(coefs seleccionados) + SES no causal del residuo
+      · sku+tienda (USE_SES=True): efecto(coefs seleccionados) + SES causal del residuo
+        (s(t)=ewm hasta t-1; sin residual contemporáneo → evita adelanto de 1 día)
+      · sku+tienda (USE_SES=False): sigue RLS propio (mismos coeficientes de train)
+
+Flags:
+  - settings.USE_SES (default True)
+  - settings.BIAS_CORRECTION (default True): escala ŷ OOS/forecast por Σy/Σŷ in-sample
 
 Ventanas por sección:
   - train / OOS / forecast-only (ver settings.section_horizons)
 
 Rendimiento:
   - Carga lazy + collect streaming; agregación lazy.
-  - Derivación SKU+tienda vectorizada por tienda.
+  - Derivación SKU+tienda vectorizada por tienda (solo si USE_SES).
   - Checkpoint por sección (`forecast_seccion_<n>_partial.parquet`).
 """
 
@@ -101,7 +108,7 @@ def _collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     except TypeError:
         try:
             return lf.collect(streaming=True)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return lf.collect()
 
 
@@ -908,18 +915,161 @@ class RLSForecastRunner:
         )
         return res_df, coefs
 
-    # ── SKU+tienda: efecto RLS seleccionado + SES no causal ───────────────
+    # ── Corrección de sesgo OOS / forecast ────────────────────────────────
+    @staticmethod
+    def apply_bias_correction(
+        res_df: pl.DataFrame,
+        *,
+        min_points: int | None = None,
+        clip: tuple[float, float] | None = None,
+        enabled: bool | None = None,
+    ) -> pl.DataFrame:
+        """
+        Escala ŷ en out_sample / forecast_only por el sesgo in-sample de cada serie.
+
+          factor_y = Σ y / Σ ŷ     (in_sample, y>0, ŷ>0, finitos)
+          factor_v = Σ value / Σ valuehat
+
+        - Solo se corrigen out_sample y forecast_only (in_sample queda crudo).
+        - Series con < min_points observaciones válidas → factor = 1.
+        - factor se recorta a `clip` para evitar explosiones en series sparse.
+        """
+        if enabled is None:
+            enabled = bool(getattr(settings, "BIAS_CORRECTION", True))
+        if not enabled or res_df.height == 0:
+            return res_df
+        if "period_type" not in res_df.columns or "unique_id" not in res_df.columns:
+            return res_df
+        if "yhat" not in res_df.columns or "y" not in res_df.columns:
+            return res_df
+
+        if min_points is None:
+            min_points = int(getattr(settings, "BIAS_CORRECTION_MIN_POINTS", 7))
+        if clip is None:
+            clip = tuple(getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)))
+        lo, hi = float(clip[0]), float(clip[1])
+
+        train = res_df.filter(pl.col("period_type") == "in_sample")
+        if train.height == 0:
+            return res_df
+
+        has_value = "value" in res_df.columns and "valuehat" in res_df.columns
+
+        # factor_y por unique_id
+        scored_y = train.filter(
+            pl.col("y").is_not_null()
+            & pl.col("yhat").is_not_null()
+            & pl.col("y").is_finite()
+            & pl.col("yhat").is_finite()
+            & (pl.col("y") > 0)
+            & (pl.col("yhat") > 0)
+        )
+        factors_y = (
+            scored_y.group_by("unique_id")
+            .agg(
+                pl.col("y").sum().alias("_sum_y"),
+                pl.col("yhat").sum().alias("_sum_yhat"),
+                pl.len().alias("_n"),
+            )
+            .with_columns(
+                pl.when((pl.col("_n") >= min_points) & (pl.col("_sum_yhat") > 0))
+                .then((pl.col("_sum_y") / pl.col("_sum_yhat")).clip(lo, hi))
+                .otherwise(1.0)
+                .alias("bias_factor_y")
+            )
+            .select(["unique_id", "bias_factor_y"])
+        )
+
+        if has_value:
+            scored_v = train.filter(
+                pl.col("value").is_not_null()
+                & pl.col("valuehat").is_not_null()
+                & pl.col("value").is_finite()
+                & pl.col("valuehat").is_finite()
+                & (pl.col("value") > 0)
+                & (pl.col("valuehat") > 0)
+            )
+            factors_v = (
+                scored_v.group_by("unique_id")
+                .agg(
+                    pl.col("value").sum().alias("_sum_v"),
+                    pl.col("valuehat").sum().alias("_sum_vhat"),
+                    pl.len().alias("_n"),
+                )
+                .with_columns(
+                    pl.when((pl.col("_n") >= min_points) & (pl.col("_sum_vhat") > 0))
+                    .then((pl.col("_sum_v") / pl.col("_sum_vhat")).clip(lo, hi))
+                    .otherwise(1.0)
+                    .alias("bias_factor_v")
+                )
+                .select(["unique_id", "bias_factor_v"])
+            )
+        else:
+            factors_v = pl.DataFrame(
+                schema={"unique_id": pl.Utf8, "bias_factor_v": pl.Float64}
+            )
+
+        # Base = todos los unique_id del resultado → left join de factores
+        factors = (
+            res_df.select("unique_id")
+            .unique()
+            .join(factors_y, on="unique_id", how="left")
+            .join(factors_v, on="unique_id", how="left")
+            .with_columns(
+                pl.col("bias_factor_y").fill_null(1.0),
+                pl.col("bias_factor_v").fill_null(1.0),
+            )
+        )
+
+        out = res_df.join(factors, on="unique_id", how="left").with_columns(
+            pl.col("bias_factor_y").fill_null(1.0),
+            pl.col("bias_factor_v").fill_null(1.0),
+        )
+
+        is_corr = pl.col("period_type").is_in(["out_sample", "forecast_only"])
+        exprs = [
+            pl.when(is_corr)
+            .then(
+                (pl.col("yhat") * pl.col("bias_factor_y"))
+                .clip(lower_bound=0.0)
+                .round(0)
+            )
+            .otherwise(pl.col("yhat"))
+            .alias("yhat"),
+        ]
+        if has_value:
+            exprs.append(
+                pl.when(is_corr)
+                .then(
+                    (pl.col("valuehat") * pl.col("bias_factor_v"))
+                    .clip(lower_bound=0.0)
+                    .round(2)
+                )
+                .otherwise(pl.col("valuehat"))
+                .alias("valuehat")
+            )
+        out = out.with_columns(exprs).drop(
+            [c for c in ("bias_factor_y", "bias_factor_v") if c in out.columns]
+        )
+        return out
+
+    # ── SKU+tienda: efecto RLS seleccionado + SES causal ──────────────────
     @staticmethod
     def _apply_ses(
         df: pl.DataFrame, src_col: str, out_col: str, alpha: float
     ) -> pl.DataFrame:
         """
-        SES **no causal** por unique_id: s(t) = ewm_mean incluyendo y_neto(t)
-        (sin shift). La causalidad del pipeline la aportan los coeficientes
-        RLS (ajustados solo en train), no el suavizado del residuo.
+        SES **causal** por unique_id (one-step-ahead):
 
-        Filas forecast_only (sin actuals): se propaga el último estado SES
-        de la parte con actuals.
+          s_raw(t) = ewm_mean(x[0..t])   # incluye x(t)
+          s(t)     = s_raw(t-1)          # shift 1 → no usa x(t)
+          s(0)     = x(0)                # init con primer residual (no 0)
+
+        Init s(0)=x(0) evita el pico del primer día: con s(0)=0 se predice
+        expm1(intercept+efecto) sin corrección de nivel y el valor “vuela”.
+
+        Filas forecast_only (sin actuals): se propaga el último estado causal
+        de la parte con actuals (ya shift-eado).
         """
         df = df.sort(["unique_id", "ds"])
         has_period = "period_type" in df.columns
@@ -927,11 +1077,22 @@ class RLSForecastRunner:
             (pl.col("period_type") != "forecast_only") if has_period else pl.lit(True)
         )
 
-        actual = df.filter(is_actual).with_columns(
-            pl.col(src_col)
-            .ewm_mean(alpha=alpha, adjust=False)
-            .over("unique_id")
-            .alias(out_col)
+        actual = (
+            df.filter(is_actual)
+            .with_columns(
+                pl.col(src_col)
+                .ewm_mean(alpha=alpha, adjust=False)
+                .shift(1)
+                .over("unique_id")
+                .alias("_s_shift")
+            )
+            .with_columns(
+                # Primer día de cada serie: usar el residual actual (x0), no 0
+                pl.coalesce(pl.col("_s_shift"), pl.col(src_col))
+                .fill_null(0.0)
+                .alias(out_col)
+            )
+            .drop("_s_shift")
         )
         last_state = actual.group_by("unique_id").agg(
             pl.col(out_col).last().alias("_last_s")
@@ -1036,21 +1197,16 @@ class RLSForecastRunner:
         la reconstrucción del pronóstico ocurre EN LOG-SPACE:
 
           - Todos los períodos (in_sample / out_sample / forecast_only):
-              yhat = expm1(intercept + efecto + SES(log-residuo))
+              yhat = expm1(intercept + efecto + SES_causal(log-residuo))
 
         donde `residuo_log = log1p(y) − (intercept + efecto)`, e `intercept` +
         `efecto` provienen del modelo (sección o tienda) elegido por
-        `_select_model_wmape`. `_apply_ses` calcula el SES sobre TODO el
-        período con actuals (in_sample + out_sample) como una única serie
-        continua, así que `_y_neto_hat`/`_v_neto_hat` ya son válidos también
-        para in_sample: no hace falta (ni es correcto) usar la predicción
-        cruda `_yhat_rls`/`_valuehat_rls` del RLS de sección/tienda para esas
-        filas. Esa predicción cruda vive en la escala del AGREGADO (sección o
-        tienda), no en la de la hoja SKU+tienda, y usarla directamente en
-        in_sample producía un salto de escala de varios órdenes de magnitud
-        entre in_sample y OOS/forecast (yhat/valuehat in-sample en la escala
-        del agregado, OOS ya corregido por el SES). `_yhat_rls`/
-        `_valuehat_rls` se conservan solo como entrada de
+        `_select_model_wmape`. `_apply_ses` calcula el SES **causal** (shift 1)
+        sobre TODO el período con actuals (in_sample + out_sample) como una
+        única serie continua: s(t) solo usa residuales hasta t-1. Así el
+        pronóstico queda alineado en fecha con y(t) (sin adelanto de 1 día).
+
+        `_yhat_rls`/`_valuehat_rls` se conservan solo como entrada de
         `_select_model_wmape` (comparación sección vs. tienda), no como
         salida final.
 
@@ -1311,7 +1467,8 @@ class RLSForecastRunner:
                 except Exception as e:
                     msg = str(e)
                     is_mem = isinstance(e, MemoryError) or (
-                        "Unable to allocate" in msg or "ArrayMemoryError" in type(e).__name__
+                        "Unable to allocate" in msg
+                        or "ArrayMemoryError" in type(e).__name__
                     )
                     if not is_mem:
                         raise
@@ -1353,8 +1510,6 @@ class RLSForecastRunner:
         del frames
         gc.collect()
         return out
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1625,10 +1780,7 @@ class RLSForecastPipeline:
         # Preferir filas con algún precio observado > 0
         priced = base.filter(
             pl.any_horizontal(
-                [
-                    (pl.col(c).is_not_null() & (pl.col(c) > 0))
-                    for c in price_cols
-                ]
+                [(pl.col(c).is_not_null() & (pl.col(c) > 0)) for c in price_cols]
             )
         )
         if priced.height:
@@ -1924,9 +2076,9 @@ class RLSForecastPipeline:
                 df_fcst_raw = self._carry_forward_prices(price_history, df_fcst_raw)
                 n_with_price = (
                     int(
-                        df_fcst_raw.filter(
-                            (pl.col("edp") > 0) | (pl.col("asp") > 0)
-                        )["unique_id"].n_unique()
+                        df_fcst_raw.filter((pl.col("edp") > 0) | (pl.col("asp") > 0))[
+                            "unique_id"
+                        ].n_unique()
                     )
                     if "edp" in df_fcst_raw.columns
                     else 0
@@ -2105,62 +2257,118 @@ class RLSForecastPipeline:
             if store_results
             else pl.DataFrame()
         )
+        print("\n")
         logger.info(
             "Sección %s: %d filas de pronósticos a nivel tienda",
             seccion,
             res_store.height,
         )
 
-        # ── 3) Derivación SKU+tienda (train+OOS+fcst; tienda a tienda) ────────
+        # ── 3) SKU+tienda ─────────────────────────────────────────────────────
+        # USE_SES=True  → efecto(coefs sección/tienda elegidos) + SES causal
+        # USE_SES=False → RLS puro por serie sku+tienda (igual que sección/tienda)
         res_derived = pl.DataFrame()
         is_sku_store = (
             pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2
         )
-        # Filtrar SKU+tienda ANTES de concat para no inflar el panel
-        parts_sku: list[pl.DataFrame] = []
-        tr = df_train.filter(is_sku_store)
-        if tr.height:
-            parts_sku.append(tr.with_columns(pl.lit("in_sample").alias("period_type")))
-        if df_oos.height:
-            oo = df_oos.filter(is_sku_store)
-            if oo.height:
-                parts_sku.append(
-                    oo.with_columns(pl.lit("out_sample").alias("period_type"))
-                )
-        if df_fcst.height:
-            fc = df_fcst.filter(is_sku_store)
-            if fc.height:
-                parts_sku.append(
-                    fc.with_columns(pl.lit("forecast_only").alias("period_type"))
-                )
+        use_ses = bool(getattr(settings, "USE_SES", True))
 
-        if parts_sku and section_coefs and store_coefs:
-            sku_level = pl.concat(parts_sku, how="diagonal_relaxed")
-            del parts_sku
-            if meta:
-                sku_level = sku_level.with_columns(
-                    [pl.lit(v).alias(k) for k, v in meta.items()]
+        if use_ses:
+            # Filtrar SKU+tienda ANTES de concat para no inflar el panel
+            parts_sku: list[pl.DataFrame] = []
+            tr = df_train.filter(is_sku_store)
+            if tr.height:
+                parts_sku.append(
+                    tr.with_columns(pl.lit("in_sample").alias("period_type"))
                 )
-            logger.info(
-                "Sección %s: %d filas SKU+tienda (train+OOS+fcst)",
-                seccion,
-                sku_level.height,
-            )
-            with _stage_timer(f"{seccion}: derivación SKU+tienda (por tienda)"):
-                res_derived = runner.derive_sku_store_forecasts(
-                    sku_level,
+            if df_oos.height:
+                oo = df_oos.filter(is_sku_store)
+                if oo.height:
+                    parts_sku.append(
+                        oo.with_columns(pl.lit("out_sample").alias("period_type"))
+                    )
+            if df_fcst.height:
+                fc = df_fcst.filter(is_sku_store)
+                if fc.height:
+                    parts_sku.append(
+                        fc.with_columns(pl.lit("forecast_only").alias("period_type"))
+                    )
+
+            if parts_sku and section_coefs and store_coefs:
+                sku_level = pl.concat(parts_sku, how="diagonal_relaxed")
+                del parts_sku
+                if meta:
+                    sku_level = sku_level.with_columns(
+                        [pl.lit(v).alias(k) for k, v in meta.items()]
+                    )
+                logger.info(
+                    "Sección %s: %d filas SKU+tienda (train+OOS+fcst) [USE_SES=True]",
                     seccion,
-                    section_coefs,
-                    store_coefs,
+                    sku_level.height,
                 )
-            del sku_level
-            logger.info(
-                "Sección %s: %d filas derivadas SKU+tienda",
-                seccion,
-                res_derived.height,
-            )
+                with _stage_timer(f"{seccion}: derivación SKU+tienda SES (por tienda)"):
+                    res_derived = runner.derive_sku_store_forecasts(
+                        sku_level,
+                        seccion,
+                        section_coefs,
+                        store_coefs,
+                    )
+                del sku_level
+                logger.info(
+                    "Sección %s: %d filas derivadas SKU+tienda (SES)",
+                    seccion,
+                    res_derived.height,
+                )
+            else:
+                del parts_sku
         else:
-            del parts_sku
+            # RLS puro a nivel sku+tienda (mismo camino que sección / tienda)
+            train_sku = df_train.filter(is_sku_store)
+            sku_ids = (
+                train_sku.get_column("unique_id").unique().to_list()
+                if train_sku.height
+                else []
+            )
+            if sku_ids:
+                targets_sku = {
+                    name: df.filter(is_sku_store) for name, df in targets.items()
+                }
+                logger.info(
+                    "Sección %s: RLS puro SKU+tienda (%d series) [USE_SES=False]",
+                    seccion,
+                    len(sku_ids),
+                )
+                with _stage_timer(f"{seccion}: RLS sku+tienda ({len(sku_ids)} series)"):
+                    res_sku, _sku_coefs = runner.fit_and_predict_sections(
+                        train_sku,
+                        targets_sku,
+                        sku_ids,
+                        desc=f"{seccion} RLS sku+tienda",
+                        meta=meta,
+                    )
+                if res_sku.height:
+                    res_derived = res_sku.with_columns(
+                        pl.when(pl.col("period_type") == "forecast_only")
+                        .then(0.0)
+                        .otherwise(pl.col("y"))
+                        .alias("y"),
+                        pl.when(pl.col("period_type") == "forecast_only")
+                        .then(0.0)
+                        .otherwise(pl.col("value"))
+                        .alias("value"),
+                        pl.lit(None).cast(pl.Float64).alias("driver_effect"),
+                        pl.lit(None).cast(pl.Float64).alias("driver_effect_value"),
+                        pl.lit("rls_propio").alias("modelo_seleccionado"),
+                    )
+                logger.info(
+                    "Sección %s: %d filas RLS puro SKU+tienda",
+                    seccion,
+                    res_derived.height,
+                )
+            else:
+                logger.warning(
+                    "Sección %s: sin series sku+tienda para RLS puro", seccion
+                )
 
         # ── Combinar resultados ────────────────────────────────────────────────
         res_df = pl.concat(
@@ -2169,6 +2377,17 @@ class RLSForecastPipeline:
         )
         if not res_df.height:
             return pl.DataFrame(), pl.DataFrame(), driver_cols
+
+        # Corrección de sesgo OOS/forecast (factor in-sample por unique_id)
+        if getattr(settings, "BIAS_CORRECTION", True):
+            with _stage_timer(f"{seccion}: bias correction OOS"):
+                res_df = RLSForecastRunner.apply_bias_correction(res_df)
+            logger.info(
+                "Sección %s: bias correction OOS aplicada (min_points=%s, clip=%s)",
+                seccion,
+                getattr(settings, "BIAS_CORRECTION_MIN_POINTS", 7),
+                getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)),
+            )
 
         wmapes_df = RLSForecastRunner._compute_wmape(res_df)
         return res_df, wmapes_df, driver_cols

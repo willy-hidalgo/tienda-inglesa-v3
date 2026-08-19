@@ -9,6 +9,15 @@ import datetime as dt
 import os
 from pathlib import Path
 
+# ── Flag de modelo a nivel hoja ──────────────────────────────────────────────
+DEMO_MODE = True
+
+# Corrección de sesgo OOS/forecast: factor = Σy/Σŷ en in_sample (por unique_id).
+# Se aplica solo a out_sample y forecast_only (in_sample queda crudo).
+BIAS_CORRECTION: bool = True
+BIAS_CORRECTION_MIN_POINTS: int = 7
+BIAS_CORRECTION_CLIP: tuple[float, float] = (0.5, 2.0)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Rutas (ancladas al propio archivo → independientes del cwd)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +63,9 @@ COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat2
 # derivan sin RLS (efecto de drivers + suavización exponencial sobre el
 # residuo). Ver README § Modelo jerárquico para el detalle del método.
 # ─────────────────────────────────────────────────────────────────────────────
-SES_ALPHA = 0.1  # alpha fijo de la suavización exponencial simple (SES)
+SES_ALPHA: float = 0.74  # alpha fijo de la suavización exponencial simple (SES)
+USE_SES: bool = True
+
 # aplicada sobre "y_neto" (y menos el efecto de los drivers
 # de la sección) para obtener yhat en nodos tienda/sku/
 # tienda+sku. Fijo (no auto-tuneado) por velocidad.
@@ -186,6 +197,13 @@ HOLIDAYS = {
         "window_after_days": 2,
         "active": 1,
     },
+    "promo_feb": {
+        "month": 2,
+        "day": 17,
+        "window_before_days": 2,
+        "window_after_days": 2,
+        "active": 1,
+    },
     "promo_mar": {
         "month": 3,
         "day": 12,
@@ -193,11 +211,50 @@ HOLIDAYS = {
         "window_after_days": 5,
         "active": 1,
     },
+    "promo_abr": {
+        "month": 4,
+        "day": 22,
+        "window_before_days": 2,
+        "window_after_days": 1,
+        "active": 1,
+    },
+    "promo_abr_2": {
+        "month": 4,
+        "day": 30,
+        "window_before_days": 1,
+        "window_after_days": 1,
+        "active": 1,
+    },
+    "promo_may": {
+        "rule": "1nd_sunday_may",
+        "relative_ocurrence": 1,
+        "absolute_weekday": 7,
+        "absolute_month": 5,
+        "window_before_days": 2,
+        "window_after_days": 2,
+        "active": 1,
+    },
+    "promo_may_2": {
+        "rule": "4nd_sunday_may",
+        "relative_ocurrence": 4,
+        "absolute_weekday": 7,
+        "absolute_month": 5,
+        "window_before_days": 2,
+        "window_after_days": 2,
+        "active": 1,
+    },
     "promo_sep": {
         "month": 9,
         "day": 3,
         "window_before_days": 1,
         "window_after_days": 15,
+        "active": 1,
+    },
+    "promo_oct": {
+        "month": 10,
+        "day": 1,
+        "window_before_days": 1,
+        "window_after_days": 1,
         "active": 1,
     },
     "promo_nov": {
