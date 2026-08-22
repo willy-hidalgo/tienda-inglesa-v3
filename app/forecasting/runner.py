@@ -1,6 +1,8 @@
 """RLS forecasting runner and leaf-level derivation."""
 from __future__ import annotations
+import datetime as dt
 import logging
+import time
 import numpy as np
 import polars as pl
 import settings
@@ -59,12 +61,21 @@ class RLSForecastRunner:
             for _ in range(max(0, n_features - 1))
         ]
 
-    def _new_rls(self, min_y: float, return_all_coefs: bool = False):
+    def _new_rls(
+        self,
+        min_y: float,
+        return_all_coefs: bool = False,
+        forgetting_factor: float | None = None,
+    ):
         if RecursiveLeastSquaresRegression is None:
             raise RuntimeError("rls_opt no disponible")
 
         return RecursiveLeastSquaresRegression(
-            forgetting_factor=self._forgetting_factor,
+            forgetting_factor=(
+                self._forgetting_factor
+                if forgetting_factor is None
+                else float(forgetting_factor)
+            ),
             min_y_to_update=min_y,
             return_all_coefs=return_all_coefs,
         )
@@ -191,68 +202,241 @@ class RLSForecastRunner:
         return matrix
 
     # ── RLS sección / tienda ──────────────────────────────────────────────
+    @staticmethod
+    def _ar_training_matrix(log_target: np.ndarray) -> np.ndarray:
+        """Causal AR features: lag7, lag28, mean7, mean28 in log-space."""
+        n = len(log_target)
+        out = np.zeros((n, 4), dtype=np.float64)
+        for i in range(n):
+            if i >= 7:
+                out[i, 0] = log_target[i - 7]
+            if i >= 28:
+                out[i, 1] = log_target[i - 28]
+            if i > 0:
+                out[i, 2] = float(np.mean(log_target[max(0, i - 7):i]))
+                out[i, 3] = float(np.mean(log_target[max(0, i - 28):i]))
+        return out
+
+    @staticmethod
+    def _ar_recursive_row(history: list[float]) -> np.ndarray:
+        """AR row available at forecast origin; predicted rows feed recursion."""
+        n = len(history)
+        lag7 = history[-7] if n >= 7 else 0.0
+        lag28 = history[-28] if n >= 28 else 0.0
+        mean7 = float(np.mean(history[-7:])) if n else 0.0
+        mean28 = float(np.mean(history[-28:])) if n else 0.0
+        return np.asarray([lag7, lag28, mean7, mean28], dtype=np.float64)
+
+    def _fit_and_predict_expanding_blocks(
+        self, uid: str, train_g: pl.DataFrame, target_parts: dict[str, dict],
+        *, meta: dict | None, desc: str, block_days: int,
+    ) -> tuple[list[pl.DataFrame], tuple[np.ndarray, np.ndarray] | None]:
+        """Expanding-28 with prior-block selection of RLS dynamics.
+
+        v8.1 audits the v8 AR recursion problem by treating the AR specification
+        itself as a candidate.  For every 28-day target block we choose only
+        from errors accumulated in PREVIOUS blocks:
+
+          * base: calendar/commercial drivers only;
+          * ar:   base + lag7/lag28/rolling7/rolling28, recursively forecast.
+
+        This preserves the client's expanding-28 contract while preventing a
+        recursively drifting AR path from being forced into OOS/forecast-only.
+        """
+        t_rls_total = time.perf_counter()
+        train_g = train_g.sort("ds")
+        oos_g = (target_parts.get("out_sample") or {}).get(uid)
+        fcst_g = (target_parts.get("forecast_only") or {}).get(uid)
+
+        parts = [train_g.with_columns(pl.lit("in_sample").alias("_source_period"))]
+        if oos_g is not None and oos_g.height:
+            parts.append(oos_g.sort("ds").with_columns(pl.lit("out_sample").alias("_source_period")))
+        actual = pl.concat(parts, how="diagonal_relaxed").sort("ds")
+        n = actual.height
+        if n == 0:
+            return [], None
+
+        seed_n = min(block_days, n)
+        base = actual.drop("_source_period")
+        y = base["y"].to_numpy().astype(np.float64, copy=False)
+        v = base["value"].to_numpy().astype(np.float64, copy=False)
+        log_y = np.log1p(np.clip(y, 0.0, None))
+        log_v = np.log1p(np.clip(v, 0.0, None))
+        Xy_base = self._finite_matrix(base, self._driver_cols, uid=uid, stage="RLS rolling fit y")
+        Xv_base = self._finite_matrix(base, self._driver_cols_price, uid=uid, stage="RLS rolling fit value")
+
+        ar_enabled = bool(getattr(settings, "RLS_AUTOREGRESSIVE_DRIVERS", True))
+        mode_candidates = tuple(getattr(settings, "RLS_DYNAMICS_CANDIDATES", ("base", "ar" if ar_enabled else "base")))
+        mode_candidates = tuple(dict.fromkeys(m for m in mode_candidates if m in {"base", "ar"} and (m != "ar" or ar_enabled))) or ("base",)
+        lambdas = tuple(sorted({float(x) for x in getattr(settings, "RLS_FORGETTING_FACTOR_CANDIDATES", (self._forgetting_factor,)) if 0.0 < float(x) <= 1.0} | {float(self._forgetting_factor)}))
+        default_lambda = float(self._forgetting_factor)
+        default_mode = str(getattr(settings, "RLS_DEFAULT_DYNAMICS", "base"))
+        if default_mode not in mode_candidates:
+            default_mode = mode_candidates[0]
+        candidates = tuple((mode, lam) for mode in mode_candidates for lam in lambdas)
+        default_candidate = (default_mode, default_lambda)
+
+        paths_y: dict[tuple[str, float], np.ndarray] = {}
+        paths_v: dict[tuple[str, float], np.ndarray] = {}
+        for mode, lam in candidates:
+            if mode == "ar":
+                Xy_fit = np.column_stack([Xy_base, self._ar_training_matrix(log_y)])
+                Xv_fit = np.column_stack([Xv_base, self._ar_training_matrix(log_v)])
+            else:
+                Xy_fit, Xv_fit = Xy_base, Xv_base
+            my = self._new_rls(self._min_y_to_update, return_all_coefs=True, forgetting_factor=lam)
+            my.fit(x=Xy_fit, y=log_y, priors=self._default_priors(Xy_fit.shape[1]), seed_n_obs=seed_n)
+            paths_y[(mode, lam)] = np.asarray(my.all_coef_[0], dtype=np.float64)
+            mv = self._new_rls(1e-8, return_all_coefs=True, forgetting_factor=lam)
+            mv.fit(x=Xv_fit, y=log_v, priors=self._default_priors(Xv_fit.shape[1]), seed_n_obs=seed_n)
+            paths_v[(mode, lam)] = np.asarray(mv.all_coef_[0], dtype=np.float64)
+
+        def predict_block(Xbase, coef, history_actual, start, end, mode):
+            hist = list(history_actual[:start].astype(float, copy=False))
+            pred = np.zeros(end - start, dtype=np.float64)
+            for j, i in enumerate(range(start, end)):
+                xrow = np.concatenate([Xbase[i], self._ar_recursive_row(hist)]) if mode == "ar" else Xbase[i]
+                lp = float(np.clip(xrow @ coef, 0.0, 30.0))
+                pred[j] = max(0.0, np.expm1(lp))
+                if mode == "ar":
+                    hist.append(lp)
+            return pred
+
+        yh = np.full(n, np.nan); vh = np.full(n, np.nan)
+        eligible = np.zeros(n, dtype=bool); block = np.zeros(n, dtype=np.int32)
+        train_days = np.full(n, seed_n, dtype=np.int32)
+        lambda_y = np.full(n, np.nan); lambda_v = np.full(n, np.nan)
+        mode_y = np.full(n, "", dtype=object); mode_v = np.full(n, "", dtype=object)
+        origin = np.full(n, None, dtype=object)
+        cum_ae_y = {c: 0.0 for c in candidates}; cum_den_y = {c: 0.0 for c in candidates}
+        cum_ae_v = {c: 0.0 for c in candidates}; cum_den_v = {c: 0.0 for c in candidates}
+
+        def choose(cae, cden):
+            scored = [(cae[c] / cden[c], c) for c in candidates if cden[c] > 0]
+            return min(scored, key=lambda z: (z[0], z[1][0], z[1][1]))[1] if scored else default_candidate
+
+        bno = 1
+        for s in range(seed_n, n, block_days):
+            e = min(s + block_days, n); boundary = s - 1
+            chosen_y = choose(cum_ae_y, cum_den_y); chosen_v = choose(cum_ae_v, cum_den_v)
+            cand_y = {}; cand_v = {}
+            for c in candidates:
+                mode, lam = c
+                cand_y[c] = predict_block(Xy_base, paths_y[c][boundary], log_y, s, e, mode)
+                cand_v[c] = predict_block(Xv_base, paths_v[c][boundary], log_v, s, e, mode)
+            yh[s:e] = np.round(cand_y[chosen_y], 0); vh[s:e] = np.round(cand_v[chosen_v], 2)
+            eligible[s:e] = True; block[s:e] = bno; train_days[s:e] = s
+            mode_y[s:e], lambda_y[s:e] = chosen_y; mode_v[s:e], lambda_v[s:e] = chosen_v
+            origin_date = base["ds"][boundary]
+            origin[s:e] = [origin_date] * (e - s)
+            valid_y = np.isfinite(y[s:e]) & (y[s:e] != 0); valid_v = np.isfinite(v[s:e]) & (v[s:e] != 0)
+            for c in candidates:
+                if valid_y.any():
+                    cum_ae_y[c] += float(np.abs(y[s:e][valid_y] - cand_y[c][valid_y]).sum()); cum_den_y[c] += float(np.abs(y[s:e][valid_y]).sum())
+                if valid_v.any():
+                    cum_ae_v[c] += float(np.abs(v[s:e][valid_v] - cand_v[c][valid_v]).sum()); cum_den_v[c] += float(np.abs(v[s:e][valid_v]).sum())
+            bno += 1
+
+        out = pl.DataFrame({
+            "unique_id": [uid] * n, "ds": actual["ds"], "value": actual["value"], "valuehat": vh,
+            "y": actual["y"], "yhat": yh, "period_type": actual["_source_period"],
+            "rls_metric_eligible": eligible, "rls_block": block, "rls_train_days": train_days,
+            "rls_lambda_y": lambda_y, "rls_lambda_value": lambda_v,
+            "rls_dynamics_y": mode_y.tolist(), "rls_dynamics_value": mode_v.tolist(),
+            "rls_forecast_origin": origin.tolist(),
+        })
+        if meta:
+            out = out.with_columns([pl.lit(vv).alias(k) for k, vv in meta.items()])
+        for c in ("sku_desc", "store_name", "seccion"):
+            if c in train_g.columns and c not in out.columns:
+                out = out.with_columns(pl.lit(train_g[c][0]).alias(c))
+
+        final_cy = choose(cum_ae_y, cum_den_y); final_cv = choose(cum_ae_v, cum_den_v)
+        final_py = paths_y[final_cy][-1].ravel(); final_pv = paths_v[final_cv][-1].ravel()
+        if fcst_g is not None and fcst_g.height:
+            fcst_g = fcst_g.sort("ds")
+            Xyf_base = self._finite_matrix(fcst_g, self._driver_cols, uid=uid, stage="RLS forecast y")
+            Xvf_base = self._finite_matrix(fcst_g, self._driver_cols_price, uid=uid, stage="RLS forecast value")
+            cy = choose(cum_ae_y, cum_den_y); cv = choose(cum_ae_v, cum_den_v)
+            def predict_future(Xbase, coef, hist_actual, mode):
+                hist = list(hist_actual.astype(float, copy=False)); pred = np.zeros(Xbase.shape[0], dtype=np.float64)
+                for j in range(Xbase.shape[0]):
+                    xrow = np.concatenate([Xbase[j], self._ar_recursive_row(hist)]) if mode == "ar" else Xbase[j]
+                    lp = float(np.clip(xrow @ coef, 0.0, 30.0)); pred[j] = max(0.0, np.expm1(lp))
+                    if mode == "ar": hist.append(lp)
+                return pred
+            fy = np.round(predict_future(Xyf_base, paths_y[cy][-1], log_y, cy[0]), 0)
+            fv = np.round(predict_future(Xvf_base, paths_v[cv][-1], log_v, cv[0]), 2)
+            forecast_origin = base["ds"][-1]
+            f = pl.DataFrame({
+                "unique_id": [uid] * fcst_g.height, "ds": fcst_g["ds"],
+                "value": fcst_g["value"] if "value" in fcst_g.columns else [0.0] * fcst_g.height, "valuehat": fv,
+                "y": fcst_g["y"] if "y" in fcst_g.columns else [0.0] * fcst_g.height, "yhat": fy,
+                "period_type": ["forecast_only"] * fcst_g.height, "rls_metric_eligible": [False] * fcst_g.height,
+                "rls_block": [bno] * fcst_g.height, "rls_train_days": [n] * fcst_g.height,
+                "rls_lambda_y": [cy[1]] * fcst_g.height, "rls_lambda_value": [cv[1]] * fcst_g.height,
+                "rls_dynamics_y": [cy[0]] * fcst_g.height, "rls_dynamics_value": [cv[0]] * fcst_g.height,
+                "rls_forecast_origin": [forecast_origin] * fcst_g.height,
+            })
+            if meta:
+                f = f.with_columns([pl.lit(vv).alias(k) for k, vv in meta.items()])
+            for c in ("sku_desc", "store_name", "seccion"):
+                if c in train_g.columns and c not in f.columns:
+                    f = f.with_columns(pl.lit(train_g[c][0]).alias(c))
+            out = pl.concat([out, f], how="diagonal_relaxed")
+            final_py = paths_y[cy][-1].ravel(); final_pv = paths_v[cv][-1].ravel()
+
+        logger.info(
+            "%s %s: expanding-%dd | dynamics=%s | lambdas=%s | final y=%s/%.3f v=%s/%.3f",
+            desc, uid, block_days, mode_candidates, lambdas, final_cy[0], final_cy[1], final_cv[0], final_cv[1],
+        )
+        logger.info(
+            "⏱ %s %s: RLS candidatos + bloques: %.1fs",
+            desc,
+            uid,
+            time.perf_counter() - t_rls_total,
+        )
+        return [out.sort("ds")], (final_py, final_pv)
+
     def fit_and_predict_sections(
-        self,
-        train: pl.DataFrame,
-        targets: dict[str, pl.DataFrame],
-        section_ids: list[str],
-        desc: str = "RLS sección",
-        meta: dict | None = None,
-    ) -> tuple[pl.DataFrame, dict[str, tuple[np.ndarray, np.ndarray]]]:
-        """
-        Ajusta RLS para los `section_ids` dados (sección o tienda).
-        Devuelve (res_df, coefs) con coefs[id] = (coef_y, coef_p).
-        """
-        train_parts = self._normalize_partition_dict(
-            train.partition_by("unique_id", as_dict=True)
-        )
-        target_parts = {
-            name: self._normalize_partition_dict(
-                df.partition_by("unique_id", as_dict=True)
-            )
-            for name, df in targets.items()
-            if df.height
-        }
-
-        results: list[pl.DataFrame] = []
-        coefs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self, train: pl.DataFrame, targets: dict[str, pl.DataFrame],
+        section_ids: list[str], desc: str="RLS sección", meta: dict|None=None,
+    ) -> tuple[pl.DataFrame, dict[str, tuple[np.ndarray,np.ndarray]]]:
+        train_parts=self._normalize_partition_dict(train.partition_by("unique_id",as_dict=True))
+        target_parts={name:self._normalize_partition_dict(df.partition_by("unique_id",as_dict=True))
+                      for name,df in targets.items() if df.height}
+        results=[]; coefs={}
+        mode=str(getattr(settings,"RLS_FIT_MODE","expanding_28")).lower()
+        block_days=int(getattr(settings,"RLS_BLOCK_DAYS",28))
         for uid in section_ids:
-            train_g = train_parts.get(uid)
-            if train_g is None or train_g.height == 0:
-                continue
-            try:
-                model_y, model_p = self._fit_models(train_g)
-            except Exception as exc:
-                logger.warning("%s: fit falló para %s: %s", desc, uid, exc)
-                continue
-            coefs[uid] = (
-                np.asarray(model_y.final_coef_[0], dtype=np.float64).ravel(),
-                np.asarray(model_p.final_coef_[0], dtype=np.float64).ravel(),
-                # np.asarray(model_y.final_coef_[0], dtype=np.float32).ravel(),
-                # np.asarray(model_p.final_coef_[0], dtype=np.float32).ravel(),
-            )
-            for name, parts in target_parts.items():
-                test_g = parts.get(uid)
-                if test_g is None or test_g.height == 0:
-                    continue
+            g=train_parts.get(uid)
+            if g is None or g.height==0: continue
+            if mode=="expanding_28":
                 try:
-                    frame = self._predict_with_models(
-                        uid, model_y, model_p, train_g, test_g, meta
-                    )
+                    parts,cf=self._fit_and_predict_expanding_blocks(uid,g,target_parts,meta=meta,desc=desc,block_days=block_days)
+                    results.extend(parts)
+                    if cf is not None: coefs[uid]=cf
                 except Exception as exc:
-                    logger.warning(
-                        "%s: predict falló para %s/%s: %s", desc, uid, name, exc
-                    )
-                    continue
-                if frame is not None and frame.height:
-                    results.append(
-                        frame.with_columns(pl.lit(name).alias("period_type"))
-                    )
-
-        res_df = (
-            pl.concat(results, how="diagonal_relaxed") if results else pl.DataFrame()
-        )
-        return res_df, coefs
+                    logger.warning("%s: expanding-%d falló para %s: %s",desc,block_days,uid,exc)
+                continue
+            try: my,mv=self._fit_models(g)
+            except Exception as exc:
+                logger.warning("%s: fit falló para %s: %s",desc,uid,exc); continue
+            coefs[uid]=(np.asarray(my.final_coef_[0],dtype=np.float64).ravel(),
+                        np.asarray(mv.final_coef_[0],dtype=np.float64).ravel())
+            for name,parts in target_parts.items():
+                tg=parts.get(uid)
+                if tg is None or tg.height==0: continue
+                try: fr=self._predict_with_models(uid,my,mv,g,tg,meta)
+                except Exception as exc:
+                    logger.warning("%s: predict falló para %s/%s: %s",desc,uid,name,exc); continue
+                if fr is not None and fr.height:
+                    results.append(fr.with_columns(
+                        pl.lit(name).alias("period_type"),
+                        pl.lit(True).alias("rls_metric_eligible"),
+                        pl.lit(None).cast(pl.Int32).alias("rls_block"),
+                        pl.lit(g.height).cast(pl.Int32).alias("rls_train_days")))
+        return (pl.concat(results,how="diagonal_relaxed") if results else pl.DataFrame()),coefs
 
     # ── Corrección de sesgo OOS / forecast ────────────────────────────────
     @staticmethod
@@ -289,6 +473,16 @@ class RLSForecastRunner:
         lo, hi = float(clip[0]), float(clip[1])
 
         train = res_df.filter(pl.col("period_type") == "in_sample")
+        # Fast leaf forecasts are already robustly calibrated and can contain
+        # millions of sparse historical rows. Excluding them here avoids a
+        # costly leaf-level group_by and prevents bias correction from changing
+        # the benchmarked leaf model.
+        if "modelo_seleccionado" in train.columns:
+            train = train.filter(
+                ~pl.col("modelo_seleccionado")
+                .cast(pl.Utf8)
+                .str.starts_with("fast_leaf")
+            )
         if train.height == 0:
             return res_df
 
@@ -430,7 +624,14 @@ class RLSForecastRunner:
 
         is_corr = pl.col("period_type").is_in(["out_sample", "forecast_only"])
         if "modelo_seleccionado" in out.columns:
-            is_corr = is_corr & ~pl.col("modelo_seleccionado").cast(pl.Utf8).str.starts_with("baseline:")
+            _model = pl.col("modelo_seleccionado").cast(pl.Utf8)
+            is_corr = (
+                is_corr
+                & ~_model.str.starts_with("baseline:")
+                & ~_model.str.starts_with("fast_leaf")
+                & ~_model.str.starts_with("leaf_ses28")
+                & ~_model.str.starts_with("leaf_adaptive")
+            )
         exprs = [
             pl.when(is_corr)
             .then(
@@ -852,6 +1053,662 @@ class RLSForecastRunner:
                 clipped,
             )
         return out
+
+    def fast_leaf_forecasts(
+        self,
+        train_leaves: pl.DataFrame,
+        oos_leaves: pl.DataFrame,
+        section_id: str,
+        horizons: dict,
+        meta: dict | None = None,
+        parent_forecasts: pl.DataFrame | None = None,
+        actual_extension_leaves: pl.DataFrame | None = None,
+    ) -> pl.DataFrame:
+        """Production leaf model: residual SES in log-space + parent RLS shape.
+
+        The 28-day client contract is strict.  For every SKU+store and target
+        block, the candidate (parent, alpha) is chosen only from cumulative
+        WMAPE of earlier forecast blocks.  The current block never tunes itself.
+        """
+        if train_leaves.height == 0:
+            return pl.DataFrame()
+
+        t_leaf_total = time.perf_counter()
+        uid_col = "unique_id"
+        block_days = int(getattr(settings, "RLS_BLOCK_DAYS", 28))
+        warmup_days = block_days
+        default_alpha = float(getattr(settings, "LEAF_SES_ALPHA", 0.70))
+        alpha_candidates = tuple(
+            sorted(
+                {
+                    float(a)
+                    for a in getattr(
+                        settings,
+                        "LEAF_SES_ALPHA_CANDIDATES",
+                        (0.20, 0.40, 0.60, 0.70, 0.80),
+                    )
+                    if 0.0 < float(a) <= 1.0
+                }
+                | {default_alpha}
+            )
+        )
+
+        train_start = horizons["train_start"]
+        test_start = horizons["test_start"]
+        test_end = horizons["test_end"]
+        forecast_start = horizons["forecast_start"]
+        forecast_end = horizons["forecast_end"]
+        warmup_end = train_start + dt.timedelta(days=warmup_days - 1)
+        metric_start = warmup_end + dt.timedelta(days=1)
+
+        train_obs = train_leaves.with_columns(pl.col("ds").cast(pl.Date))
+        oos_obs = (
+            oos_leaves.with_columns(pl.col("ds").cast(pl.Date))
+            if oos_leaves.height
+            else pl.DataFrame()
+        )
+        meta_cols = [
+            c
+            for c in ("sku_desc", "store_name", "seccion", "conteo_sku")
+            if c in train_obs.columns
+        ]
+        ids = (
+            train_obs.select([uid_col] + meta_cols)
+            .group_by(uid_col)
+            .agg([pl.col(c).drop_nulls().first().alias(c) for c in meta_cols])
+            if meta_cols
+            else train_obs.select(uid_col).unique()
+        )
+
+        def block_expr() -> pl.Expr:
+            return (
+                ((pl.col("ds") - pl.lit(train_start)).dt.total_days() // block_days)
+                .cast(pl.Int32)
+                .alias("_block")
+            )
+
+        # Initial structural level: mean of actual observations available in
+        # days 1..28, transformed once to log-space.  No sum/28 dilution.
+        min_initial = int(getattr(settings, "LEAF_INITIAL_MIN_POINTS", 7))
+        initial = (
+            train_obs.filter(
+                (pl.col("ds") >= pl.lit(train_start))
+                & (pl.col("ds") <= pl.lit(warmup_end))
+            )
+            .group_by(uid_col)
+            .agg(
+                pl.col("y").filter(pl.col("y").is_finite()).mean().alias("_mean_y0"),
+                pl.col("y").filter(pl.col("y").is_finite()).median().alias("_med_y0"),
+                pl.col("y").filter(pl.col("y").is_finite()).len().alias("_n_y0"),
+                pl.col("value").filter(pl.col("value").is_finite()).mean().alias("_mean_v0"),
+                pl.col("value").filter(pl.col("value").is_finite()).median().alias("_med_v0"),
+                pl.col("value").filter(pl.col("value").is_finite()).len().alias("_n_v0"),
+            )
+        )
+        state0 = (
+            ids.select(uid_col)
+            .join(initial, on=uid_col, how="left")
+            .with_columns(
+                pl.when(pl.col("_n_y0").fill_null(0) >= min_initial)
+                .then(pl.col("_mean_y0"))
+                .otherwise(pl.coalesce("_med_y0", "_mean_y0", pl.lit(0.0)))
+                .fill_nan(0.0).fill_null(0.0).clip(lower_bound=0.0)
+                .log1p().alias("_level_log_y"),
+                pl.when(pl.col("_n_v0").fill_null(0) >= min_initial)
+                .then(pl.col("_mean_v0"))
+                .otherwise(pl.coalesce("_med_v0", "_mean_v0", pl.lit(0.0)))
+                .fill_nan(0.0).fill_null(0.0).clip(lower_bound=0.0)
+                .log1p().alias("_level_log_v"),
+            )
+            .select(uid_col, "_level_log_y", "_level_log_v")
+        )
+
+        # Parent RLS contributes SHAPE only.  Centering log1p(parent forecast)
+        # inside each 28-day block removes the parent intercept/level.
+        parent = (
+            parent_forecasts.with_columns(pl.col("ds").cast(pl.Date), block_expr())
+            if parent_forecasts is not None and parent_forecasts.height
+            else pl.DataFrame()
+        )
+        parent_effects = pl.DataFrame()
+        if parent.height:
+            parent_effects = (
+                parent.filter(pl.col("_block") >= 1)
+                .with_columns(
+                    pl.col("yhat").fill_null(0.0).clip(lower_bound=0.0).log1p().alias("_log_py"),
+                    pl.col("valuehat").fill_null(0.0).clip(lower_bound=0.0).log1p().alias("_log_pv"),
+                )
+                .with_columns(
+                    (pl.col("_log_py") - pl.col("_log_py").mean().over(["unique_id", "_block"]))
+                    .alias("_effect_y"),
+                    (pl.col("_log_pv") - pl.col("_log_pv").mean().over(["unique_id", "_block"]))
+                    .alias("_effect_v"),
+                )
+                .select("unique_id", "ds", "_block", "_effect_y", "_effect_v")
+            )
+
+        # Observed leaf rows through OOS only.  No post-OOS leakage.
+        actual_parts = [
+            train_obs.select(
+                [c for c in (uid_col, "ds", "y", "value") if c in train_obs.columns]
+            )
+        ]
+        if oos_obs.height:
+            actual_parts.append(
+                oos_obs.select(
+                    [c for c in (uid_col, "ds", "y", "value") if c in oos_obs.columns]
+                )
+            )
+        actual_obs = (
+            pl.concat(actual_parts, how="diagonal_relaxed")
+            .sort([uid_col, "ds"])
+            .with_columns(block_expr())
+        )
+
+        # Dense only for OOS + forecast-only (56 days), never full leaf history.
+        uid_arr = ids[uid_col].to_numpy()
+        oos_dates = pl.date_range(test_start, test_end, interval="1d", eager=True).to_numpy()
+        fc_dates = pl.date_range(forecast_start, forecast_end, interval="1d", eager=True).to_numpy()
+
+        oos_grid = pl.DataFrame(
+            {uid_col: np.repeat(uid_arr, len(oos_dates)), "ds": np.tile(oos_dates, len(uid_arr))}
+        ).with_columns(pl.col("ds").cast(pl.Date))
+        if meta_cols:
+            oos_grid = oos_grid.join(ids, on=uid_col, how="left")
+        if oos_obs.height:
+            oos_grid = oos_grid.join(
+                oos_obs.select(uid_col, "ds", "y", "value"),
+                on=[uid_col, "ds"], how="left",
+            )
+        oos_grid = oos_grid.with_columns(
+            (pl.col("y").fill_null(0.0) if "y" in oos_grid.columns else pl.lit(0.0).alias("y")),
+            (pl.col("value").fill_null(0.0) if "value" in oos_grid.columns else pl.lit(0.0).alias("value")),
+            pl.lit("out_sample").alias("period_type"),
+        )
+
+        forecast_grid = pl.DataFrame(
+            {
+                uid_col: np.repeat(uid_arr, len(fc_dates)),
+                "ds": np.tile(fc_dates, len(uid_arr)),
+                "y": np.zeros(len(uid_arr) * len(fc_dates)),
+                "value": np.zeros(len(uid_arr) * len(fc_dates)),
+            }
+        ).with_columns(
+            pl.col("ds").cast(pl.Date),
+            pl.lit("forecast_only").alias("period_type"),
+        )
+        if meta_cols:
+            forecast_grid = forecast_grid.join(ids, on=uid_col, how="left")
+
+        historical = train_obs.filter(pl.col("ds") >= pl.lit(metric_start)).select(
+            [c for c in (uid_col, "ds", "y", "value") + tuple(meta_cols) if c in train_obs.columns]
+        ).with_columns(pl.lit("in_sample").alias("period_type"))
+
+        rows = pl.concat(
+            [historical, oos_grid, forecast_grid], how="diagonal_relaxed"
+        ).with_columns(
+            block_expr(),
+            pl.col(uid_col).str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
+        )
+
+        # Join store and section log-effects.
+        if parent_effects.height:
+            store_eff = parent_effects.filter(
+                pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 1
+            ).select(
+                pl.col("unique_id").alias("_store_uid"), "ds",
+                pl.col("_effect_y").alias("_store_ey"),
+                pl.col("_effect_v").alias("_store_ev"),
+            )
+            sec_eff = parent_effects.filter(
+                pl.col("unique_id") == str(section_id)
+            ).select(
+                "ds",
+                pl.col("_effect_y").alias("_sec_ey"),
+                pl.col("_effect_v").alias("_sec_ev"),
+            )
+            rows = rows.join(store_eff, on=["_store_uid", "ds"], how="left")
+            rows = rows.join(sec_eff, on="ds", how="left")
+
+        for c in ("_store_ey", "_store_ev", "_sec_ey", "_sec_ev"):
+            if c not in rows.columns:
+                rows = rows.with_columns(pl.lit(0.0).alias(c))
+            else:
+                rows = rows.with_columns(pl.col(c).fill_nan(0.0).fill_null(0.0))
+
+        # Actual observations receive the same causal parent effects used by
+        # their forecast block; these residuals update SES only AFTER block close.
+        actual_resid = actual_obs.with_columns(
+            pl.col(uid_col).str.replace(r"\|\|S:.*$", "").alias("_store_uid")
+        )
+        if parent_effects.height:
+            actual_resid = actual_resid.join(
+                store_eff, on=["_store_uid", "ds"], how="left"
+            ).join(sec_eff, on="ds", how="left")
+        for c in ("_store_ey", "_store_ev", "_sec_ey", "_sec_ev"):
+            if c not in actual_resid.columns:
+                actual_resid = actual_resid.with_columns(pl.lit(0.0).alias(c))
+            else:
+                actual_resid = actual_resid.with_columns(pl.col(c).fill_nan(0.0).fill_null(0.0))
+
+        max_block = int((forecast_end - train_start).days // block_days)
+        actual_last_block = int((test_end - train_start).days // block_days)
+
+        # ── Vectorized candidate engine ────────────────────────────────────
+        # v8.2 keeps exactly the same 15 candidates (3 parents × 5 alphas),
+        # but evaluates ALL candidates of a leaf in one Polars pass per block.
+        # This replaces the v8.1 nested parent×alpha×block loop, which repeated
+        # filter/join/group_by hundreds of times over the same observations.
+        t_candidates = time.perf_counter()
+
+        actual_resid = actual_resid.with_columns(
+            pl.lit(0.0).alias("_none_ey"),
+            pl.lit(0.0).alias("_none_ev"),
+        )
+        rows = rows.with_columns(
+            pl.lit(0.0).alias("_none_ey"),
+            pl.lit(0.0).alias("_none_ev"),
+        )
+
+        params = pl.DataFrame(
+            [
+                {
+                    "_parent": parent_name,
+                    "_alpha": float(alpha_c),
+                    "_candidate": f"{parent_name}|{float(alpha_c):.3f}",
+                }
+                for parent_name in ("store", "section", "none")
+                for alpha_c in alpha_candidates
+            ]
+        )
+
+        # One compact state row per SKU×candidate.  Cumulative errors live in
+        # this table, so no historical candidate-score DataFrame is rebuilt.
+        current = (
+            ids.select(uid_col)
+            .join(params, how="cross")
+            .join(state0, on=uid_col, how="left")
+            .with_columns(
+                pl.lit(0.0).alias("_cae_y"),
+                pl.lit(0.0).alias("_cden_y"),
+                pl.lit(0.0).alias("_cae_v"),
+                pl.lit(0.0).alias("_cden_v"),
+            )
+        )
+
+        # Partition actual rows ONCE.  v8.1 re-filtered the full history inside
+        # every candidate/block iteration.
+        obs_by_block: dict[int, pl.DataFrame] = {}
+        if actual_resid.height:
+            for key, frame in actual_resid.partition_by(
+                "_block", as_dict=True, maintain_order=True
+            ).items():
+                k = key[0] if isinstance(key, tuple) else key
+                obs_by_block[int(k)] = frame
+
+        chosen_frames: list[pl.DataFrame] = []
+        default_candidate = f"store|{default_alpha:.3f}"
+
+        for block_i in range(1, max_block + 1):
+            # Candidate choice at the block origin uses cumulative errors only
+            # through block_i-1.  Therefore the semantics are identical to v8.1.
+            if block_i == 1:
+                choices_block = ids.select(uid_col).with_columns(
+                    pl.lit(default_candidate).alias("_candidate_y"),
+                    pl.lit(default_candidate).alias("_candidate_v"),
+                )
+            else:
+                ranked = current.with_columns(
+                    pl.when(pl.col("_cden_y") > 0)
+                    .then(pl.col("_cae_y") / pl.col("_cden_y"))
+                    .otherwise(float("inf"))
+                    .alias("_wmape_y"),
+                    pl.when(pl.col("_cden_v") > 0)
+                    .then(pl.col("_cae_v") / pl.col("_cden_v"))
+                    .otherwise(float("inf"))
+                    .alias("_wmape_v"),
+                )
+                choices_block = ranked.group_by(uid_col).agg(
+                    pl.col("_candidate")
+                    .sort_by("_wmape_y", "_candidate")
+                    .first()
+                    .alias("_candidate_y"),
+                    pl.col("_candidate")
+                    .sort_by("_wmape_v", "_candidate")
+                    .first()
+                    .alias("_candidate_v"),
+                )
+
+            # Store ONLY the two selected states required for final output.
+            # v8.1 retained all 15 states for all blocks and joined them later.
+            chosen_y = (
+                current.join(choices_block, on=uid_col, how="inner")
+                .filter(pl.col("_candidate") == pl.col("_candidate_y"))
+                .select(
+                    uid_col,
+                    pl.lit(block_i).cast(pl.Int32).alias("_block"),
+                    "_candidate_y",
+                    pl.col("_level_log_y"),
+                    pl.col("_parent").alias("_parent_y"),
+                    pl.col("_alpha").alias("_alpha_y"),
+                )
+            )
+            chosen_v = (
+                current.join(choices_block, on=uid_col, how="inner")
+                .filter(pl.col("_candidate") == pl.col("_candidate_v"))
+                .select(
+                    uid_col,
+                    pl.lit(block_i).cast(pl.Int32).alias("_block"),
+                    "_candidate_v",
+                    pl.col("_level_log_v"),
+                    pl.col("_parent").alias("_parent_v"),
+                    pl.col("_alpha").alias("_alpha_v"),
+                )
+            )
+            chosen_frames.append(
+                chosen_y.join(
+                    chosen_v, on=[uid_col, "_block"], how="inner"
+                )
+            )
+
+            obs_block = obs_by_block.get(block_i)
+            if obs_block is None or obs_block.height == 0:
+                continue
+
+            # Expand this 28-day block to the 15 candidates ONCE, score them
+            # and compute the SES end-state in the same grouped aggregation.
+            expanded = (
+                obs_block.join(
+                    current.select(
+                        uid_col,
+                        "_candidate",
+                        "_parent",
+                        "_alpha",
+                        "_level_log_y",
+                        "_level_log_v",
+                    ),
+                    on=uid_col,
+                    how="inner",
+                )
+                .with_columns(
+                    pl.when(pl.col("_parent") == "store")
+                    .then(pl.col("_store_ey"))
+                    .when(pl.col("_parent") == "section")
+                    .then(pl.col("_sec_ey"))
+                    .otherwise(pl.col("_none_ey"))
+                    .alias("_ey"),
+                    pl.when(pl.col("_parent") == "store")
+                    .then(pl.col("_store_ev"))
+                    .when(pl.col("_parent") == "section")
+                    .then(pl.col("_sec_ev"))
+                    .otherwise(pl.col("_none_ev"))
+                    .alias("_ev"),
+                )
+                .sort([uid_col, "_candidate", "ds"])
+                .with_columns(
+                    (
+                        pl.col("_level_log_y") + pl.col("_ey")
+                    )
+                    .clip(0.0, 30.0)
+                    .exp()
+                    .sub(1.0)
+                    .alias("_pred_y"),
+                    (
+                        pl.col("_level_log_v") + pl.col("_ev")
+                    )
+                    .clip(0.0, 30.0)
+                    .exp()
+                    .sub(1.0)
+                    .alias("_pred_v"),
+                    (
+                        pl.col("y").clip(lower_bound=0.0).log1p()
+                        - pl.col("_ey")
+                    ).alias("_zy"),
+                    (
+                        pl.col("value").clip(lower_bound=0.0).log1p()
+                        - pl.col("_ev")
+                    ).alias("_zv"),
+                    (
+                        pl.col("ds")
+                        .cum_count()
+                        .over([uid_col, "_candidate"])
+                        - 1
+                    ).alias("_j"),
+                    pl.len()
+                    .over([uid_col, "_candidate"])
+                    .alias("_n_obs"),
+                )
+                .with_columns(
+                    (
+                        pl.col("_alpha")
+                        * (pl.lit(1.0) - pl.col("_alpha")).pow(
+                            pl.col("_n_obs") - 1 - pl.col("_j")
+                        )
+                    ).alias("_w")
+                )
+                .group_by(
+                    [uid_col, "_candidate", "_parent", "_alpha"]
+                )
+                .agg(
+                    pl.when(
+                        pl.col("y").is_finite() & (pl.col("y") != 0)
+                    )
+                    .then((pl.col("y") - pl.col("_pred_y")).abs())
+                    .otherwise(None)
+                    .sum()
+                    .alias("_ae_y"),
+                    pl.when(
+                        pl.col("y").is_finite() & (pl.col("y") != 0)
+                    )
+                    .then(pl.col("y").abs())
+                    .otherwise(None)
+                    .sum()
+                    .alias("_den_y"),
+                    pl.when(
+                        pl.col("value").is_finite()
+                        & (pl.col("value") != 0)
+                    )
+                    .then((pl.col("value") - pl.col("_pred_v")).abs())
+                    .otherwise(None)
+                    .sum()
+                    .alias("_ae_v"),
+                    pl.when(
+                        pl.col("value").is_finite()
+                        & (pl.col("value") != 0)
+                    )
+                    .then(pl.col("value").abs())
+                    .otherwise(None)
+                    .sum()
+                    .alias("_den_v"),
+                    (pl.col("_zy") * pl.col("_w"))
+                    .sum()
+                    .alias("_wzy"),
+                    (pl.col("_zv") * pl.col("_w"))
+                    .sum()
+                    .alias("_wzv"),
+                    pl.col("_n_obs").max().alias("_n_obs"),
+                )
+            )
+
+            # Score the block for future selection.  Update SES only after a
+            # block whose actuals are legitimately known at the next origin.
+            current = (
+                current.join(
+                    expanded,
+                    on=[uid_col, "_candidate", "_parent", "_alpha"],
+                    how="left",
+                )
+                .with_columns(
+                    (
+                        pl.col("_cae_y")
+                        + pl.col("_ae_y").fill_null(0.0)
+                    ).alias("_cae_y"),
+                    (
+                        pl.col("_cden_y")
+                        + pl.col("_den_y").fill_null(0.0)
+                    ).alias("_cden_y"),
+                    (
+                        pl.col("_cae_v")
+                        + pl.col("_ae_v").fill_null(0.0)
+                    ).alias("_cae_v"),
+                    (
+                        pl.col("_cden_v")
+                        + pl.col("_den_v").fill_null(0.0)
+                    ).alias("_cden_v"),
+                    pl.when(pl.lit(block_i <= actual_last_block))
+                    .then(
+                        (pl.lit(1.0) - pl.col("_alpha")).pow(
+                            pl.col("_n_obs").fill_null(0)
+                        )
+                        * pl.col("_level_log_y")
+                        + pl.col("_wzy").fill_null(0.0)
+                    )
+                    .otherwise(pl.col("_level_log_y"))
+                    .alias("_level_log_y"),
+                    pl.when(pl.lit(block_i <= actual_last_block))
+                    .then(
+                        (pl.lit(1.0) - pl.col("_alpha")).pow(
+                            pl.col("_n_obs").fill_null(0)
+                        )
+                        * pl.col("_level_log_v")
+                        + pl.col("_wzv").fill_null(0.0)
+                    )
+                    .otherwise(pl.col("_level_log_v"))
+                    .alias("_level_log_v"),
+                )
+                .select(
+                    uid_col,
+                    "_candidate",
+                    "_parent",
+                    "_alpha",
+                    "_level_log_y",
+                    "_level_log_v",
+                    "_cae_y",
+                    "_cden_y",
+                    "_cae_v",
+                    "_cden_v",
+                )
+            )
+
+        chosen_states = pl.concat(
+            chosen_frames, how="vertical_relaxed"
+        )
+
+        rows = (
+            rows.join(
+                chosen_states, on=[uid_col, "_block"], how="left"
+            )
+            .with_columns(
+                pl.when(pl.col("_parent_y") == "store")
+                .then(pl.col("_store_ey"))
+                .when(pl.col("_parent_y") == "section")
+                .then(pl.col("_sec_ey"))
+                .otherwise(pl.col("_none_ey"))
+                .alias("_ey"),
+                pl.when(pl.col("_parent_v") == "store")
+                .then(pl.col("_store_ev"))
+                .when(pl.col("_parent_v") == "section")
+                .then(pl.col("_sec_ev"))
+                .otherwise(pl.col("_none_ev"))
+                .alias("_ev"),
+            )
+            .with_columns(
+                (
+                    pl.col("_level_log_y") + pl.col("_ey")
+                )
+                .clip(0.0, 30.0)
+                .exp()
+                .sub(1.0)
+                .clip(lower_bound=0.0)
+                .round(0)
+                .alias("yhat"),
+                (
+                    pl.col("_level_log_v") + pl.col("_ev")
+                )
+                .clip(0.0, 30.0)
+                .exp()
+                .sub(1.0)
+                .clip(lower_bound=0.0)
+                .round(2)
+                .alias("valuehat"),
+                pl.concat_str(
+                    [
+                        pl.lit("leaf_residual_ses:"),
+                        pl.col("_parent_y"),
+                        pl.lit("/"),
+                        pl.col("_parent_v"),
+                    ]
+                ).alias("modelo_seleccionado"),
+                pl.col("_alpha_y").alias("ses_alpha_y"),
+                pl.col("_alpha_v").alias("ses_alpha_value"),
+                pl.col("_parent_y").alias("parent_model_y"),
+                pl.col("_parent_v").alias("parent_model_value"),
+                pl.col("_ey").alias("driver_effect"),
+                pl.col("_ev").alias("driver_effect_value"),
+                pl.lit(True).alias("rls_metric_eligible"),
+                pl.col("_block").alias("rls_block"),
+                (pl.col("_block") * block_days)
+                .cast(pl.Int32)
+                .alias("rls_train_days"),
+            )
+        )
+
+        logger.info(
+            "⏱ Sección %s: selección leaf vectorizada (%d candidatos): %.1fs",
+            section_id,
+            params.height,
+            time.perf_counter() - t_candidates,
+        )
+
+        # Warm-up is visual continuity only; never official metrics.
+        warm = (
+            train_obs.filter(pl.col("ds") <= pl.lit(warmup_end))
+            .join(state0, on=uid_col, how="left")
+            .with_columns(
+                pl.col("_level_log_y").exp().sub(1.0).clip(lower_bound=0.0).round(0).alias("yhat"),
+                pl.col("_level_log_v").exp().sub(1.0).clip(lower_bound=0.0).round(2).alias("valuehat"),
+                pl.lit("in_sample").alias("period_type"),
+                pl.lit("leaf_warmup_mean_actuals").alias("modelo_seleccionado"),
+                pl.lit(default_alpha).alias("ses_alpha_y"),
+                pl.lit(default_alpha).alias("ses_alpha_value"),
+                pl.lit("warmup").alias("parent_model_y"),
+                pl.lit("warmup").alias("parent_model_value"),
+                pl.lit(0.0).alias("driver_effect"),
+                pl.lit(0.0).alias("driver_effect_value"),
+                pl.lit(False).alias("rls_metric_eligible"),
+                pl.lit(0).cast(pl.Int32).alias("rls_block"),
+                pl.lit(warmup_days).cast(pl.Int32).alias("rls_train_days"),
+            )
+        )
+
+        drop_tmp = [
+            c for c in (
+                "_block", "_store_uid", "_store_ey", "_store_ev", "_sec_ey", "_sec_ev",
+                "_none_ey", "_none_ev",
+                "_candidate_y", "_candidate_v", "_level_log_y", "_level_log_v",
+                "_parent_y", "_parent_v", "_alpha_y", "_alpha_v", "_ey", "_ev",
+            ) if c in rows.columns
+        ]
+        rows = rows.drop(drop_tmp)
+        warm = warm.drop(
+            [c for c in ("_level_log_y", "_level_log_v") if c in warm.columns]
+        )
+
+        if meta:
+            warm = warm.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
+            rows = rows.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
+
+        logger.info(
+            "Sección %s: leaf residual-SES log-space | %d hojas | alphas=%s | "
+            "candidato tienda/sección/SES-directo por WMAPE acumulado previo",
+            section_id, ids.height, alpha_candidates,
+        )
+        logger.info(
+            "⏱ Sección %s: FAST SKU+tienda total: %.1fs",
+            section_id,
+            time.perf_counter() - t_leaf_total,
+        )
+        return pl.concat([warm, rows], how="diagonal_relaxed").sort([uid_col, "ds"])
 
     def derive_sku_store_forecasts(
         self,

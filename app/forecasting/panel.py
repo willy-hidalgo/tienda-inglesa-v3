@@ -1,15 +1,11 @@
 """Dense daily panel construction."""
-
 from __future__ import annotations
-
 import datetime as dt
 import logging
-
 import numpy as np
 import polars as pl
 
 logger = logging.getLogger(__name__)
-
 
 def densify_section_panel(
     df: pl.DataFrame,

@@ -66,6 +66,9 @@ SERIES_COLS_PREFERRED = [
     "forecast_end",
     "driver_effect",
     "driver_effect_value",
+    "rls_metric_eligible",
+    "rls_block",
+    "rls_train_days",
 ]
 
 # Columnas mínimas para WMAPE (reduce picos de memoria al preparar unidades)

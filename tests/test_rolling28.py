@@ -1,10 +1,4 @@
-"""Tests del rolling 28d que sigue vivo.
-
-El cálculo de rolling28 en el pipeline se desactivó (COMPUTE_ROLLING_28=False):
-forecasts.py ya no genera yhat28/valuehat28. El dashboard conserva el soporte
-de mostrar/métrívar esas columnas SI existen en el parquet. Estos tests cubren
-esa capa viva: settings y backend.metrics_rolling28.
-"""
+"""Compatibilidad de métricas 28d y contrato expanding-28 vigente."""
 from __future__ import annotations
 
 import datetime as dt
@@ -20,15 +14,10 @@ sys.path.insert(0, str(ROOT / "app"))
 import settings
 
 
-def test_rolling_horizon_setting():
-    assert settings.ROLLING_HORIZON_DAYS == 28
-
-
-def test_compute_rolling_28_default_is_false():
-    """El cálculo de rolling28 es opcional y viene desactivado por defecto:
-    el pipeline no genera columnas yhat28/valuehat28 (el dashboard detecta su
-    ausencia por falta de columna)."""
-    assert settings.COMPUTE_ROLLING_28 is False
+def test_expanding_28_settings():
+    assert settings.RLS_BLOCK_DAYS == 28
+    assert settings.RLS_FIT_MODE == "expanding_28"
+    assert settings.METRICS_MODE == "rolling_28"
 
 
 def test_metrics_rolling28_backend():

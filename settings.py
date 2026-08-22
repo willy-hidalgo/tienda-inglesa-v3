@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 # ── Flag de modelo a nivel hoja ──────────────────────────────────────────────
-DEMO_MODE = True  # os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEMO_MODE = os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Corrección de sesgo OOS/forecast: factor = Σy/Σŷ en in_sample (por unique_id).
 # Se aplica solo a out_sample y forecast_only (in_sample queda crudo).
@@ -44,55 +44,56 @@ EXCLUDED_CATEGORIES_FOR_RANGE: list[str] = []
 SALES_DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
 SOURCE_ENCODING = "cp1252"
 
-# Compatibilidad global (el pipeline usa SECCIONES por sección)
+# ─────────────────────────────────────────────────────────────────────────────
+# Forecasting v5: RLS expanding-28 + hojas rápidas con efectos de drivers
+# ─────────────────────────────────────────────────────────────────────────────
+# Fechas globales de compatibilidad; las ventanas operativas se definen por
+# sección en SECCIONES y se resuelven con section_horizons().
 TEST_START = dt.date(2025, 11, 1)
 TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
-ROLLING_HORIZON_DAYS = 28  # yhat28 / valuehat28 walk-forward
-COMPUTE_ROLLING_28 = False  # si False, forecasts.py no calcula yhat28/valuehat28
-# (el dashboard detecta la ausencia de estas
-# columnas en el parquet para ocultar el control
-# de selección de series y la sección de métricas
-# rolling28; ver README § Rolling 28d). Desde el
-# cambio de arquitectura (RLS solo a nivel
-# sección), el rolling28 SOLO se calcula para los
-# nodos de sección — ver README § Modelo jerárquico.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Modelo jerárquico: RLS solo a nivel sección; tienda/sku/tienda+sku se
-# derivan sin RLS (efecto de drivers + suavización exponencial sobre el
-# residuo). Ver README § Modelo jerárquico para el detalle del método.
-# ─────────────────────────────────────────────────────────────────────────────
-SES_ALPHA: float = 0.20  # fallback; el alpha efectivo se selecciona por serie en train
-SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.05, 0.10, 0.20, 0.35, 0.50, 0.70)
-SES_TUNE_VALIDATION_DAYS: int = 28
-SES_TUNE_MIN_VALID_POINTS: int = 7
-OOS_FREEZE_RESIDUAL_STATE: bool = True
-LEAF_BASELINE_GUARDRAIL: bool = True
-LEAF_BASELINE_METHOD_BY_SECTION: dict[str, str] = {
-    # Compatibilidad; el guardrail evalúa todos los candidatos por serie.
-    "1": "median_pos56",
-    "23": "weekday_pos8",
-}
-LEAF_BASELINE_CANDIDATES: tuple[str, ...] = (
-    "median_pos28",
-    "median_pos56",
-    "median_pos84",
-    "weekday_pos4",
-    "weekday_pos8",
-    "weekday_pos12",
-    "seasonal_naive7",
-)
-LEAF_BASELINE_VALIDATION_DAYS: int = 28
-LEAF_BASELINE_LOOKBACK_DAYS: int = 56
-LEAF_BASELINE_MIN_VALID_POINTS: int = 7
-LEAF_BASELINE_MIN_IMPROVEMENT: float = 0.05
-LEAF_BASELINE_CLIP_RATIO: tuple[float, float] = (0.35, 2.50)
-USE_SES: bool = True
+# El artefacto wmape.parquet del pipeline prioriza OOS para evitar agregaciones
+# históricas costosas al cierre de cada sección.
+PIPELINE_WMAPE_OOS_ONLY: bool = True
 
-# aplicada sobre "y_neto" (y menos el efecto de los drivers
-# de la sección) para obtener yhat en nodos tienda/sku/
-# tienda+sku. Fijo (no auto-tuneado) por velocidad.
+# Requisito del cliente:
+#   actuals 1..28   -> modelo para forecast 29..56
+#   actuals 1..56   -> modelo para forecast 57..84
+#   actuals 1..84   -> modelo para forecast 85..112
+# La implementación usa un único recorrido RLS y snapshots de coeficientes en
+# cada corte de 28 días; evita refits completos y conserva la semántica expansiva.
+RLS_FIT_MODE: str = "expanding_28"  # "current" restaura el fit único anterior
+RLS_BLOCK_DAYS: int = 28
+
+# Métricas por defecto de sección/tienda: forecasts acumulados emitidos por los
+# bloques expanding-28. "current" restaura el cálculo anterior.
+METRICS_MODE: str = "rolling_28"
+
+# SKU+tienda: ruta productiva escalable.
+# Los primeros 28 días son warm-up: nivel inicial = promedio de actuals
+# realmente disponibles (no se diluye sum/28 por fechas ausentes). Desde el
+# día 29 SES se actualiza sobre el residuo log-space únicamente al cierre de
+# cada bloque con actuals conocidos.
+FAST_LEAF_MODE: bool = True
+LEAF_INITIAL_LEVEL_DAYS: int = 28
+LEAF_INITIAL_MIN_POINTS: int = 7
+LEAF_SES_ALPHA: float = 0.70  # fallback/default para el primer bloque
+LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.20, 0.40, 0.60, 0.70, 0.80)
+LEAF_PARENT_SELECTION: str = "prior_cumulative_wmape"
+# Motor computacional; no modifica el espacio estadístico de candidatos.
+LEAF_CANDIDATE_ENGINE: str = "vectorized_block"
+# v8: SES modela el nivel desestacionalizado en log-space. Se elimina la
+# escala multiplicativa SKU de v7.x para evitar saltos artificiales de nivel.
+LEAF_RESIDUAL_LOG_SPACE: bool = True
+FAST_LEAF_DRIVER_EFFECTS: bool = True
+FAST_LEAF_DRIVER_FACTOR_CLIP: tuple[float, float] = (0.20, 5.00)
+
+# Métricas oficiales: siempre bottom-up desde SKU+tienda y desde el día 29.
+METRICS_START_DAY: int = 29
+
+# Ranking SKU: mínimo de días con actual distinto de cero.
+RANKING_SKU_MIN_NONZERO_POINTS: int = 15
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
 FECHAS_TEST = (TEST_START, TEST_END)
@@ -156,12 +157,12 @@ SECCIONES = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Niveles de agregación (solo 3)
+# Niveles de agregación
 # ─────────────────────────────────────────────────────────────────────────────
-# unique_id:
-#   "1"                     → sección
-#   "1||00122"              → tienda (local)
-#   "1||00122||SKU123"      → SKU dentro de la tienda
+# IDs canónicos:
+#   "1"                          → sección
+#   "1||T:00122"                 → tienda
+#   "1||T:00122||S:SKU123"       → SKU+tienda
 AGGREGATION_LEVELS = {
     "SECCION": "seccion",
     "STORE_ID": "store",
@@ -177,7 +178,18 @@ NOMBRES_NIVELES = ["seccion", "store", "sku"]
 RMSE_ERROR = 0.2
 CORRECTION_FACTOR = False
 FORGETTING_FACTOR = 0.995
-MIN_Y_TO_UPDATE = 1.0  # umbral mínimo de y para actualizar el RLS (0 => no filtra)
+RLS_FORGETTING_FACTOR_CANDIDATES: tuple[float, ...] = (0.970, 0.985, 0.995)
+RLS_AUTOREGRESSIVE_DRIVERS: bool = True
+# v8.1: AR no se fuerza. Cada bloque elige causalmente entre RLS base y RLS+AR
+# usando exclusivamente el wMAPE acumulado de bloques anteriores. Esto protege
+# OOS contra deriva recursiva de lag/rolling sin eliminar los picos cuando AR gana.
+RLS_DYNAMICS_CANDIDATES: tuple[str, ...] = ("base", "ar")
+RLS_DEFAULT_DYNAMICS: str = "base"
+RLS_AR_LAGS: tuple[int, ...] = (7, 28)
+RLS_AR_ROLLING_WINDOWS: tuple[int, ...] = (7, 28)
+# Los drivers AR del bloque objetivo se construyen recursivamente: nunca usan
+# actuals del propio bloque que todavía no eran conocidos al emitir el forecast.
+MIN_Y_TO_UPDATE = 1.0  # actualiza RLS solo cuando y supera este umbral
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,50 +352,111 @@ def nearest_monday_on_or_after(d: dt.date) -> dt.date:
 def compute_train_window(
     first_data: dt.date, train_end: dt.date, block_days: int = 28
 ) -> tuple[dt.date, dt.date]:
-    """
-    train_end = test_start de la sección.
-    train_start = max(S0, T*), donde:
-      S0 = domingo ≥ first_data
-      T* = train_end - n*block_days  (n máximo tal que T* ≥ S0)
-    """
-    s0 = nearest_sunday_on_or_after(first_data)
-    if train_end < s0:
-        return s0, train_end
-    n = (train_end - s0).days // block_days
-    t_star = train_end - dt.timedelta(days=n * block_days)
-    train_start = max(s0, t_star)
-    return train_start, train_end
+    """Inclusive train window aligned to the first available Monday."""
+    if block_days <= 0:
+        raise ValueError("block_days must be > 0")
+    train_start = nearest_monday_on_or_after(first_data)
+    if train_end < train_start:
+        return train_start, train_end
+    n_days = (train_end - train_start).days + 1
+    n_complete = n_days // block_days
+    if n_complete < 1:
+        return train_start, train_end
+    aligned_end = train_start + dt.timedelta(days=n_complete * block_days - 1)
+    return train_start, aligned_end
 
 
-def section_horizons(seccion: str, first_data: dt.date | None = None) -> dict:
-    """
-    Ventanas de una sección:
-      train:  [train_start, train_end]  train_end = test_start original
-      OOS:    lunes ≥ test_start → test_end
-      forecast-only (sin actuals): test_end + 1 → forecast_end (settings.SECCIONES)
+def _aligned_block_start_on_or_after(
+    first_monday: dt.date, preferred: dt.date, block_days: int
+) -> dt.date:
+    """First block boundary >= preferred on the grid rooted at first_monday."""
+    preferred_monday = nearest_monday_on_or_after(preferred)
+    delta = max(0, (preferred_monday - first_monday).days)
+    k = (delta + block_days - 1) // block_days
+    return first_monday + dt.timedelta(days=k * block_days)
+
+
+def section_horizons(
+    seccion: str,
+    first_data: dt.date | None = None,
+    last_actual: dt.date | None = None,
+) -> dict:
+    """Resolve aligned train/OOS/actual-extension/forecast-only windows.
+
+    Rules:
+    - day 1 is the first Monday available for the section;
+    - every modeling block is 28 days, Monday through Sunday;
+    - OOS is exactly one complete 28-day block;
+    - OOS start is the first aligned block boundary on/after the configured
+      preferred test_start; if there are not 28 actual days available there,
+      step backwards by complete blocks until a valid OOS is found;
+    - forecast-only is exactly the 28 days immediately after OOS;
+    - any actuals that happen to exist in forecast-only are not consumed before
+      generating that forecast, preventing leakage;
+    - forecast-only therefore starts Monday and ends Sunday with no visual gap.
     """
     cfg = SECCIONES[seccion]
-    test_start = cfg["test_start"]
-    test_end = cfg["test_end"]
-    train_end = test_start
+    block_days = int(RLS_BLOCK_DAYS)
+
     if first_data is None:
         first_data = FECHAS_TRAIN[0]
-    train_start, train_end = compute_train_window(first_data, train_end)
-    oos_start = nearest_monday_on_or_after(test_start)
-    # Solo-forecast: día siguiente a test_end hasta forecast_end de la sección
-    forecast_start = test_end + dt.timedelta(days=1)
-    forecast_end = cfg.get("forecast_end") or (
-        test_end + dt.timedelta(days=METRIC_HORIZON_DAYS)
+    first_monday = nearest_monday_on_or_after(first_data)
+
+    if last_actual is None:
+        # Compatibility fallback for callers that do not have data bounds.
+        last_actual = cfg.get("test_end") or TEST_END
+
+    preferred = cfg.get("test_start") or first_monday
+    oos_start = _aligned_block_start_on_or_after(
+        first_monday, preferred, block_days
     )
-    forecast_end = max(forecast_end, forecast_start)
+    oos_end = oos_start + dt.timedelta(days=block_days - 1)
+
+    # OOS must be fully covered by actuals. Move backward by full blocks if the
+    # configured/preferred boundary is too recent for the available data.
+    while oos_end > last_actual and oos_start - dt.timedelta(days=block_days) >= first_monday:
+        oos_start -= dt.timedelta(days=block_days)
+        oos_end -= dt.timedelta(days=block_days)
+
+    if oos_end > last_actual:
+        raise ValueError(
+            f"Sección {seccion}: no hay 28 días completos de actuals para OOS "
+            f"desde el primer lunes disponible {first_monday}."
+        )
+
+    train_start = first_monday
+    train_end = oos_start - dt.timedelta(days=1)
+    train_days = (train_end - train_start).days + 1
+    if train_days < block_days or train_days % block_days != 0:
+        raise ValueError(
+            f"Sección {seccion}: train no queda alineado a bloques de {block_days} días "
+            f"({train_start} → {train_end}, {train_days} días)."
+        )
+
+    # Forecast-only is ALWAYS the immediately following 28-day block.
+    # Actuals that may already exist inside this period are deliberately not
+    # used to update RLS/SES before creating the forecast (no leakage).
+    forecast_start = oos_end + dt.timedelta(days=1)
+    forecast_end = forecast_start + dt.timedelta(days=block_days - 1)
+
+    # Kept in the public horizon contract for compatibility, but disabled for
+    # the current production forecast: post-OOS actuals are not consumed.
+    extension_start = None
+    actual_extension_end = None
+    n_extension_blocks = 0
+
     return {
+        "first_monday": first_monday,
+        "last_actual": last_actual,
         "train_start": train_start,
         "train_end": train_end,
         "test_start": oos_start,
-        "test_end": test_end,
+        "test_end": oos_end,
+        "actual_extension_start": None,
+        "actual_extension_end": actual_extension_end,
         "forecast_start": forecast_start,
         "forecast_end": forecast_end,
-        "raw_test_start": test_start,
+        "raw_test_start": cfg.get("test_start"),
         "raw_forecast_start": cfg.get("forecast_start"),
         "locales": list(cfg["locales"]),
         "local_names": dict(cfg["local_names"]),

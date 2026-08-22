@@ -241,8 +241,12 @@ def _ranking_from_metrics(
                 )
                 code_col = "sku"
 
-    # Solo filas con rotación y wMAPE > 0; orden ASCENDENTE por wMAPE (mejor primero)
+    # Solo filas con rotación y wMAPE > 0. Ranking SKU: mínimo 15 días
+    # con actual distinto de cero (configurable).
     tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
+    if axis == "sku":
+        min_nonzero = int(getattr(settings, "RANKING_SKU_MIN_NONZERO_POINTS", 15))
+        tabla = tabla.filter(pl.col("n_with_sales") >= min_nonzero)
     if tabla.height == 0:
         return empty
     if code_col in tabla.columns:
@@ -348,8 +352,8 @@ def prepare_dashboard_state_fast(
         n_spine=n_spine or 1,
     )
 
-    # Métricas in/out/total siempre bottom-up desde hojas del alcance.
-    # La serie del gráfico sigue siendo el nodo seleccionado (df_view).
+    # Métricas oficiales SIEMPRE bottom-up desde hojas SKU+tienda. En modo
+    # rolling_28, backend filtra además rls_metric_eligible=True (día 29+).
     fpath = Path(forecast_path) if forecast_path else None
     if store is not None and sku is not None:
         # Hoja: la propia serie diaria (bottom-up trivial de una hoja)
@@ -564,8 +568,7 @@ def prepare_dashboard_state(
         unidad=unidad,
     )
 
-    # Ranking ya es bottom-up vía wmape_por_id. Métricas in/out del nodo:
-    # siempre bottom-up desde hojas del alcance seleccionado.
+    # Métricas oficiales SIEMPRE bottom-up desde hojas SKU+tienda.
     metrics = backend.metrics_in_out_bottom_up(
         unit_df,
         seccion=seccion,

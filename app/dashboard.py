@@ -482,6 +482,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # Render
 # ─────────────────────────────────────────────────────────────────────────────
+_metrics_mode = str(getattr(settings, "METRICS_MODE", "rolling_28")).lower()
+
 _view_signature = "|".join(
     [
         str(view.unidad),
@@ -559,13 +561,18 @@ with col_s:
 
 hz = view.horizons
 st.markdown("#### Métricas")
+_metric_definition = (
+    "Métricas RLS = forecasts acumulados de bloques expanding-28; "
+    if _metrics_mode == "rolling_28" and view.node_kind in ("seccion", "tienda")
+    else "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
+)
 st.caption(
     f"Agregación: **{view.freq}** · Unidad: **{view.unidad}** · "
     f"Sección **{view.seccion}** · Train → {hz.get('train_end')} · "
     f"OOS [{hz.get('test_start')} → {hz.get('test_end')}] · "
     f"Solo-forecast [{hz.get('forecast_start')} → {hz.get('forecast_end')}]. "
-    "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
-    "OOS = period_type out_sample (misma definición que el ranking)."
+    + _metric_definition
+    + "OOS = period_type out_sample."
 )
 
 c1, c2, c3 = st.columns(3)

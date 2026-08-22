@@ -96,6 +96,7 @@ class RecursiveLeastSquaresRegression:
         priors: Sequence[RLSPriorBase],
         in_sample_metrics: bool = False,
         out_sample_metrics: bool = False,
+        seed_n_obs: int | None = None,
     ) -> None:
         if in_sample_metrics or out_sample_metrics:
             raise NotImplementedError("RLS metric generation is not implemented; compute metrics in the forecasting layer")
@@ -103,8 +104,15 @@ class RecursiveLeastSquaresRegression:
         self._check_fit_inputs(x, y, priors)
         self._check_priors(priors)
 
-        coeffs_0 = self._coefficient_seeds(x=x, y=y, priors=priors)
-        xxt_inv_0 = self._xxt_inv_seeds(y=y, priors=priors, coefficient_seeds=coeffs_0)
+        if seed_n_obs is not None:
+            seed_n = max(1, min(int(seed_n_obs), len(y)))
+            x_seed, y_seed = x[:seed_n], y[:seed_n]
+        else:
+            x_seed, y_seed = x, y
+        coeffs_0 = self._coefficient_seeds(x=x_seed, y=y_seed, priors=priors)
+        xxt_inv_0 = self._xxt_inv_seeds(
+            y=y_seed, priors=priors, coefficient_seeds=coeffs_0
+        )
 
         # Public API validation is always on; Numba kernels keep internal asserts.
         self._check_inputs(x=x, y=y, priors=coeffs_0, xxt_inv=xxt_inv_0)

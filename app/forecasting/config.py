@@ -1,14 +1,10 @@
 """Forecast configuration contract."""
-
 from __future__ import annotations
-
 import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
 import settings
-
 
 @dataclass(slots=True)
 class ForecastConfig:

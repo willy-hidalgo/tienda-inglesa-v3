@@ -245,6 +245,11 @@ def _scored_leaves(
         return df.head(0)
 
     leaves = df.filter(_is_leaf_expr())
+    if (
+        "rls_metric_eligible" in leaves.columns
+        and str(getattr(settings, "METRICS_MODE", "rolling_28")).lower() == "rolling_28"
+    ):
+        leaves = leaves.filter(pl.col("rls_metric_eligible") == True)
     if "period_type" in leaves.columns:
         if period_types is not None:
             leaves = leaves.filter(pl.col("period_type").is_in(list(period_types)))
@@ -603,8 +608,12 @@ def ranking_table(
                 uid_expr = pl.col("unique_id")
                 code_col = "_sku"
 
-    # Solo filas con rotación y wMAPE > 0; orden ASCENDENTE por wMAPE (mejor primero)
+    # Solo filas con rotación y wMAPE > 0. Para SKU se exige además una
+    # cobertura mínima de días con actual distinto de cero.
     tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
+    if axis == "sku":
+        min_nonzero = int(getattr(settings, "RANKING_SKU_MIN_NONZERO_POINTS", 15))
+        tabla = tabla.filter(pl.col("n_with_sales") >= min_nonzero)
     if tabla.height == 0:
         return empty
     tabla = tabla.sort("wmape", descending=False).unique(
@@ -651,7 +660,13 @@ def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
     """
     if df.height == 0 or "y" not in df.columns or "yhat" not in df.columns:
         return 0.0, 0.0, 0
-    scored = df.filter(
+    metric_df = df
+    if (
+        "rls_metric_eligible" in metric_df.columns
+        and str(getattr(settings, "METRICS_MODE", "rolling_28")).lower() == "rolling_28"
+    ):
+        metric_df = metric_df.filter(pl.col("rls_metric_eligible") == True)
+    scored = metric_df.filter(
         pl.col("y").is_not_null()
         & pl.col("yhat").is_not_null()
         & pl.col("y").is_finite()

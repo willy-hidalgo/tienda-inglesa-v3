@@ -15,6 +15,7 @@ from app.forecasting.calendar import HolidayCalendar
 from app.forecasting.config import ForecastConfig
 from app.forecasting.features import CalendarFeatureBuilder
 from app.forecasting.panel import densify_section_panel
+from app.forecasting.metrics import compute_wmape
 from app.forecasting.runner import RLSForecastRunner
 from app.forecasting.utils import _stage_timer, _collect_streaming, _lf_columns
 
@@ -75,21 +76,28 @@ class RLSForecastPipeline:
         )
         return lf
 
-    def _first_data_by_section(
+    def _data_bounds_by_section(
         self, selected: pl.LazyFrame | pl.DataFrame
-    ) -> dict[str, dt.date]:
+    ) -> dict[str, tuple[dt.date, dt.date]]:
+        """Return min/max actual dates by section without materializing rows."""
         col = self._cfg.date_column
         lf = selected.lazy() if isinstance(selected, pl.DataFrame) else selected
         summary = _collect_streaming(
-            lf.group_by("SECCION").agg(pl.col(col).min().alias("min_d"))
+            lf.group_by("SECCION").agg(
+                pl.col(col).min().alias("min_d"),
+                pl.col(col).max().alias("max_d"),
+            )
         )
-        out: dict[str, dt.date] = {}
+        out: dict[str, tuple[dt.date, dt.date]] = {}
         for r in summary.iter_rows(named=True):
-            d = r["min_d"]
-            if isinstance(d, dt.datetime):
-                d = d.date()
-            out[str(r["SECCION"])] = d
+            d0, d1 = r["min_d"], r["max_d"]
+            if isinstance(d0, dt.datetime):
+                d0 = d0.date()
+            if isinstance(d1, dt.datetime):
+                d1 = d1.date()
+            out[str(r["SECCION"])] = (d0, d1)
         return out
+
 
     def _apply_limit_series(self, df_train: pl.DataFrame) -> pl.DataFrame:
         """Debug/benchmark: muestrea N SKUs, conservando niveles sección/tienda."""
@@ -362,10 +370,11 @@ class RLSForecastPipeline:
         selected: pl.LazyFrame | pl.DataFrame,
         seccion: str,
         first_data: dt.date,
+        last_actual: dt.date,
         driver_cols: list[str] | None,
     ) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
         """Ejecuta train / OOS / forecast-only para una sección."""
-        hz = settings.section_horizons(seccion, first_data)
+        hz = settings.section_horizons(seccion, first_data, last_actual)
         logger.info(
             "Sección %s | train [%s → %s] | OOS [%s → %s] | fcst [%s → %s]",
             seccion,
@@ -392,21 +401,34 @@ class RLSForecastPipeline:
             (pl.col(date_col) >= hz["test_start"])
             & (pl.col(date_col) <= hz["test_end"])
         )
+        raw_extension_lf = None
+        if hz.get("actual_extension_start") and hz.get("actual_extension_end"):
+            raw_extension_lf = sec_lf.filter(
+                (pl.col(date_col) >= hz["actual_extension_start"])
+                & (pl.col(date_col) <= hz["actual_extension_end"])
+            )
 
-        # ── Agregación + densify + EDP + features (TRAIN) ─────────────────────
+        # ── Agregación TRAIN: separar nodos RLS de hojas SKU+tienda ───────────
+        # Las hojas NO se densifican ni pasan por EDP/features sobre toda la
+        # historia. Ese era el principal cuello de botella: O(n_hojas*n_días).
         with _stage_timer(f"{seccion}: agregación train (lazy+streaming)"):
-            df_train = self._aggregator.aggregate(raw_train_lf)
+            df_train_all = self._aggregator.aggregate(raw_train_lf)
+        df_train_all = self._apply_limit_series(df_train_all)
+        _depth_train = pl.col("unique_id").str.count_matches(r"\|\|", literal=False)
+        train_leaves = df_train_all.filter(_depth_train == 2)
+        df_train = df_train_all.filter(_depth_train < 2)
+        del df_train_all
         logger.info(
-            "Sección %s: train agregado shape=%s | series=%d",
+            "Sección %s: train | nodos RLS=%d filas/%d series | hojas observadas=%d filas/%d series",
             seccion,
-            df_train.shape,
+            df_train.height,
             df_train["unique_id"].n_unique() if df_train.height else 0,
+            train_leaves.height,
+            train_leaves["unique_id"].n_unique() if train_leaves.height else 0,
         )
 
-        df_train = self._apply_limit_series(df_train)
-
         n_before = df_train.height
-        with _stage_timer(f"{seccion}: densify train"):
+        with _stage_timer(f"{seccion}: densify train SOLO sección/tienda"):
             df_train = densify_section_panel(
                 df_train, hz["train_start"], hz["train_end"]
             )
@@ -448,12 +470,19 @@ class RLSForecastPipeline:
                 )
             ]
 
-        # ── Agregación + densify + EDP + features (OOS) ────────────────────────
-        with _stage_timer(f"{seccion}: agregación+densify OOS (lazy+streaming)"):
-            # aggregate materializa; si no hay filas OOS devuelve vacío
-            df_oos = self._aggregator.aggregate(raw_oos_lf)
+        # ── OOS: separar nodos RLS y hojas ────────────────────────────────────
+        with _stage_timer(f"{seccion}: agregación OOS (lazy+streaming)"):
+            df_oos_all = self._aggregator.aggregate(raw_oos_lf)
+            _depth_oos = pl.col("unique_id").str.count_matches(r"\|\|", literal=False)
+            oos_leaves = df_oos_all.filter(_depth_oos == 2)
+            # Solo hojas vistas en train: evita introducir series sin historial.
+            if train_leaves.height and oos_leaves.height:
+                leaf_uids = train_leaves.select("unique_id").unique()
+                oos_leaves = oos_leaves.join(leaf_uids, on="unique_id", how="semi")
+            df_oos = df_oos_all.filter(_depth_oos < 2)
+            del df_oos_all
             if df_oos.height:
-                # densify incluye series de train ausentes en OOS vía extra_uids
+                # densify solo sección/tienda: unas pocas series, no miles.
                 train_uids = df_train.select("unique_id").unique()
                 df_oos = densify_section_panel(
                     df_oos,
@@ -491,6 +520,70 @@ class RLSForecastPipeline:
                 ).sort("ds")
             logger.info("Sección %s: OOS densificado shape=%s", seccion, df_oos.shape)
 
+        # ── Actual extension: complete 28-day blocks after OOS ─────────────
+        df_extension = pl.DataFrame()
+        extension_leaves = pl.DataFrame()
+        if raw_extension_lf is not None:
+            with _stage_timer(f"{seccion}: agregación actual_extension"):
+                ext_all = self._aggregator.aggregate(raw_extension_lf)
+                _depth_ext = pl.col("unique_id").str.count_matches(
+                    r"\|\|", literal=False
+                )
+                extension_leaves = ext_all.filter(_depth_ext == 2)
+                if train_leaves.height and extension_leaves.height:
+                    leaf_uids = train_leaves.select("unique_id").unique()
+                    extension_leaves = extension_leaves.join(
+                        leaf_uids, on="unique_id", how="semi"
+                    )
+                df_extension = ext_all.filter(_depth_ext < 2)
+                del ext_all
+
+            if df_extension.height:
+                train_uids = df_train.select("unique_id").unique()
+                df_extension = densify_section_panel(
+                    df_extension,
+                    hz["actual_extension_start"],
+                    hz["actual_extension_end"],
+                    extra_uids=train_uids,
+                )
+                meta_cols_ext = [
+                    c
+                    for c in ("sku_desc", "store_name", "seccion", "conteo_sku")
+                    if c in df_train.columns
+                ]
+                if meta_cols_ext:
+                    meta_ext = (
+                        df_train.select(["unique_id"] + meta_cols_ext)
+                        .group_by("unique_id")
+                        .agg(
+                            [
+                                pl.col(c).drop_nulls().first().alias(c)
+                                for c in meta_cols_ext
+                            ]
+                        )
+                    )
+                    existing = [
+                        c for c in meta_cols_ext if c in df_extension.columns
+                    ]
+                    if existing:
+                        df_extension = df_extension.drop(existing)
+                    df_extension = df_extension.join(
+                        meta_ext, on="unique_id", how="left"
+                    )
+                df_extension = self._sanitize_numeric_drivers(
+                    self._calculate_edp(df_extension)
+                )
+                df_extension = self._feature_builder.extract_drivers(
+                    df_extension, req_columns=driver_cols
+                ).sort("ds")
+                logger.info(
+                    "Sección %s: actual_extension [%s → %s] shape=%s",
+                    seccion,
+                    hz["actual_extension_start"],
+                    hz["actual_extension_end"],
+                    df_extension.shape,
+                )
+
         # ── Forecast-only (calendario sintético + carry-forward de precios) ───
         uids = df_train["unique_id"].unique().to_list()
         fcst_start = hz["forecast_start"]
@@ -509,9 +602,14 @@ class RLSForecastPipeline:
                 # Historial de precios: train + OOS (si hay). Sin esto asp/edp/
                 # discount quedan en 0 y el RLS infla el nivel de yhat.
                 price_history = df_train
+                price_parts = [df_train]
                 if df_oos.height:
+                    price_parts.append(df_oos)
+                if df_extension.height:
+                    price_parts.append(df_extension)
+                if len(price_parts) > 1:
                     price_history = pl.concat(
-                        [df_train, df_oos], how="diagonal_relaxed"
+                        price_parts, how="diagonal_relaxed"
                     )
                 df_fcst_raw = self._sanitize_numeric_drivers(
                     self._carry_forward_prices(price_history, df_fcst_raw)
@@ -563,6 +661,8 @@ class RLSForecastPipeline:
         targets: dict[str, pl.DataFrame] = {"in_sample": df_train}
         if df_oos.height:
             targets["out_sample"] = df_oos
+        if df_extension.height:
+            targets["actual_extension"] = df_extension
         if df_fcst.height:
             targets["forecast_only"] = df_fcst
 
@@ -714,8 +814,29 @@ class RLSForecastPipeline:
             pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2
         )
         use_ses = bool(getattr(settings, "USE_SES", True))
+        fast_leaf = bool(getattr(settings, "FAST_LEAF_MODE", True))
 
-        if use_ses:
+        if fast_leaf:
+            with _stage_timer(f"{seccion}: FAST SKU+tienda (sin EDP/RLS denso)"):
+                parent_forecasts = pl.concat(
+                    [f for f in (res_section, res_store) if f.height],
+                    how="diagonal_relaxed",
+                ) if (res_section.height or res_store.height) else pl.DataFrame()
+                res_derived = runner.fast_leaf_forecasts(
+                    train_leaves,
+                    oos_leaves,
+                    seccion,
+                    hz,
+                    meta=meta,
+                    parent_forecasts=parent_forecasts,
+                    actual_extension_leaves=extension_leaves,
+                )
+            logger.info(
+                "Sección %s: %d filas SKU+tienda FAST",
+                seccion,
+                res_derived.height,
+            )
+        elif use_ses:
             # Filtrar SKU+tienda ANTES de concat para no inflar el panel
             parts_sku: list[pl.DataFrame] = []
             tr = df_train.filter(is_sku_store)
@@ -831,7 +952,12 @@ class RLSForecastPipeline:
                 getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)),
             )
 
-        wmapes_df = RLSForecastRunner._compute_wmape(res_df)
+        wmapes_df = compute_wmape(
+            res_df,
+            period_types=("out_sample",)
+            if bool(getattr(settings, "PIPELINE_WMAPE_OOS_ONLY", True))
+            else None,
+        )
         return res_df, wmapes_df, driver_cols
 
     def run(self) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -862,19 +988,20 @@ class RLSForecastPipeline:
         self._feature_builder = CalendarFeatureBuilder(self._calendar)
 
         selected = self._load()
-        first_by_sec = self._first_data_by_section(selected)
+        bounds_by_sec = self._data_bounds_by_section(selected)
         _advance("datos cargados")
 
         all_res, all_wm = [], []
         driver_cols = None
         for seccion in settings.FOCUS_SECTIONS:
-            if seccion not in first_by_sec:
+            if seccion not in bounds_by_sec:
                 logger.warning("Sin datos para sección %s; se omite.", seccion)
                 _advance(f"sección {seccion} omitida")
                 continue
             sec_t0 = time.perf_counter()
+            first_data, last_actual = bounds_by_sec[seccion]
             res, wm, driver_cols = self._run_section(
-                selected, seccion, first_by_sec[seccion], driver_cols
+                selected, seccion, first_data, last_actual, driver_cols
             )
             logger.info(
                 "⏱ Sección %s: TOTAL %.1fs", seccion, time.perf_counter() - sec_t0

@@ -1,188 +1,261 @@
-# Tienda Inglesa — Forecasting jerárquico RLS
+# Tienda Inglesa — Forecasting RLS v8.1
 
-Aplicación de forecasting retail para las secciones **1 y 23**, con Python,
-Polars, NumPy/Numba, Streamlit y un RLS optimizado. Los niveles reportados son
-**sección → tienda → SKU-tienda** y el wMAPE de tienda/sección se calcula
-bottom-up desde las hojas.
+Aplicación de forecasting jerárquico para retail con dos objetivos de producción:
 
-## Runtime
+1. minimizar wMAPE/BIAS OOS, especialmente en SKU+tienda;
+2. mantener tiempos y memoria compatibles con el volumen real.
 
-El proyecto está normalizado a **Python 3.13** (`.python-version`). El lockfile
-anterior correspondía a Python 3.14 y fue retirado por estar desfasado; debe
-regenerarse en un entorno con acceso a PyPI:
+## Contrato temporal
 
-```bash
-uv venv --python 3.13
-uv lock
-uv sync --dev
-```
+- El día 1 de cada sección es su primer lunes disponible.
+- Los bloques de entrenamiento/pronóstico son de 28 días (4 semanas).
+- OOS dura exactamente 28 días, lunes a domingo.
+- `forecast_only` son los 28 días inmediatamente posteriores al OOS.
+- Si existen actuals dentro del período `forecast_only`, no se utilizan para
+  actualizar RLS/SES antes de generar ese forecast. Esto evita leakage.
+- Los días 1–28 son warm-up y quedan fuera de las métricas oficiales.
 
-## Arquitectura
+## RLS expanding-28 v8.1
+
+Contrato obligatorio:
 
 ```text
-app/
-├── main.py                     CLI/orquestación
-├── ingestor.py                 ingestión master + ventas
-├── categories_selector.py      selección de secciones/tiendas/SKU
-├── forecasts.py                fachada compatible + CLI forecast
-├── forecasting/
-│   ├── config.py               contrato de configuración
-│   ├── calendar.py             calendario retail/feriados
-│   ├── features.py             drivers
-│   ├── aggregation.py          agregación Polars
-│   ├── panel.py                densificación diaria
-│   ├── metrics.py              wMAPE bottom-up
-│   ├── robust_baseline.py      guardrail leakage-free de hojas
-│   ├── runner.py               RLS + derivación SKU-tienda
-│   ├── pipeline.py             pipeline por sección
-│   └── utils.py                utilidades compartidas
-├── backend.py                  métricas/rankings/chart
-├── dashboard_data.py           preparación de vista
-├── dashboard_artifacts.py      artefactos precomputados
-└── dashboard.py                Streamlit
-
-rls_opt/
-├── solver.py                   API/validación RLS
-├── kernels.py                  kernels Numba
-├── priors.py
-└── edp.py
+actuals 1–28   -> forecast 29–56
+actuals 1–56   -> forecast 57–84
+actuals 1–84   -> forecast 85–112
+...
 ```
 
-Los notebooks en `notebook/` son parte del proyecto y se conservan para auditoría
-y experimentación.
+No se usan actuals del bloque que se está pronosticando.
 
-## Modelo OOS de producción
+### Drivers causales y adaptación
 
-### Sección y tienda
+El RLS de sección/tienda incorpora calendario, feriados y drivers comerciales,
+más cuatro señales autoregresivas causales en log-space:
 
-RLS se ajusta sobre `log1p(y)` y `log1p(value)` con drivers de calendario/precio.
-La reconstrucción usa `expm1` y los coeficientes aprendidos exclusivamente en
-train.
+```text
+lag 7
+lag 28
+rolling mean 7
+rolling mean 28
+```
 
-### SKU-tienda
+Dentro de un bloque objetivo los lags/rolling son recursivos: después del origen
+del bloque se alimentan con forecasts, nunca con actuals todavía desconocidos.
 
-1. Se calculan candidatos con coeficientes de sección y tienda.
-2. La corrección residual usa SES en log-space.
-3. El SES in-sample es one-step-ahead; para **todo el OOS/forecast** se usa el
-   estado final del train y se congela. No se incorporan actuals OOS.
-4. `SES_ALPHA` default es **0.20**. El anterior 0.74 resultó excesivamente
-   reactivo en benchmark temporal de las hojas.
-5. Se aplica un **guardrail robusto** leakage-free:
-   - sección 1: mediana de ventas positivas recientes (`median_pos56`);
-   - sección 23: mediana positiva por día de semana (`weekday_pos8`).
-6. El baseline solo reemplaza RLS+SES si demuestra una mejora mínima en la cola
-   de validación del train; en caso contrario RLS se conserva.
-7. Para evitar explosiones, los forecasts futuros RLS se limitan a un rango
-   configurable respecto del baseline robusto.
-8. La corrección de bias no modifica filas que ya fueron reemplazadas por un
-   baseline.
-
-Parámetros centrales en `settings.py`:
+Se evalúan pocos forgetting factors, solo en sección/tienda:
 
 ```python
-SES_ALPHA = 0.20
-LEAF_BASELINE_GUARDRAIL = True
-LEAF_BASELINE_VALIDATION_DAYS = 28
-LEAF_BASELINE_LOOKBACK_DAYS = 56
-LEAF_BASELINE_MIN_VALID_POINTS = 7
-LEAF_BASELINE_MIN_IMPROVEMENT = 0.03
-LEAF_BASELINE_CLIP_RATIO = (0.35, 2.50)
+RLS_FORGETTING_FACTOR_CANDIDATES = (0.970, 0.985, 0.995)
 ```
 
-El benchmark independiente que justificó estos guardrails está documentado en
-[`docs/OOS_BENCHMARK.md`](docs/OOS_BENCHMARK.md). Es un benchmark de baselines,
-no una afirmación del wMAPE final del RLS completo.
+El lambda del bloque siguiente se elige por wMAPE acumulado de bloques anteriores.
 
-## wMAPE
 
-La definición usada por cliente y aplicación es:
+### Selección de dinámica RLS v8.1
+
+El componente autoregresivo deja de ser obligatorio. Para cada bloque se comparan:
 
 ```text
-wMAPE = Σ |y - yhat| / Σ |y|
+base = calendario + feriados + drivers comerciales
+ar   = base + lag7 + lag28 + rolling7 + rolling28
 ```
 
-Se excluyen `y == 0`, `forecast_only` y valores no finitos. Para tienda y sección
-se suman numeradores/denominadores de las hojas SKU-tienda; no se usa el `yhat`
-del nodo agregado para el ranking.
+La combinación `(dinámica, lambda)` del bloque siguiente se elige únicamente con
+wMAPE acumulado de bloques anteriores. Así un AR recursivo que empieza a derivar
+no se impone en OOS, mientras que sigue disponible cuando realmente mejora el ajuste.
+El artefacto conserva `rls_dynamics_*` y `rls_forecast_origin` para auditar fecha a fecha.
 
-Implementaciones principales:
+## SKU+tienda v8: residual SES en log-space
 
-- `app.forecasting.metrics.compute_wmape`
-- `app.backend.wmape_bottom_up`
-- `app.backend.wmape_por_id`
+Se elimina la escala multiplicativa `leaf_scale` de v7.x.
 
-## Ventanas
+Primeros 28 días:
 
-`settings.section_horizons()` define por sección:
+```text
+nivel inicial = log1p(media de actuals disponibles)
+```
 
-- train: hasta el domingo inmediatamente anterior/al inicio del holdout según la
-  configuración vigente;
-- OOS: lunes posterior/igual a `test_start` hasta `test_end`;
-- forecast-only: desde el día siguiente a `test_end` hasta `forecast_end`.
+Desde el día 29, cada padre RLS aporta únicamente su efecto temporal, centrado
+por bloque para retirar el intercepto/nivel:
+
+```text
+efecto_RLS = log1p(parent_forecast) - media_bloque(log1p(parent_forecast))
+```
+
+Para actualizar SES después de cerrar un bloque:
+
+```text
+residuo = log1p(actual) - efecto_RLS
+nivel_siguiente = SES(residuo)
+```
+
+Forecast:
+
+```text
+forecast = exp(nivel_SES + efecto_RLS) - 1
+```
+
+Se evalúan conjuntamente:
+
+```text
+5 alphas SES × 3 candidatos de forma (tienda/sección/ninguna)
+```
+
+por SKU+tienda. El candidato de un bloque se selecciona exclusivamente con
+wMAPE acumulado de bloques anteriores. No hay tuning con el bloque actual.
+
+Esto separa responsabilidades:
+
+```text
+SES -> nivel estructural SKU
+RLS -> forma temporal, calendario, drivers y picos cuando mejora históricamente
+SES directo -> protección para hojas donde el padre desalinearía la serie
+```
+
+## Métricas oficiales
+
+```python
+METRICS_MODE = "rolling_28"
+METRICS_START_DAY = 29
+```
+
+Las métricas oficiales son siempre bottom-up desde las hojas SKU+tienda:
+
+```text
+SKU+tienda
+    ↓
+Tienda
+    ↓
+Sección
+```
+
+\[
+wMAPE = \frac{\sum |y-\hat y|}{\sum |y|}
+\]
+
+\[
+BIAS = \frac{\sum(\hat y-y)}{\sum y}
+\]
+
+Solo participan filas elegibles a partir del día 29, con actual distinto de cero
+y valores finitos.
+
+## Ranking SKU
+
+```python
+RANKING_SKU_MIN_NONZERO_POINTS = 15
+```
+
+Solo se muestran SKU con al menos 15 días con actual distinto de cero.
+
+## Dashboard
+
+Unidad, frecuencia, sección, tienda y SKU forman un único estado. Cambiar
+`Valor ($)` ↔ `Unidades` actualiza conjuntamente:
+
+- ranking de tiendas;
+- ranking de SKU;
+- wMAPE;
+- BIAS;
+- gráfico;
+- detalle.
+
+Las métricas de tienda y sección son bottom-up, nunca el wMAPE directo del nodo RLS.
+
+## Diagnóstico disponible
+
+`forecast.parquet` conserva para las hojas:
+
+```text
+ses_alpha_y
+ses_alpha_value
+parent_model_y
+parent_model_value
+driver_effect
+driver_effect_value
+modelo_seleccionado
+```
+
+Esto permite auditar por SKU qué `alpha`, escala y padre fueron utilizados.
+
+## Rendimiento
+
+La aplicación evita:
+
+```text
+n_SPU × n_tiendas × historia_completa × RLS
+```
+
+RLS se ejecuta en sección/tienda. La lógica leaf utiliza agregaciones Polars,
+estados SES por bloque y operaciones vectorizadas.
 
 ## Ejecución
 
+Python objetivo: 3.13.
+
 ```bash
-python -m app.main
-python -m app.forecasts --n-jobs 8
+python app/forecasts.py --n-jobs 8
 python -m app.dashboard_artifacts
 streamlit run app/dashboard.py
 ```
 
-Pipeline por etapas:
+Tests:
 
 ```bash
-python -m app.main --run ingest
-python -m app.main --run select
-python -m app.main --run forecast --n-jobs 8
-python -m app.main --run dashboard
+pytest tests/ -q
 ```
 
-## Tests
+## Criterios de aceptación
 
-```bash
-pytest -q
+Una nueva versión no debe reemplazar la vigente si:
+
+- empeora materialmente wMAPE OOS bottom-up;
+- elimina picos explicados por drivers;
+- introduce leakage;
+- crea huecos entre OOS y forecast-only;
+- deteriora de forma material tiempo o memoria;
+- rompe la sincronización del dashboard.
+
+El objetivo es recuperar y superar el desempeño histórico cercano al 16% wMAPE
+sin volver a una arquitectura SKU+tienda que tarde horas o días.
+
+## Optimización de rendimiento v8.2
+
+La lógica estadística de v8.1 se conserva: SKU+tienda sigue comparando los
+mismos 15 candidatos (`3 padres × 5 alphas`) y la selección continúa usando
+únicamente wMAPE acumulado de bloques anteriores.
+
+El cambio es computacional. v8.1 recorría candidatos y bloques con operaciones
+Polars repetidas:
+
+```text
+padre × alpha × bloque
+    -> filter
+    -> join
+    -> group_by
 ```
 
-Cobertura relevante:
+v8.2 usa `LEAF_CANDIDATE_ENGINE="vectorized_block"`:
 
-- `test_settings.py`: horizontes e IDs.
-- `test_wmape.py`: fórmula cliente y bottom-up.
-- `test_backend.py`: rankings/filtros.
-- `test_aggregator.py`: agregaciones.
-- `test_densify.py`: panel diario.
-- `test_forecasts_runner.py`: SES causal, OOS congelado y derivación.
-- `test_forecasts_logspace.py`: consistencia `log1p/expm1`.
-- `test_rls_contract.py`: contrato, finitud y parámetros del solver.
-- `test_robust_baseline.py`: guardrail temporal sin dependencia de Polars.
-
-## Dependencias directas
-
-Declaradas en `pyproject.toml`: `polars`, `numpy`, `numba`, `streamlit`, `plotly`,
-`python-dateutil`, `tqdm`, `fastexcel`, `xlsxwriter`, `matplotlib` e `ipykernel`.
-
-`psutil` es opcional: si está instalado, `dashboard_artifacts.py` informa RSS;
-si no, continúa sin esa métrica.
-
-## Dashboard
-
-El dashboard no reajusta modelos. Lee `forecast.parquet` y prefiere los artefactos
-precomputados de `data/output/dashboard/`. Si no existen, usa el camino legacy.
-La construcción de artefactos se ejecuta al guardar forecasts o manualmente con:
-
-```bash
-python -m app.dashboard_artifacts
+```text
+por cada bloque de 28 días
+    -> expandir una vez a los 15 candidatos
+    -> score + actualización SES en un group_by vectorizado
+    -> conservar solo los estados elegidos
 ```
 
-## Troubleshooting
+Además, las observaciones se particionan por bloque una sola vez. Esto reduce
+drásticamente el número de scans, joins y group_by sin reducir el espacio de
+modelos ni cambiar expanding-28, causalidad, SES residual o bottom-up.
 
-**`ModuleNotFoundError: polars`**: crear/sincronizar el entorno con `uv sync --dev`.
+El log incluye tiempos separados:
 
-**Lockfile ausente**: es intencional en esta entrega; el anterior era de Python
-3.14. Ejecutar `uv lock` con Python 3.13 y acceso a PyPI.
+```text
+⏱ ... RLS candidatos + bloques
+⏱ Sección ... selección leaf vectorizada
+⏱ Sección ... FAST SKU+tienda total
+```
 
-**Forecasts extremos en hojas**: revisar `modelo_seleccionado`, parámetros
-`LEAF_BASELINE_*` y el benchmark OOS antes de ampliar los límites del guardrail.
-
-**Cambios de wMAPE**: validar siempre por `period_type == "out_sample"` y por los
-tres niveles. No optimizar contra in-sample como criterio principal.
+Estos tiempos deben utilizarse para localizar cualquier cuello de botella
+restante antes de simplificar la lógica estadística.

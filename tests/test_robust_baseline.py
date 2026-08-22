@@ -43,3 +43,18 @@ def test_validation_score_is_finite_when_tail_has_sales():
     y = np.asarray([0 if i % 3 else 10 + (i % 7) for i in range(100)], dtype=float)
     score = validation_score(y, d, method="median_pos56", validation_days=28)
     assert np.isfinite(score)
+
+
+def test_all_adaptive_baseline_candidates_return_finite_nonnegative_forecasts():
+    import datetime as dt
+    from app.forecasting.robust_baseline import SUPPORTED_METHODS, robust_baseline_forecast
+
+    dates = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(100)]
+    y = [0.0 if i % 5 == 0 else float(5 + (i % 7)) for i in range(100)]
+    future = [dates[-1] + dt.timedelta(days=i) for i in range(1, 29)]
+
+    for method in SUPPORTED_METHODS:
+        pred = robust_baseline_forecast(y, dates, future, method=method)
+        assert len(pred) == len(future)
+        assert np.isfinite(pred).all()
+        assert (pred >= 0).all()

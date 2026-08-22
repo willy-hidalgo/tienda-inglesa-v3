@@ -18,7 +18,6 @@ Uso (desde la raíz del proyecto, donde está settings.py):
     python artifacts/validate_wmape_bottom_up.py --seccion 1 --store 00063 --sku 127360
     python artifacts/validate_wmape_bottom_up.py --in-sample-only
 """
-
 from __future__ import annotations
 
 import argparse
@@ -40,8 +39,8 @@ else:
     if (ROOT / "app" / "backend.py").exists() and str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-import settings
-from app import backend
+import settings  # noqa: E402
+from app import backend  # noqa: E402
 
 
 def _fmt_pct(x: float) -> str:
@@ -56,7 +55,9 @@ def _scored_leaves_manual(unit_df: pl.DataFrame) -> pl.DataFrame:
     if "period_type" in leaves.columns:
         leaves = leaves.filter(pl.col("period_type") != "forecast_only")
     leaves = leaves.filter(
-        pl.col("y").is_not_null() & pl.col("yhat").is_not_null() & (pl.col("y") != 0)
+        pl.col("y").is_not_null()
+        & pl.col("yhat").is_not_null()
+        & (pl.col("y") != 0)
     )
     if leaves.height == 0:
         return leaves
@@ -104,9 +105,7 @@ def serie_agregada_wmape(unit_df: pl.DataFrame, uid: str) -> float | None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seccion", default="1")
     ap.add_argument("--store", default="00063")
     ap.add_argument("--sku", default="127360")
@@ -156,12 +155,12 @@ def main() -> int:
 
     uid_sec = str(args.seccion)
     uid_store = settings.make_unique_id(args.seccion, store=args.store)
-    uid_leaf = settings.make_unique_id(args.seccion, store=args.store, sku=args.sku)
+    uid_leaf = settings.make_unique_id(
+        args.seccion, store=args.store, sku=args.sku
+    )
 
     leaves = _scored_leaves_manual(unit_df)
-    print(
-        f"\nHojas scorables: {leaves.height} filas | {leaves['unique_id'].n_unique() if leaves.height else 0} series"
-    )
+    print(f"\nHojas scorables: {leaves.height} filas | {leaves['unique_id'].n_unique() if leaves.height else 0} series")
 
     cases = [
         ("sku+tienda", uid_leaf, pl.col("unique_id") == uid_leaf),
@@ -171,13 +170,14 @@ def main() -> int:
 
     # Backend vectorizado
     bu = backend.wmape_bottom_up(unit_df)
-    bu_map = {r["unique_id"]: r for r in bu.to_dicts()}
+    bu_map = {
+        r["unique_id"]: r
+        for r in bu.to_dicts()
+    }
 
     ok_all = True
     print("\n" + "-" * 72)
-    print(
-        f"{'nivel':<12} {'unique_id':<32} {'manual':>12} {'backend':>12} {'Δ':>12} {'OK':>4}"
-    )
+    print(f"{'nivel':<12} {'unique_id':<32} {'manual':>12} {'backend':>12} {'Δ':>12} {'OK':>4}")
     print("-" * 72)
 
     rows_out = []
@@ -263,7 +263,9 @@ def main() -> int:
             continue
         w1 = float(row_bu["wmape"])
         w2 = float(row_id["wmape"][0])
-        checks.append((f"wmape_por_id == bottom_up ({uid})", abs(w1 - w2) < 1e-12))
+        checks.append(
+            (f"wmape_por_id == bottom_up ({uid})", abs(w1 - w2) < 1e-12)
+        )
 
     for name, passed in checks:
         print(f"  [{'✓' if passed else '✗'}] {name}")

@@ -1,11 +1,7 @@
 """Holiday calendar for forecasting."""
-
 from __future__ import annotations
-
 import datetime as dt
-
 from dateutil.easter import easter
-
 
 class HolidayCalendar:
     _YEARS_BACK = 6
