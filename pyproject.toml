@@ -5,7 +5,6 @@ description = "Assessment Tienda Inglesa"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "easter>=0.0.6",
     "fastexcel>=0.20.2",
     "ipykernel>=7.3.0",
     "ipympl>=0.10.0",
@@ -13,6 +12,7 @@ dependencies = [
     "mplcursors>=0.7.1",
     "numba>=0.66.0",
     "plotly>=6.9.0",
+    "python-dateutil>=2.9.0",
     "polars>=1.43.0",
     "scipy>=1.18.0",
     "streamlit>=1.60.0",
