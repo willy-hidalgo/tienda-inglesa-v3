@@ -14,8 +14,8 @@ def leaf_method() -> str:
 
 
 def test_release_is_v9_1():
-    assert 'APP_VERSION: str = "9.1"' in read("settings.py")
-    assert 'version = "9.1.0"' in read("pyproject.toml")
+    assert 'APP_VERSION: str = "9.2"' in read("settings.py")
+    assert 'version = "9.2.0"' in read("pyproject.toml")
 
 
 def test_sparse_reference_uses_median_of_closed_28_day_blocks():

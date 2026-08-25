@@ -9,7 +9,7 @@ import datetime as dt
 import os
 from pathlib import Path
 
-APP_VERSION: str = "9.1"
+APP_VERSION: str = "9.2"
 
 # ── Flag de modelo a nivel hoja ──────────────────────────────────────────────
 DEMO_MODE = os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -81,7 +81,7 @@ FAST_LEAF_MODE: bool = True
 LEAF_INITIAL_LEVEL_DAYS: int = 28
 LEAF_INITIAL_MIN_POINTS: int = 7  # legacy/ignored v8.9; warm-up = sum(actuals)/28 calendar days
 LEAF_SES_ALPHA: float = 0.10  # fallback conservador cuando aún no hay score causal
-LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80)
+LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.0002, 0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80)
 LEAF_PARENT_SELECTION: str = "prior_cumulative_wmape"
 LEAF_ALPHA_SELECTION: str = "pure_ses_prior_cumulative_wmape"
 LEAF_SES_NEAR_BEST_REL_TOLERANCE: float = 0.05
@@ -99,6 +99,11 @@ LEAF_REGIME_SCORE_TOLERANCE: float = 0.20
 LEAF_REGIME_GROWTH_RATIO: float = 1.15
 LEAF_REGIME_SPARSE_SHOCK_RATIO: float = 1.35
 LEAF_REGIME_SPARSE_STABILITY_RATIO: float = 1.25
+# v9.2: shock alcista = el bloque recién cerrado no define el nivel estructural.
+LEAF_REGIME_STRUCTURAL_BLOCKS: int = 6
+LEAF_REGIME_UPWARD_SHOCK_MIN_BLOCKS: int = 3
+LEAF_REGIME_UPWARD_SHOCK_RATIO: float = 1.75
+LEAF_REGIME_UPWARD_SHOCK_STABILITY_RATIO: float = 1.30
 # Motor computacional; no modifica el espacio estadístico de candidatos.
 LEAF_CANDIDATE_ENGINE: str = "vectorized_block"
 LEAF_REQUIRE_PARENT_DRIVERS: bool = True

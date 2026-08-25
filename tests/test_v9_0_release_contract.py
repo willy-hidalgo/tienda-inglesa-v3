@@ -6,9 +6,9 @@ def read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 def test_release_versions_are_consistent():
-    assert 'APP_VERSION: str = "9.1"' in read("settings.py")
-    assert 'version = "9.1.0"' in read("pyproject.toml")
-    assert "ARTIFACT_VERSION = 6" in read("app/dashboard_artifacts.py")
+    assert 'APP_VERSION: str = "9.2"' in read("settings.py")
+    assert 'version = "9.2.0"' in read("pyproject.toml")
+    assert "ARTIFACT_VERSION = 7" in read("app/dashboard_artifacts.py")
     assert 'Pipeline Tienda Inglesa v{settings.APP_VERSION}' in read("app/main.py")
 
 def test_dashboard_stops_on_metric_series_inconsistency():

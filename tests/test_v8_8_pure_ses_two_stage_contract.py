@@ -11,7 +11,7 @@ def leaf_method() -> str:
 
 def test_version_and_low_alpha_grid():
     settings = read("settings.py")
-    assert 'APP_VERSION: str = "9.1"' in settings
+    assert 'APP_VERSION: str = "9.2"' in settings
     assert 'LEAF_ALPHA_SELECTION: str = "pure_ses_prior_cumulative_wmape"' in settings
     for token in ("0.005", "0.01", "0.02", "0.05", "0.10"):
         assert token in settings

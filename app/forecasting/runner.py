@@ -1645,7 +1645,7 @@ class RLSForecastRunner:
             else pl.DataFrame()
         )
 
-        # v9.1 robust sparse reference: use the median of the previous four
+        # v9.2 robust sparse reference: use the median of the previous four
         # 28-day DAILY means. A single spike-heavy block can inflate the
         # 112-day mean, but cannot dominate this median. This reference is
         # diagnostic/selection-only: the forecast level remains a PURE SES
@@ -1691,6 +1691,62 @@ class RLSForecastRunner:
                 pl.len().cast(pl.Int32).alias("_robust_block_n"),
             )
             if robust_block_shifted
+            else pl.DataFrame()
+        )
+
+        # v9.2 structural reference: EXCLUDE the immediately closed block.
+        # If that last block is a shock, it must not define its own ceiling.
+        structural_blocks = int(
+            getattr(settings, "LEAF_REGIME_STRUCTURAL_BLOCKS", 6)
+        )
+        upward_shock_min_blocks = int(
+            getattr(settings, "LEAF_REGIME_UPWARD_SHOCK_MIN_BLOCKS", 3)
+        )
+        upward_shock_ratio = float(
+            getattr(settings, "LEAF_REGIME_UPWARD_SHOCK_RATIO", 1.75)
+        )
+        upward_shock_stability_ratio = float(
+            getattr(
+                settings,
+                "LEAF_REGIME_UPWARD_SHOCK_STABILITY_RATIO",
+                1.30,
+            )
+        )
+        structural_shifted: list[pl.DataFrame] = []
+        for lag_block in range(2, structural_blocks + 2):
+            structural_shifted.append(
+                stability_block_sums.select(
+                    uid_col,
+                    (pl.col("_block") + lag_block)
+                    .cast(pl.Int32)
+                    .alias("_block"),
+                    (
+                        pl.col("_ref_sum_y") / pl.lit(float(block_days))
+                    ).alias("_struct_block_mean_y"),
+                    (
+                        pl.col("_ref_sum_v") / pl.lit(float(block_days))
+                    ).alias("_struct_block_mean_v"),
+                )
+            )
+        structural_block_refs = (
+            pl.concat(structural_shifted, how="vertical_relaxed")
+            .group_by([uid_col, "_block"])
+            .agg(
+                pl.col("_struct_block_mean_y")
+                .median()
+                .alias("_structural_block_median_y"),
+                pl.col("_struct_block_mean_v")
+                .median()
+                .alias("_structural_block_median_v"),
+                pl.col("_struct_block_mean_y")
+                .mean()
+                .alias("_structural_block_mean_y"),
+                pl.col("_struct_block_mean_v")
+                .mean()
+                .alias("_structural_block_mean_v"),
+                pl.len().cast(pl.Int32).alias("_structural_block_n"),
+            )
+            if structural_shifted
             else pl.DataFrame()
         )
 
@@ -1780,6 +1836,13 @@ class RLSForecastRunner:
                     on=uid_col,
                     how="left",
                 )
+                .join(
+                    structural_block_refs.filter(
+                        pl.col("_block") == block_i
+                    ).drop("_block"),
+                    on=uid_col,
+                    how="left",
+                )
                 .with_columns(
                     (
                         pl.lit(block_start) - pl.col("_leaf_start")
@@ -1802,6 +1865,11 @@ class RLSForecastRunner:
                     pl.col("_robust_block_max_y").fill_null(0.0),
                     pl.col("_robust_block_max_v").fill_null(0.0),
                     pl.col("_robust_block_n").fill_null(0),
+                    pl.col("_structural_block_median_y").fill_null(0.0),
+                    pl.col("_structural_block_median_v").fill_null(0.0),
+                    pl.col("_structural_block_mean_y").fill_null(0.0),
+                    pl.col("_structural_block_mean_v").fill_null(0.0),
+                    pl.col("_structural_block_n").fill_null(0),
                 )
                 .with_columns(
                     pl.when(pl.col("_leaf_age_days") <= 0)
@@ -1877,6 +1945,32 @@ class RLSForecastRunner:
                             > pl.col("_sparse_robust_v") * sparse_shock_ratio
                         )
                     ).alias("_sparse_shock_v"),
+                )
+                .with_columns(
+                    (
+                        (pl.col("_structural_block_n") >= upward_shock_min_blocks)
+                        & (
+                            pl.col("_structural_block_median_y")
+                            > stability_eps
+                        )
+                        & (
+                            pl.col("_recent28_y")
+                            > pl.col("_structural_block_median_y")
+                            * upward_shock_ratio
+                        )
+                    ).alias("_upward_shock_y"),
+                    (
+                        (pl.col("_structural_block_n") >= upward_shock_min_blocks)
+                        & (
+                            pl.col("_structural_block_median_v")
+                            > stability_eps
+                        )
+                        & (
+                            pl.col("_recent28_v")
+                            > pl.col("_structural_block_median_v")
+                            * upward_shock_ratio
+                        )
+                    ).alias("_upward_shock_v"),
                 )
                 .with_columns(
                     # Dense series may follow a persistent recent trend.
@@ -1971,6 +2065,13 @@ class RLSForecastRunner:
                     "_robust_block_median_v",
                     "_robust_block_mean_y",
                     "_robust_block_mean_v",
+                    "_structural_block_median_y",
+                    "_structural_block_median_v",
+                    "_structural_block_mean_y",
+                    "_structural_block_mean_v",
+                    "_structural_block_n",
+                    "_upward_shock_y",
+                    "_upward_shock_v",
                     "_regime_anchor_y",
                     "_regime_anchor_v",
                 )
@@ -2030,7 +2131,9 @@ class RLSForecastRunner:
                     .with_columns(
                         # Dense growth is allowed a higher ceiling by using the
                         # regime anchor; sparse shocks retain the 112-day ceiling.
-                        pl.when(
+                        pl.when(pl.col("_upward_shock_y"))
+                        .then(pl.col("_structural_block_median_y"))
+                        .when(
                             pl.col("_coverage_y") >= regime_dense_coverage
                         )
                         .then(
@@ -2041,7 +2144,9 @@ class RLSForecastRunner:
                         )
                         .otherwise(pl.col("_sparse_robust_y"))
                         .alias("_stability_anchor_y"),
-                        pl.when(
+                        pl.when(pl.col("_upward_shock_v"))
+                        .then(pl.col("_structural_block_median_v"))
+                        .when(
                             pl.col("_coverage_v") >= regime_dense_coverage
                         )
                         .then(
@@ -2052,13 +2157,17 @@ class RLSForecastRunner:
                         )
                         .otherwise(pl.col("_sparse_robust_v"))
                         .alias("_stability_anchor_v"),
-                        pl.when(
+                        pl.when(pl.col("_upward_shock_y"))
+                        .then(upward_shock_stability_ratio)
+                        .when(
                             pl.col("_coverage_y") < regime_dense_coverage
                         )
                         .then(sparse_stability_ratio)
                         .otherwise(stability_ratio)
                         .alias("_stability_ratio_y"),
-                        pl.when(
+                        pl.when(pl.col("_upward_shock_v"))
+                        .then(upward_shock_stability_ratio)
+                        .when(
                             pl.col("_coverage_v") < regime_dense_coverage
                         )
                         .then(sparse_stability_ratio)
@@ -2153,40 +2262,46 @@ class RLSForecastRunner:
                         pl.when(
                             pl.col("_stable_y")
                             & (
-                                pl.col("_wmape_ses_y")
-                                <= (
-                                    pl.col("_best_stable_ses_y")
-                                    * (1.0 + pl.col("_regime_score_tol_y"))
-                                    + alpha_abs_tol
+                                pl.col("_upward_shock_y")
+                                | (
+                                    pl.col("_wmape_ses_y")
+                                    <= (
+                                        pl.col("_best_stable_ses_y")
+                                        * (1.0 + pl.col("_regime_score_tol_y"))
+                                        + alpha_abs_tol
+                                    )
                                 )
                             )
-                            & (pl.col("_regime_anchor_y") > stability_eps)
+                            & (pl.col("_stability_anchor_y") > stability_eps)
                         )
                         .then(
                             (
-                                pl.col("_level_y") - pl.col("_regime_anchor_y")
+                                pl.col("_level_y") - pl.col("_stability_anchor_y")
                             ).abs()
-                            / pl.col("_regime_anchor_y")
+                            / pl.col("_stability_anchor_y")
                         )
                         .otherwise(float("inf"))
                         .alias("_regime_dist_y"),
                         pl.when(
                             pl.col("_stable_v")
                             & (
-                                pl.col("_wmape_ses_v")
-                                <= (
-                                    pl.col("_best_stable_ses_v")
-                                    * (1.0 + pl.col("_regime_score_tol_v"))
-                                    + alpha_abs_tol
+                                pl.col("_upward_shock_v")
+                                | (
+                                    pl.col("_wmape_ses_v")
+                                    <= (
+                                        pl.col("_best_stable_ses_v")
+                                        * (1.0 + pl.col("_regime_score_tol_v"))
+                                        + alpha_abs_tol
+                                    )
                                 )
                             )
-                            & (pl.col("_regime_anchor_v") > stability_eps)
+                            & (pl.col("_stability_anchor_v") > stability_eps)
                         )
                         .then(
                             (
-                                pl.col("_level_v") - pl.col("_regime_anchor_v")
+                                pl.col("_level_v") - pl.col("_stability_anchor_v")
                             ).abs()
-                            / pl.col("_regime_anchor_v")
+                            / pl.col("_stability_anchor_v")
                         )
                         .otherwise(float("inf"))
                         .alias("_regime_dist_v"),
@@ -2236,6 +2351,26 @@ class RLSForecastRunner:
                         .sort_by("_level_v", "_alpha")
                         .first()
                         .alias("_alpha_v_lowlevel"),
+                        pl.col("_alpha")
+                        .sort_by(
+                            (
+                                pl.col("_level_y")
+                                - pl.col("_structural_block_median_y")
+                            ).abs(),
+                            "_alpha",
+                        )
+                        .first()
+                        .alias("_alpha_y_structural"),
+                        pl.col("_alpha")
+                        .sort_by(
+                            (
+                                pl.col("_level_v")
+                                - pl.col("_structural_block_median_v")
+                            ).abs(),
+                            "_alpha",
+                        )
+                        .first()
+                        .alias("_alpha_v_structural"),
                         pl.col("_stable_y").any().alias("_stable_pool_y"),
                         pl.col("_stable_v").any().alias("_stable_pool_v"),
                         pl.col("_reference_y").first().alias("_reference_y"),
@@ -2258,13 +2393,29 @@ class RLSForecastRunner:
                         .alias("_robust_block_median_v"),
                         pl.col("_regime_anchor_y").first().alias("_regime_anchor_y"),
                         pl.col("_regime_anchor_v").first().alias("_regime_anchor_v"),
+                        pl.col("_structural_block_median_y")
+                        .first().alias("_structural_block_median_y"),
+                        pl.col("_structural_block_median_v")
+                        .first().alias("_structural_block_median_v"),
+                        pl.col("_upward_shock_y").first().alias("_upward_shock_y"),
+                        pl.col("_upward_shock_v").first().alias("_upward_shock_v"),
                     )
                     .with_columns(
-                        pl.when(pl.col("_stable_pool_y"))
+                        pl.when(
+                            pl.col("_upward_shock_y")
+                            & ~pl.col("_stable_pool_y")
+                        )
+                        .then(pl.col("_alpha_y_structural"))
+                        .when(pl.col("_stable_pool_y"))
                         .then(pl.col("_alpha_y_regime"))
                         .otherwise(pl.col("_alpha_y_lowlevel"))
                         .alias("_alpha_y"),
-                        pl.when(pl.col("_stable_pool_v"))
+                        pl.when(
+                            pl.col("_upward_shock_v")
+                            & ~pl.col("_stable_pool_v")
+                        )
+                        .then(pl.col("_alpha_v_structural"))
+                        .when(pl.col("_stable_pool_v"))
                         .then(pl.col("_alpha_v_regime"))
                         .otherwise(pl.col("_alpha_v_lowlevel"))
                         .alias("_alpha_v"),
@@ -2284,6 +2435,8 @@ class RLSForecastRunner:
                         "_alpha_v_regime",
                         "_alpha_y_lowlevel",
                         "_alpha_v_lowlevel",
+                        "_alpha_y_structural",
+                        "_alpha_v_structural",
                     )
                 )
 
@@ -2303,6 +2456,8 @@ class RLSForecastRunner:
                     "_sparse_shock_y",
                     "_robust_block_median_y",
                     "_regime_anchor_y",
+                    "_structural_block_median_y",
+                    "_upward_shock_y",
                     pl.col("_level_y"),
                     pl.when(pl.col("_cden_ses_y") > 0)
                     .then(pl.col("_cae_ses_y") / pl.col("_cden_ses_y"))
@@ -2326,6 +2481,8 @@ class RLSForecastRunner:
                     "_sparse_shock_v",
                     "_robust_block_median_v",
                     "_regime_anchor_v",
+                    "_structural_block_median_v",
+                    "_upward_shock_v",
                     pl.col("_level_v"),
                     pl.when(pl.col("_cden_ses_v") > 0)
                     .then(pl.col("_cae_ses_v") / pl.col("_cden_ses_v"))
@@ -3058,6 +3215,12 @@ class RLSForecastRunner:
                 .alias("ses_robust_block_median_y"),
                 pl.col("_robust_block_median_v")
                 .alias("ses_robust_block_median_value"),
+                pl.col("_structural_block_median_y")
+                .alias("ses_structural_block_median_y"),
+                pl.col("_structural_block_median_v")
+                .alias("ses_structural_block_median_value"),
+                pl.col("_upward_shock_y").alias("ses_upward_shock_y"),
+                pl.col("_upward_shock_v").alias("ses_upward_shock_value"),
                 pl.col("_ses_guard_y").alias("ses_stability_guard_y"),
                 pl.col("_ses_guard_v").alias("ses_stability_guard_value"),
                 pl.col("_stable_pool_y").alias("ses_stable_pool_found_y"),

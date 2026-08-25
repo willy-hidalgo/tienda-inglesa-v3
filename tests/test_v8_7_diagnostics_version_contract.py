@@ -8,7 +8,7 @@ def read(rel: str) -> str:
 def test_app_version_is_centralized_and_shown_in_main_menu():
     settings = read("settings.py")
     main = read("app/main.py")
-    assert 'APP_VERSION: str = "9.1"' in settings
+    assert 'APP_VERSION: str = "9.2"' in settings
     assert '=== Pipeline Tienda Inglesa v{settings.APP_VERSION} ===' in main
 
 def test_leaf_diagnostic_chain_is_logged():

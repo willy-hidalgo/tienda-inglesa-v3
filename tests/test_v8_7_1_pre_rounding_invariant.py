@@ -6,7 +6,7 @@ def read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 def test_version_is_patch_release():
-    assert 'APP_VERSION: str = "9.1"' in read("settings.py")
+    assert 'APP_VERSION: str = "9.2"' in read("settings.py")
 
 def test_hard_level_invariant_uses_raw_forecast():
     src = read("app/forecasting/runner.py")

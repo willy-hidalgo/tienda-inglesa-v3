@@ -6,8 +6,8 @@ def read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 def test_release_version_9_0_1():
-    assert 'APP_VERSION: str = "9.1"' in read("settings.py")
-    assert 'version = "9.1.0"' in read("pyproject.toml")
+    assert 'APP_VERSION: str = "9.2"' in read("settings.py")
+    assert 'version = "9.2.0"' in read("pyproject.toml")
 
 def test_parent_choices_are_normalized_before_chosen_frame_concat():
     src = read("app/forecasting/runner.py")

@@ -10,7 +10,7 @@ def leaf_method() -> str:
     return src[src.index("def fast_leaf_forecasts"):src.index("def derive_sku_store_forecasts")]
 
 def test_version_is_v9_0():
-    assert 'APP_VERSION: str = "9.1"' in read("settings.py")
+    assert 'APP_VERSION: str = "9.2"' in read("settings.py")
 
 def test_warmup_is_sum_over_28_calendar_days():
     m = leaf_method()

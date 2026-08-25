@@ -13,7 +13,7 @@ def leaf_method() -> str:
 def test_v9_version_and_driver_grid():
     settings = read("settings.py")
     m = leaf_method()
-    assert 'APP_VERSION: str = "9.1"' in settings
+    assert 'APP_VERSION: str = "9.2"' in settings
     assert 'LEAF_DRIVER_STRENGTH_CANDIDATES' in settings
     assert '{"_parent": "none", "_strength": 0.0}' in m
     for token in ("0.25", "0.50", "0.75", "1.00"):
@@ -96,7 +96,7 @@ def test_artifact_fingerprint_is_strict_and_versioned():
     art = read("app/dashboard_artifacts.py")
     dash = read("app/dashboard.py")
     audit = read("app/dashboard_consistency.py")
-    assert "ARTIFACT_VERSION = 6" in art
+    assert "ARTIFACT_VERSION = 7" in art
     for token in ("mtime_ns", "size_bytes", "app_version", "n_rows"):
         assert token in art
     assert "artifacts_match_source" in art

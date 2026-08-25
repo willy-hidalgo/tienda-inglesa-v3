@@ -39,7 +39,7 @@ def test_ranking_percentage_uses_oos_horizon_not_full_history():
 
 def test_artifact_version_forces_rebuild_after_semantic_changes():
     src = read("app/dashboard_artifacts.py")
-    assert "ARTIFACT_VERSION = 6" in src
+    assert "ARTIFACT_VERSION = 7" in src
     assert 'payload.get("version")' in src
 
 
