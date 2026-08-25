@@ -45,6 +45,8 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+ARTIFACT_VERSION = 6
+
 SERIES_COLS_PREFERRED = [
     "unique_id",
     "ds",
@@ -64,8 +66,30 @@ SERIES_COLS_PREFERRED = [
     "test_end",
     "forecast_start",
     "forecast_end",
+    "ses_level_y",
+    "ses_level_value",
     "driver_effect",
     "driver_effect_value",
+    "driver_factor_y",
+    "driver_factor_value",
+    "driver_strength_selected_y",
+    "driver_strength_selected_value",
+    "driver_strength_y",
+    "driver_strength_value",
+    "driver_direction_guard_y",
+    "driver_direction_guard_value",
+    "ses_recent28_y",
+    "ses_recent28_value",
+    "ses_recent14_y",
+    "ses_recent14_value",
+    "ses_recent28_coverage_y",
+    "ses_recent28_coverage_value",
+    "ses_regime_anchor_y",
+    "ses_regime_anchor_value",
+    "ses_stability_reference_y",
+    "ses_stability_reference_value",
+    "ses_stability_guard_y",
+    "ses_stability_guard_value",
     "rls_metric_eligible",
     "rls_block",
     "rls_train_days",
@@ -125,14 +149,87 @@ def _series_legacy_path(adir: Path) -> Path:
     return adir / "series.parquet"
 
 
+def source_fingerprint(
+    forecast_path: Path,
+    *,
+    n_rows: int | None = None,
+) -> dict[str, int | str]:
+    """Fingerprint barato y estricto del forecast que originó los artefactos."""
+    path = Path(forecast_path)
+    stat = path.stat()
+    fp: dict[str, int | str] = {
+        "mtime_ns": int(stat.st_mtime_ns),
+        "size_bytes": int(stat.st_size),
+        "app_version": str(getattr(settings, "APP_VERSION", "")),
+    }
+    if n_rows is not None:
+        fp["n_rows"] = int(n_rows)
+    return fp
+
+
+def artifacts_match_source(
+    forecast_path: Path,
+    index: dict[str, Any] | None = None,
+) -> bool:
+    """True solo si index y forecast pertenecen exactamente a la misma corrida."""
+    path = Path(forecast_path)
+    if not path.exists():
+        return False
+    if index is None:
+        ipath = _index_path(artifacts_dir(path))
+        if not ipath.exists():
+            return False
+        try:
+            index = json.loads(ipath.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+    expected = index.get("forecast_fingerprint") or {}
+    if not expected:
+        return False
+    current = source_fingerprint(path)
+    stat_match = (
+        int(expected.get("mtime_ns") or -1) == int(current["mtime_ns"])
+        and int(expected.get("size_bytes") or -1) == int(current["size_bytes"])
+        and str(expected.get("app_version") or "") == str(current["app_version"])
+    )
+    if not stat_match:
+        return False
+
+    # Row count is part of the identity too. Parquet metadata makes this check
+    # cheap and it prevents a ranking/KPI from being served from a different
+    # forecast even in the unlikely case of matching file size/timestamps.
+    expected_rows = int(expected.get("n_rows") or -1)
+    if expected_rows < 0:
+        return False
+    try:
+        current_rows = int(
+            pl.scan_parquet(path)
+            .select(pl.len().alias("_n"))
+            .collect()
+            .item()
+        )
+    except Exception:
+        return False
+    return current_rows == expected_rows
+
+
 def artifacts_exist(forecast_path: Path | None = None) -> bool:
     adir = artifacts_dir(forecast_path)
     has_series = _series_dir(adir).is_dir() or _series_legacy_path(adir).exists()
-    return (
-        _index_path(adir).exists()
-        and _metrics_path(adir).exists()
-        and has_series
-    )
+    ipath = _index_path(adir)
+    if not (ipath.exists() and _metrics_path(adir).exists() and has_series):
+        return False
+    try:
+        payload = json.loads(ipath.read_text(encoding="utf-8"))
+        return (
+            int(payload.get("version") or 0) == ARTIFACT_VERSION
+            and artifacts_match_source(
+                Path(forecast_path or settings.FORECAST_PATH),
+                payload,
+            )
+        )
+    except Exception:
+        return False
 
 
 def _parse_uid_parts(uids: list[str]) -> pl.DataFrame:
@@ -217,9 +314,17 @@ def _wmape_table_for_unit(
     for seccion in secciones:
         hz = settings.section_horizons(seccion)
         n_spine = (hz["forecast_end"] - hz["train_start"]).days + 1
-        spine_rows.append({"seccion": seccion, "n_spine": int(n_spine)})
+        ranking_days = (hz["test_end"] - hz["test_start"]).days + 1
+        spine_rows.append(
+            {
+                "seccion": seccion,
+                "n_spine": int(n_spine),
+                "ranking_days": int(ranking_days),
+            }
+        )
     spine_df = pl.DataFrame(spine_rows).with_columns(
-        pl.col("n_spine").cast(pl.UInt32)
+        pl.col("n_spine").cast(pl.UInt32),
+        pl.col("ranking_days").cast(pl.UInt32),
     )
 
     # WMAPE de rankings = solo out-of-sample (única fuente de verdad en tablas).
@@ -231,10 +336,12 @@ def _wmape_table_for_unit(
         return empty
 
     tabla = (
-        tabla.join(sec_from_id, on="unique_id", how="left")
+        tabla.with_columns(
+            pl.col("unique_id").str.split("||").list.get(0).alias("seccion")
+        )
         .join(spine_df, on="seccion", how="left")
         .with_columns(
-            pl.col("n_spine").fill_null(0).alias("n_points"),
+            pl.col("ranking_days").fill_null(0).alias("n_points"),
             pl.lit(unidad).alias("unidad"),
         )
         .select(
@@ -464,9 +571,14 @@ def _build_index(
                 )
 
     return {
-        "version": 2,
+        "version": ARTIFACT_VERSION,
         "forecast_path": str(forecast_path.resolve()),
         "forecast_mtime": forecast_path.stat().st_mtime if forecast_path.exists() else 0.0,
+        "forecast_fingerprint": source_fingerprint(
+            forecast_path,
+            n_rows=res_df.height,
+        ),
+        "app_version": str(getattr(settings, "APP_VERSION", "")),
         "secciones": secciones,
         "stores_by_sec": stores_by_sec,
         "skus_by_sec": skus_by_sec,

@@ -9,12 +9,14 @@ import datetime as dt
 import os
 from pathlib import Path
 
+APP_VERSION: str = "9.1"
+
 # ── Flag de modelo a nivel hoja ──────────────────────────────────────────────
 DEMO_MODE = os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Corrección de sesgo OOS/forecast: factor = Σy/Σŷ en in_sample (por unique_id).
 # Se aplica solo a out_sample y forecast_only (in_sample queda crudo).
-BIAS_CORRECTION: bool = True
+BIAS_CORRECTION: bool = True  # solo nodos agregados; SKU+tienda se excluye estructuralmente
 BIAS_CORRECTION_MIN_POINTS: int = 7
 BIAS_CORRECTION_CLIP: tuple[float, float] = (0.5, 2.0)
 
@@ -77,17 +79,56 @@ METRICS_MODE: str = "rolling_28"
 # cada bloque con actuals conocidos.
 FAST_LEAF_MODE: bool = True
 LEAF_INITIAL_LEVEL_DAYS: int = 28
-LEAF_INITIAL_MIN_POINTS: int = 7
-LEAF_SES_ALPHA: float = 0.70  # fallback/default para el primer bloque
-LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.20, 0.40, 0.60, 0.70, 0.80)
+LEAF_INITIAL_MIN_POINTS: int = 7  # legacy/ignored v8.9; warm-up = sum(actuals)/28 calendar days
+LEAF_SES_ALPHA: float = 0.10  # fallback conservador cuando aún no hay score causal
+LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80)
 LEAF_PARENT_SELECTION: str = "prior_cumulative_wmape"
+LEAF_ALPHA_SELECTION: str = "pure_ses_prior_cumulative_wmape"
+LEAF_SES_NEAR_BEST_REL_TOLERANCE: float = 0.05
+LEAF_SES_NEAR_BEST_ABS_TOLERANCE: float = 1e-6
+LEAF_SES_STABILITY_ENABLED: bool = True
+LEAF_SES_STABILITY_WINDOW_DAYS: int = 112
+LEAF_SES_LEVEL_MAX_RECENT_RATIO: float = 1.50
+LEAF_SES_STABILITY_EPS: float = 1e-9
+LEAF_SES_SCORE_DECAY: float = 0.85
+LEAF_REGIME_DENSE_COVERAGE: float = 0.85
+LEAF_REGIME_SHOCK_RATIO: float = 1.50
+LEAF_REGIME_DECLINE_RATIO: float = 0.60
+LEAF_REGIME_RECENT14_WEIGHT: float = 0.65
+LEAF_REGIME_SCORE_TOLERANCE: float = 0.20
+LEAF_REGIME_GROWTH_RATIO: float = 1.15
+LEAF_REGIME_SPARSE_SHOCK_RATIO: float = 1.35
+LEAF_REGIME_SPARSE_STABILITY_RATIO: float = 1.25
 # Motor computacional; no modifica el espacio estadístico de candidatos.
 LEAF_CANDIDATE_ENGINE: str = "vectorized_block"
-# v8: SES modela el nivel desestacionalizado en log-space. Se elimina la
-# escala multiplicativa SKU de v7.x para evitar saltos artificiales de nivel.
-LEAF_RESIDUAL_LOG_SPACE: bool = True
+LEAF_REQUIRE_PARENT_DRIVERS: bool = True
+WMAPE_INCLUDE_ZERO_ACTUAL_DAYS: bool = True
+# SES modela directamente el nivel observable de cada hoja en escala
+# original. Los drivers RLS solo modifican la forma temporal del bloque.
+LEAF_SES_SCALE: str = "original"
 FAST_LEAF_DRIVER_EFFECTS: bool = True
-FAST_LEAF_DRIVER_FACTOR_CLIP: tuple[float, float] = (0.20, 5.00)
+# El driver RLS modifica la FORMA diaria, nunca el nivel medio del SKU.
+# Factor multiplicativo relativo, normalizado a media 1 por bloque.
+FAST_LEAF_DRIVER_FACTOR_CLIP: tuple[float, float] = (0.50, 2.00)
+# Después del warm-up, ausencia de fila diaria significa venta cero
+# para el estado SES y para el score histórico. Train y OOS usan así la misma
+# semántica de calendario diario.
+LEAF_ZERO_FILL_MISSING_CALENDAR_DAYS: bool = True
+LEAF_DRIVER_MEAN_TOLERANCE: float = 1e-6
+LEAF_DRIVER_STRENGTH_CANDIDATES: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00)
+LEAF_DRIVER_DEFAULT_STRENGTH: float = 0.50
+LEAF_DRIVER_SCORE_DECAY: float = 0.70
+LEAF_DRIVER_NEAR_BEST_REL_TOLERANCE: float = 0.02
+LEAF_DRIVER_DIRECTION_CONFLICT_RATIO: float = 0.85
+LEAF_DRIVER_RECENT_TREND_FLOOR: float = 0.95
+LEAF_DRIVER_RECENT_TREND_CEILING: float = 1.05
+LEAF_DRIVER_DIRECTION_GUARD_MAX_STRENGTH: float = 0.25
+LEAF_FORECAST_LEVEL_MEAN_TOLERANCE: float = 0.02
+LEAF_LEVEL_REFERENCE_WARN_RATIO: float = 4.0
+# Diagnóstico obligatorio de transiciones OOS/forecast-only.
+LEAF_DIAGNOSTIC_TOP_N: int = 10
+LEAF_DIAGNOSTIC_LEVEL_RATIO: float = 3.0
+LEAF_DIAGNOSTIC_FORECAST_RATIO: float = 3.0
 
 # Métricas oficiales: siempre bottom-up desde SKU+tienda y desde el día 29.
 METRICS_START_DAY: int = 29
@@ -553,20 +594,20 @@ def ranking_description(
 # ─────────────────────────────────────────────────────────────────────────────
 # Métricas (WMAPE / BIAS)
 # ─────────────────────────────────────────────────────────────────────────────
-# WMAPE TOTAL REAL = Σ_i |y_i − ŷ_i| / Σ_j y_j
-# (equiv. a Σ_i (|err_i|/y_i) · (y_i / Σ y) )
-# Se excluyen observaciones con y = 0 (o nulas).
+# WMAPE TOTAL REAL = Σ_i |y_i − ŷ_i| / Σ_j |y_j|
+# Los días con y=0 permanecen: aportan |ŷ| al numerador y 0 al denominador.
+# Solo se excluyen pares no finitos/nulos.
 #
-# BIAS = Σ (ŷ − y) / Σ y   (mismo filtro y ≠ 0)
+# BIAS = Σ (ŷ − y) / Σ y sobre los mismos pares finitos.
 
 
 def compute_wmape(y, yhat) -> float:
-    """WMAPE en [0, +∞) como fracción (no porcentaje). Excluye y==0."""
+    """WMAPE en [0,+∞). Incluye días y==0 en el error absoluto."""
     import numpy as np
 
     y = np.asarray(y, dtype=np.float64).ravel()
     yhat = np.asarray(yhat, dtype=np.float64).ravel()
-    mask = np.isfinite(y) & np.isfinite(yhat) & (y != 0)
+    mask = np.isfinite(y) & np.isfinite(yhat)
     if not mask.any():
         return 0.0
     y_m, yh_m = y[mask], yhat[mask]
@@ -577,12 +618,12 @@ def compute_wmape(y, yhat) -> float:
 
 
 def compute_bias(y, yhat) -> float:
-    """BIAS = Σ(ŷ−y)/Σy. Excluye y==0."""
+    """BIAS = Σ(ŷ−y)/Σy sobre pares finitos, incluyendo y==0."""
     import numpy as np
 
     y = np.asarray(y, dtype=np.float64).ravel()
     yhat = np.asarray(yhat, dtype=np.float64).ravel()
-    mask = np.isfinite(y) & np.isfinite(yhat) & (y != 0)
+    mask = np.isfinite(y) & np.isfinite(yhat)
     if not mask.any():
         return 0.0
     y_m, yh_m = y[mask], yhat[mask]

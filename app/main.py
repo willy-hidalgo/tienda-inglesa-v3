@@ -25,6 +25,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+import settings
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -69,7 +70,7 @@ class PipelineCLI:
             if self._default_n_jobs and self._default_n_jobs > 1
             else ""
         )
-        print("\n=== Pipeline Tienda Inglesa ===")
+        print(f"\n=== Pipeline Tienda Inglesa v{settings.APP_VERSION} ===")
         for opt in self._options:
             extra = n_info if opt.supports_parallel else ""
             print(f"{opt.key}. {opt.label}{extra}")

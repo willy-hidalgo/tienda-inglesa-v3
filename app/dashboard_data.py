@@ -45,6 +45,7 @@ class DashboardView:
     ranking_tiendas: pl.DataFrame
     ranking_skus: pl.DataFrame
     n_spine: int
+    ranking_days: int
     metrics: dict[str, dict[str, float | int]]
     metrics_28: dict[str, float | int]
     has_rolling28: bool
@@ -54,6 +55,7 @@ class DashboardView:
     ds_min: dt.date | None
     ds_max: dt.date | None
     cutoff: dt.date
+    consistency_warnings: list[str]
     has_value_cols: bool = False
 
 
@@ -106,6 +108,57 @@ def _horizons_from_index(
     return hz
 
 
+def _pin_selected(display: pl.DataFrame, code: str | None) -> pl.DataFrame:
+    """Mantiene visible la selección actual sin alterar el cálculo del ranking."""
+    if display.height == 0 or code is None or "Código" not in display.columns:
+        return display
+    selected = str(code)
+    if display.filter(pl.col("Código").cast(pl.Utf8) == selected).height == 0:
+        return display
+    return (
+        display.with_columns(
+            (pl.col("Código").cast(pl.Utf8) == selected).alias("_selected"),
+            pl.when(pl.col("Código").cast(pl.Utf8) == selected)
+            .then(pl.lit("✓"))
+            .otherwise(pl.lit(""))
+            .alias("Sel."),
+        )
+        .sort("_selected", descending=True, maintain_order=True)
+        .drop("_selected")
+    )
+
+
+def _metric_consistency_warnings(
+    metrics: pl.DataFrame,
+    *,
+    selected_id: str,
+    unidad: str,
+    observed: dict[str, dict[str, float | int]],
+    tolerance: float = 1e-9,
+) -> list[str]:
+    """Verifica que KPI OOS y metrics.parquet usan exactamente la misma métrica."""
+    if metrics.height == 0:
+        return []
+    row = metrics.filter(
+        (pl.col("unique_id") == selected_id)
+        & (pl.col("unidad") == unidad)
+    )
+    if row.height == 0:
+        return [
+            f"No existe métrica OOS precalculada para {selected_id} / {unidad}. "
+            "Regenera los artefactos del dashboard."
+        ]
+    expected = float(row["wmape"][0])
+    actual = float((observed.get("out") or {}).get("wmape", 0.0) or 0.0)
+    if abs(expected - actual) > tolerance:
+        return [
+            "Inconsistencia detectada entre ranking/metrics.parquet y KPI OOS "
+            f"del gráfico para {selected_id}: {expected:.6%} vs {actual:.6%}. "
+            "Los artefactos pueden estar desactualizados o construidos con otra definición."
+        ]
+    return []
+
+
 def _ranking_from_metrics(
     metrics: pl.DataFrame,
     *,
@@ -116,6 +169,7 @@ def _ranking_from_metrics(
     exclude: str | None,
     desc_map: dict[str, str],
     n_spine: int,
+    selected_code: str | None = None,
 ) -> pl.DataFrame:
     """Ranking barato sobre metrics.parquet (misma semántica que ranking_table)."""
     label_rot = "Rotación ($)" if unidad.startswith("Valor") else "Rotación (unid.)"
@@ -127,6 +181,8 @@ def _ranking_from_metrics(
             label_rot: pl.Utf8,
             "N puntos": pl.UInt32,
             "% ≠0": pl.Utf8,
+            "Impacto error (%)": pl.Utf8,
+            "Estado": pl.Utf8,
             "unique_id": pl.Utf8,
         }
     )
@@ -165,10 +221,18 @@ def _ranking_from_metrics(
         base = base.with_columns(pl.col("sku").cast(pl.Utf8))
 
     if axis == "store":
-        # Siempre y solo nodos tienda puros (store presente, sku ausente).
-        tabla = base.filter(
-            pl.col("store").is_not_null() & pl.col("sku").is_null()
-        )
+        if fixed_peer is not None:
+            # SKU seleccionado → comparar ESE MISMO SKU entre tiendas.
+            peer = str(fixed_peer)
+            tabla = base.filter(
+                pl.col("store").is_not_null()
+                & (pl.col("sku") == peer)
+            )
+        else:
+            # Sin SKU fijo → métricas bottom-up derivadas por tienda.
+            tabla = base.filter(
+                pl.col("store").is_not_null() & pl.col("sku").is_null()
+            )
         if exclude is not None:
             tabla = tabla.filter(pl.col("store") != str(exclude))
         code_col = "store"
@@ -241,12 +305,37 @@ def _ranking_from_metrics(
                 )
                 code_col = "sku"
 
-    # Solo filas con rotación y wMAPE > 0. Ranking SKU: mínimo 15 días
-    # con actual distinto de cero (configurable).
-    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
+    # Participación en el error absoluto del alcance ANTES de ocultar filas
+    # por elegibilidad de ranking. Un wMAPE enorme en un SKU de poca rotación
+    # puede así distinguirse de un SKU que realmente domina el error agregado.
+    scope_abs_error = float(
+        tabla.select(
+            (pl.col("wmape") * pl.col("sum_y").abs()).sum()
+        ).item()
+        or 0.0
+    )
+
+    # Elegibilidad del ranking. La selección actual se conserva aunque quede
+    # fuera del criterio en el nuevo alcance (p.ej. SKU con 15 días a nivel
+    # sección pero solo 6 días de venta en una tienda concreta).
+    eligible_expr = (pl.col("sum_y") > 0) & (pl.col("wmape") > 0)
+    min_nonzero = int(getattr(settings, "RANKING_SKU_MIN_NONZERO_POINTS", 15))
     if axis == "sku":
-        min_nonzero = int(getattr(settings, "RANKING_SKU_MIN_NONZERO_POINTS", 15))
-        tabla = tabla.filter(pl.col("n_with_sales") >= min_nonzero)
+        eligible_expr = eligible_expr & (pl.col("n_with_sales") >= min_nonzero)
+    tabla = tabla.with_columns(eligible_expr.alias("_eligible"))
+
+    selected_row = pl.DataFrame()
+    if selected_code is not None:
+        selected_row = tabla.filter(
+            pl.col(code_col).cast(pl.Utf8) == str(selected_code)
+        )
+
+    ranked = tabla.filter(pl.col("_eligible"))
+    if selected_row.height:
+        ranked = pl.concat(
+            [ranked, selected_row], how="diagonal_relaxed"
+        ).unique(subset=[code_col], keep="first", maintain_order=True)
+    tabla = ranked
     if tabla.height == 0:
         return empty
     if code_col in tabla.columns:
@@ -264,14 +353,32 @@ def _ranking_from_metrics(
         (float(nw) / float(n_spine) * 100) if n_spine else 0.0
         for nw in n_with_sales
     ]
+    impacts = [
+        (
+            float(w) * abs(float(sy)) / scope_abs_error * 100.0
+            if scope_abs_error > 0
+            else 0.0
+        )
+        for w, sy in zip(tabla["wmape"].to_list(), tabla["sum_y"].to_list())
+    ]
+
     descriptions: list[str] = []
     for u, code in zip(uids2, codes):
-        d = desc_map.get(u, "")
-        if not d and axis == "sku":
-            d = next(
-                (desc_map[k] for k in desc_map if f"||S:{code}" in k and desc_map[k]),
-                "",
-            )
+        if axis == "store":
+            store_uid = settings.make_unique_id(seccion, store=str(code))
+            d = desc_map.get(store_uid, "")
+        else:
+            sku_uid = settings.make_unique_id(seccion, sku=str(code))
+            d = desc_map.get(sku_uid, "") or desc_map.get(u, "")
+            if not d:
+                d = next(
+                    (
+                        desc_map[k]
+                        for k in desc_map
+                        if f"||S:{code}" in k and desc_map[k]
+                    ),
+                    "",
+                )
         descriptions.append(d)
 
     return pl.DataFrame(
@@ -282,6 +389,13 @@ def _ranking_from_metrics(
             label_rot: [f"{v:,.2f}" for v in tabla["sum_y"].to_list()],
             "N puntos": [int(x) for x in n_with_sales],
             "% ≠0": [f"{p:,.1f}" for p in pct],
+            "Impacto error (%)": [f"{v:,.1f}" for v in impacts],
+            "Estado": [
+                "✓ criterio"
+                if bool(v)
+                else f"fuera criterio (<{min_nonzero} días ≠0)"
+                for v in tabla["_eligible"].to_list()
+            ],
             "unique_id": uids2,
         }
     )
@@ -318,7 +432,13 @@ def prepare_dashboard_state_fast(
         )
 
     horizons = _horizons_from_index(index, seccion, df_daily)
+    test_start = horizons.get("test_start")
     test_end = horizons.get("test_end")
+    ranking_days = (
+        (test_end - test_start).days + 1
+        if test_start is not None and test_end is not None
+        else int(getattr(settings, "METRIC_HORIZON_DAYS", 28))
+    )
     fcst_start = horizons.get("forecast_start")
     fcst_end = horizons.get("forecast_end")
     train_end = horizons.get("train_end")
@@ -337,9 +457,10 @@ def prepare_dashboard_state_fast(
         unidad=unidad,
         axis="store",
         fixed_peer=sku,
-        exclude=store,
+        exclude=None,
         desc_map=desc_map,
-        n_spine=n_spine or 1,
+        n_spine=ranking_days or 1,
+        selected_code=store,
     )
     ranking_skus = _ranking_from_metrics(
         metrics,
@@ -347,10 +468,13 @@ def prepare_dashboard_state_fast(
         unidad=unidad,
         axis="sku",
         fixed_peer=store,
-        exclude=sku,
+        exclude=None,
         desc_map=desc_map,
-        n_spine=n_spine or 1,
+        n_spine=ranking_days or 1,
+        selected_code=sku,
     )
+    ranking_tiendas = _pin_selected(ranking_tiendas, store)
+    ranking_skus = _pin_selected(ranking_skus, sku)
 
     # Métricas oficiales SIEMPRE bottom-up desde hojas SKU+tienda. En modo
     # rolling_28, backend filtra además rls_metric_eligible=True (día 29+).
@@ -383,6 +507,12 @@ def prepare_dashboard_state_fast(
                 df_view, cutoff, test_end or cutoff
             )
     metrics_28 = backend.metrics_rolling28(df_view)
+    consistency_warnings = _metric_consistency_warnings(
+        metrics,
+        selected_id=selected_id,
+        unidad=unidad,
+        observed=metrics_io,
+    )
 
     has_rolling28 = (
         "yhat28" in df_daily.columns
@@ -420,6 +550,7 @@ def prepare_dashboard_state_fast(
         ranking_tiendas=ranking_tiendas,
         ranking_skus=ranking_skus,
         n_spine=n_spine,
+        ranking_days=ranking_days,
         metrics=metrics_io,
         metrics_28=metrics_28,
         has_rolling28=has_rolling28,
@@ -429,6 +560,7 @@ def prepare_dashboard_state_fast(
         ds_min=ds_min,
         ds_max=ds_max,
         cutoff=cutoff,
+        consistency_warnings=consistency_warnings,
         has_value_cols=has_value,
     )
 
@@ -518,7 +650,13 @@ def prepare_dashboard_state(
 
     horizons = backend.resolve_horizons(df_daily, seccion, cols)
     train_end = horizons["train_end"]
+    test_start = horizons["test_start"]
     test_end = horizons["test_end"]
+    ranking_days = (
+        (test_end - test_start).days + 1
+        if test_start is not None and test_end is not None
+        else int(getattr(settings, "METRIC_HORIZON_DAYS", 28))
+    )
     fcst_start = horizons["forecast_start"]
     fcst_end = horizons["forecast_end"]
 
@@ -545,7 +683,7 @@ def prepare_dashboard_state(
             tabla_base = backend.wmape_por_id(
                 candidatos,
                 unit_df,
-                n_fechas_spine=n_spine,
+                n_fechas_spine=ranking_days,
                 period_types=["out_sample"],
             )
 
@@ -554,18 +692,20 @@ def prepare_dashboard_state(
         seccion=seccion,
         axis="store",
         fixed_peer=sku,
-        exclude=store,
+        exclude=None,
         desc_map=desc_map,
         unidad=unidad,
+        selected_code=store,
     )
     ranking_skus = backend.ranking_table(
         tabla_base,
         seccion=seccion,
         axis="sku",
         fixed_peer=store,
-        exclude=sku,
+        exclude=None,
         desc_map=desc_map,
         unidad=unidad,
+        selected_code=sku,
     )
 
     # Métricas oficiales SIEMPRE bottom-up desde hojas SKU+tienda.
@@ -616,6 +756,7 @@ def prepare_dashboard_state(
         ranking_tiendas=ranking_tiendas,
         ranking_skus=ranking_skus,
         n_spine=n_spine,
+        ranking_days=ranking_days,
         metrics=metrics,
         metrics_28=metrics_28,
         has_rolling28=has_rolling28,
@@ -625,5 +766,6 @@ def prepare_dashboard_state(
         ds_min=ds_min,
         ds_max=ds_max,
         cutoff=cutoff,
+        consistency_warnings=[],
         has_value_cols=has_value,
     )

@@ -168,6 +168,7 @@ def test_client_required_rls_defaults():
     assert settings.RLS_BLOCK_DAYS == 28
     assert settings.METRICS_MODE == "rolling_28"
     assert settings.FAST_LEAF_DRIVER_EFFECTS is True
+    assert settings.FAST_LEAF_DRIVER_FACTOR_CLIP == (0.50, 2.00)
 
 
 def test_v6_leaf_and_metric_contract():
@@ -180,7 +181,7 @@ def test_v6_leaf_and_metric_contract():
     assert settings.LEAF_INITIAL_MIN_POINTS == 7
     assert settings.LEAF_SES_ALPHA in settings.LEAF_SES_ALPHA_CANDIDATES
     assert settings.LEAF_PARENT_SELECTION == "prior_cumulative_wmape"
-    assert settings.LEAF_RESIDUAL_LOG_SPACE is True
+    assert settings.LEAF_SES_SCALE == "original"
     assert settings.RLS_AUTOREGRESSIVE_DRIVERS is True
     assert settings.RLS_FORGETTING_FACTOR_CANDIDATES == (0.970, 0.985, 0.995)
     assert settings.RANKING_SKU_MIN_NONZERO_POINTS == 15

@@ -232,7 +232,7 @@ def _scored_leaves(
     period_types: list[str] | None = None,
 ) -> pl.DataFrame:
     """
-    Hojas sku+tienda con venta.
+    Hojas sku+tienda puntuables. Los días con y=0 permanecen para penalizar sobreforecast.
 
     period_types:
       - None → excluye solo forecast_only (in_sample + out_sample; compat métricas in/out)
@@ -260,7 +260,6 @@ def _scored_leaves(
         & pl.col("yhat").is_not_null()
         & pl.col("y").is_finite()
         & pl.col("yhat").is_finite()
-        & (pl.col("y") != 0)
     )
     if leaves.height == 0:
         return leaves
@@ -288,7 +287,7 @@ def wmape_bottom_up(
     WMAPE bottom-up desde hojas sku+tienda (única fuente de verdad).
 
     Definición (igual para hoja / tienda / sección / SKU puro):
-        abs_err_i = |y_i − ŷ_i|   en cada fila de hoja con y ≠ 0
+        abs_err_i = |y_i − ŷ_i| en toda fila finita, incluyendo y=0
         wMAPE     = Σ abs_err / Σ |y|
 
     - Hoja sku+tienda: suma sobre sus propias filas.
@@ -327,9 +326,14 @@ def wmape_bottom_up(
 
     # Días distintos con venta; sin ds → filas (compat)
     if "ds" in leaves.columns:
-        n_sales_expr = pl.col("ds").n_unique().cast(pl.UInt32).alias("n_with_sales")
+        n_sales_expr = (
+            pl.col("ds").filter(pl.col("y") != 0).n_unique()
+            .cast(pl.UInt32).alias("n_with_sales")
+        )
     else:
-        n_sales_expr = pl.len().cast(pl.UInt32).alias("n_with_sales")
+        n_sales_expr = (
+            (pl.col("y") != 0).sum().cast(pl.UInt32).alias("n_with_sales")
+        )
 
     def _agg_level(group_key: str) -> pl.DataFrame:
         out = (
@@ -480,6 +484,7 @@ def ranking_table(
     exclude: str | None,
     desc_map: dict[str, str],
     unidad: str,
+    selected_code: str | None = None,
 ) -> pl.DataFrame:
     """
     Tabla de ranking para UN eje (`axis="store"` o `axis="sku"`), con
@@ -513,6 +518,8 @@ def ranking_table(
             label_rot: pl.Utf8,
             "N puntos": pl.UInt32,
             "% ≠0": pl.Utf8,
+            "Impacto error (%)": pl.Utf8,
+            "Estado": pl.Utf8,
             "unique_id": pl.Utf8,
         }
     )
@@ -539,10 +546,17 @@ def ranking_table(
     )
 
     if axis == "store":
-        # Siempre y solo nodos tienda puros (store presente, sku ausente).
-        tabla = enriched.filter(
-            pl.col("_store").is_not_null() & pl.col("_sku").is_null()
-        )
+        if fixed_peer is not None:
+            # SKU seleccionado → comparar la misma hoja SKU entre tiendas.
+            peer = str(fixed_peer)
+            tabla = enriched.filter(
+                pl.col("_store").is_not_null() & (pl.col("_sku") == peer)
+            )
+        else:
+            # Sin SKU fijo → métricas bottom-up derivadas por tienda.
+            tabla = enriched.filter(
+                pl.col("_store").is_not_null() & pl.col("_sku").is_null()
+            )
         if exclude is not None:
             tabla = tabla.filter(pl.col("_store") != str(exclude))
         code_expr = pl.col("_store")
@@ -608,12 +622,30 @@ def ranking_table(
                 uid_expr = pl.col("unique_id")
                 code_col = "_sku"
 
-    # Solo filas con rotación y wMAPE > 0. Para SKU se exige además una
-    # cobertura mínima de días con actual distinto de cero.
-    tabla = tabla.filter((pl.col("sum_y") > 0) & (pl.col("wmape") > 0))
+    scope_abs_error = float(
+        tabla.select(
+            (pl.col("wmape") * pl.col("sum_y").abs()).sum()
+        ).item()
+        or 0.0
+    )
+
+    eligible_expr = (pl.col("sum_y") > 0) & (pl.col("wmape") > 0)
+    min_nonzero = int(getattr(settings, "RANKING_SKU_MIN_NONZERO_POINTS", 15))
     if axis == "sku":
-        min_nonzero = int(getattr(settings, "RANKING_SKU_MIN_NONZERO_POINTS", 15))
-        tabla = tabla.filter(pl.col("n_with_sales") >= min_nonzero)
+        eligible_expr = eligible_expr & (pl.col("n_with_sales") >= min_nonzero)
+    tabla = tabla.with_columns(eligible_expr.alias("_eligible"))
+
+    selected_row = pl.DataFrame()
+    if selected_code is not None:
+        selected_row = tabla.filter(
+            pl.col(code_col).cast(pl.Utf8) == str(selected_code)
+        )
+    ranked = tabla.filter(pl.col("_eligible"))
+    if selected_row.height:
+        ranked = pl.concat(
+            [ranked, selected_row], how="diagonal_relaxed"
+        ).unique(subset=[code_col], keep="first", maintain_order=True)
+    tabla = ranked
     if tabla.height == 0:
         return empty
     tabla = tabla.sort("wmape", descending=False).unique(
@@ -628,15 +660,32 @@ def ranking_table(
         (float(nw) / float(np_) * 100) if np_ else 0.0
         for nw, np_ in zip(n_with_sales, n_points)
     ]
+    impacts = [
+        (
+            float(w) * abs(float(sy)) / scope_abs_error * 100.0
+            if scope_abs_error > 0
+            else 0.0
+        )
+        for w, sy in zip(tabla["wmape"].to_list(), tabla["sum_y"].to_list())
+    ]
+
     descriptions: list[str] = []
     for u, code in zip(uids2, codes):
-        d = desc_map.get(u, "")
-        if not d and axis == "sku":
-            prefix_hit = next(
-                (desc_map[k] for k in desc_map if f"||S:{code}" in k and desc_map[k]),
-                "",
-            )
-            d = prefix_hit
+        if axis == "store":
+            store_uid = settings.make_unique_id(seccion, store=str(code))
+            d = desc_map.get(store_uid, "")
+        else:
+            sku_uid = settings.make_unique_id(seccion, sku=str(code))
+            d = desc_map.get(sku_uid, "") or desc_map.get(u, "")
+            if not d:
+                d = next(
+                    (
+                        desc_map[k]
+                        for k in desc_map
+                        if f"||S:{code}" in k and desc_map[k]
+                    ),
+                    "",
+                )
         descriptions.append(d)
 
     return pl.DataFrame(
@@ -647,6 +696,13 @@ def ranking_table(
             label_rot: [f"{v:,.2f}" for v in tabla["sum_y"].to_list()],
             "N puntos": [int(x) for x in n_with_sales],
             "% ≠0": [f"{p:,.1f}" for p in pct],
+            "Impacto error (%)": [f"{v:,.1f}" for v in impacts],
+            "Estado": [
+                "✓ criterio"
+                if bool(v)
+                else f"fuera criterio (<{min_nonzero} días ≠0)"
+                for v in tabla["_eligible"].to_list()
+            ],
             "unique_id": uids2,
         }
     )
@@ -654,8 +710,8 @@ def ranking_table(
 
 def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
     """
-    wMAPE = Σ|y−ŷ| / Σ|y| sobre filas con y≠0 y ŷ finito.
-    Misma exclusión que rankings / `_scored_leaves`.
+    wMAPE = Σ|y−ŷ| / Σ|y| sobre filas finitas, incluyendo y=0.
+    Los días cero penalizan sobreforecast en el numerador.
     Si `df` trae varias hojas, es bottom-up (suma de abs_err de cada fila hoja).
     """
     if df.height == 0 or "y" not in df.columns or "yhat" not in df.columns:
@@ -671,7 +727,6 @@ def calcular_metricas(df: pl.DataFrame) -> tuple[float, float, int]:
         & pl.col("yhat").is_not_null()
         & pl.col("y").is_finite()
         & pl.col("yhat").is_finite()
-        & (pl.col("y") != 0)
     )
     if scored.height == 0:
         return 0.0, 0.0, 0
@@ -926,8 +981,9 @@ def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}
     scored = df_view.filter(
         pl.col("y").is_not_null()
-        & (pl.col("y") != 0)
         & pl.col("yhat28").is_not_null()
+        & pl.col("y").is_finite()
+        & pl.col("yhat28").is_finite()
     )
     if scored.height == 0:
         return {"wmape_28": 0.0, "bias_28": 0.0, "n": 0}

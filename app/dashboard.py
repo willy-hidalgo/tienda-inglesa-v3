@@ -90,6 +90,9 @@ def _cached_section_metrics(
     unit_df = backend.prepare_unit_df(_res_df, unidad, has_value)
     hz_spine = settings.section_horizons(seccion)
     n_spine = (hz_spine["forecast_end"] - hz_spine["train_start"]).days + 1
+    ranking_days = (
+        (hz_spine["test_end"] - hz_spine["test_start"]).days + 1
+    )
     candidatos = [
         uid for uid in all_ids_tuple if uid == seccion or uid.startswith(f"{seccion}||")
     ]
@@ -100,7 +103,7 @@ def _cached_section_metrics(
     tabla_base = backend.wmape_por_id(
         candidatos,
         unit_df,
-        n_fechas_spine=n_spine,
+        n_fechas_spine=ranking_days,
         period_types=["out_sample"],
     )
     return tabla_base, n_spine
@@ -210,33 +213,31 @@ else:
     default_path = Path(settings.FORECAST_PATH)
     forecast_path_str = str(default_path)
     if default_path.exists():
-        _mtime_key = float(default_path.stat().st_mtime)
+        _mtime_key = int(default_path.stat().st_mtime_ns)
         if artifacts.artifacts_exist(default_path):
-            # Invalidar si el forecast es más nuevo que el index
             try:
                 index = _load_index(_mtime_key, forecast_path_str)
-                art_mtime = float(index.get("forecast_mtime") or 0)
-                if art_mtime and abs(art_mtime - _mtime_key) > 1.0:
-                    st.sidebar.warning(
-                        "Artefactos desactualizados respecto a forecast.parquet. "
-                        "Reconstruir: `python -m app.dashboard_artifacts`"
-                    )
-                    use_fast = False
-                    res_df = _load_parquet(forecast_path_str, _mtime_key)
-                else:
-                    use_fast = True
-                    st.sidebar.success(
-                        f"Artefactos listos · {default_path.name}"
-                    )
+                use_fast = True
+                st.sidebar.success(
+                    f"Artefactos v{index.get('version')} sincronizados · "
+                    f"{default_path.name}"
+                )
             except Exception as exc:  # noqa: BLE001
-                st.sidebar.warning(f"No se pudieron cargar artefactos: {exc}")
-                use_fast = False
-                res_df = _load_parquet(forecast_path_str, _mtime_key)
+                st.error(f"No se pudieron cargar artefactos consistentes: {exc}")
+                st.stop()
         else:
+            index_path = artifacts.artifacts_dir(default_path) / "index.json"
+            if index_path.exists():
+                st.error(
+                    "Los artefactos del dashboard NO corresponden al "
+                    "`forecast.parquet` actual. Por seguridad no se muestran "
+                    "rankings/KPIs potencialmente antiguos. Ejecuta "
+                    "`python -m app.dashboard_artifacts` y recarga."
+                )
+                st.stop()
             st.sidebar.warning(
-                "⚠️ Sin artefactos → modo LENTO. "
-                "Ejecutá: `python -m app.dashboard_artifacts` "
-                "(o menú opción 4) y recargá."
+                "⚠️ Artefactos ausentes → modo legacy. Para producción genera: "
+                "`python -m app.dashboard_artifacts`."
             )
             use_fast = False
             res_df = _load_parquet(forecast_path_str, _mtime_key)
@@ -374,28 +375,33 @@ _raw_sku = st.session_state.get("sel_sku", _SENTINEL_SKU)
 _sku_val = None if _raw_sku == _SENTINEL_SKU else _raw_sku
 _store_val = None if _raw_tienda == _SENTINEL_TIENDA else _raw_tienda
 
+# Coherencia bidireccional:
+# - si hay SKU seleccionado, la lista de tiendas contiene SOLO tiendas donde existe;
+# - si hay tienda seleccionada, la lista SKU contiene SOLO SKU de esa tienda.
+# Esto aplica igual si la selección vino del sidebar o de una tabla de ranking.
 if use_fast:
-    if last_touched == "sku" and _sku_val is not None:
-        tienda_opts = [_SENTINEL_TIENDA] + list(
+    all_stores = list((index.get("stores_by_sec") or {}).get(seccion, []))
+    all_skus = list((index.get("skus_by_sec") or {}).get(seccion, []))
+    if _sku_val is not None:
+        allowed_stores = list(
             (index.get("stores_for_sku") or {}).get(seccion, {}).get(_sku_val, [])
         )
     else:
-        tienda_opts = [_SENTINEL_TIENDA] + list(
-            (index.get("stores_by_sec") or {}).get(seccion, [])
-        )
+        allowed_stores = all_stores
 else:
-    if last_touched == "sku" and _sku_val is not None:
-        tienda_opts = [_SENTINEL_TIENDA] + backend.stores_for_sku(
-            all_ids, seccion, _sku_val
-        )
-    else:
-        tienda_opts = [_SENTINEL_TIENDA] + backend.all_stores_in_section(
-            all_ids, seccion
-        )
+    all_stores = backend.all_stores_in_section(all_ids, seccion)
+    all_skus = backend.all_skus_in_section(all_ids, seccion)
+    allowed_stores = (
+        backend.stores_for_sku(all_ids, seccion, _sku_val)
+        if _sku_val is not None
+        else all_stores
+    )
 
+tienda_opts = [_SENTINEL_TIENDA] + list(allowed_stores)
 if _raw_tienda not in tienda_opts:
     st.session_state["sel_tienda"] = _SENTINEL_TIENDA
     _raw_tienda = _SENTINEL_TIENDA
+    _store_val = None
 
 store_sel = st.sidebar.selectbox(
     "Tienda",
@@ -409,24 +415,22 @@ store_sel = st.sidebar.selectbox(
 store_sel_val = None if store_sel == _SENTINEL_TIENDA else store_sel
 
 if use_fast:
-    if last_touched == "tienda" and store_sel_val is not None:
-        sku_opts = [_SENTINEL_SKU] + list(
+    if store_sel_val is not None:
+        allowed_skus = list(
             (index.get("skus_for_store") or {})
             .get(seccion, {})
             .get(store_sel_val, [])
         )
     else:
-        sku_opts = [_SENTINEL_SKU] + list(
-            (index.get("skus_by_sec") or {}).get(seccion, [])
-        )
+        allowed_skus = all_skus
 else:
-    if last_touched == "tienda" and store_sel_val is not None:
-        sku_opts = [_SENTINEL_SKU] + backend.skus_for_store(
-            all_ids, seccion, store_sel_val
-        )
-    else:
-        sku_opts = [_SENTINEL_SKU] + backend.all_skus_in_section(all_ids, seccion)
+    allowed_skus = (
+        backend.skus_for_store(all_ids, seccion, store_sel_val)
+        if store_sel_val is not None
+        else all_skus
+    )
 
+sku_opts = [_SENTINEL_SKU] + list(allowed_skus)
 if _raw_sku not in sku_opts:
     st.session_state["sel_sku"] = _SENTINEL_SKU
     _raw_sku = _SENTINEL_SKU
@@ -505,11 +509,29 @@ _header_label = {
 }[view.node_kind]
 st.subheader(f"{_header_label}: **{view.label}**")
 
+if view.consistency_warnings:
+    for _warning in view.consistency_warnings:
+        st.error("⚠️ " + _warning)
+    st.error(
+        "Dashboard detenido: ranking/KPI/serie no comparten la misma métrica "
+        "o los artefactos no corresponden al forecast actual. Regenera con "
+        "`python -m app.dashboard_artifacts`."
+    )
+    st.stop()
+
 st.markdown("#### Ranking")
+_ranking_scope = []
+if view.store:
+    _ranking_scope.append(f"SKU restringidos a tienda **{view.store}**")
+if view.sku:
+    _ranking_scope.append(f"tiendas restringidas a SKU **{view.sku}**")
+_scope_txt = " · ".join(_ranking_scope) if _ranking_scope else "sin filtro cruzado tienda/SKU"
 st.caption(
-    f"Sección **{view.seccion}** · Unidad: **{view.unidad}** · "
-    f"N puntos totales (spine): **{view.n_spine}** (~5 filas visibles, scroll). "
-    "wMAPE de ranking = **out-of-sample** (bottom-up hojas sku+tienda)."
+    f"Sección **{view.seccion}** · Unidad: **{view.unidad}** · {_scope_txt} · "
+    f"Horizonte OOS: **{view.ranking_days} días** (~5 filas visibles, scroll). "
+    "wMAPE de ranking = **out-of-sample bottom-up** desde hojas SKU+tienda. "
+    "La selección actual se mantiene visible con ✓. "
+    "Impacto error (%) = participación del nodo en el error absoluto OOS del alcance."
 )
 
 
@@ -535,6 +557,9 @@ def _show_ranking(display, key: str, pending_key: str, extract_field: str) -> No
             "Descripción": st.column_config.TextColumn("Descripción"),
             "N puntos": st.column_config.NumberColumn("N puntos (días ≠0)"),
             "% ≠0": st.column_config.TextColumn("% ≠0"),
+            "Impacto error (%)": st.column_config.TextColumn("Impacto error (%)"),
+            "Estado": st.column_config.TextColumn("Estado"),
+            "Sel.": st.column_config.TextColumn("Sel.", width="small"),
         },
     )
     if event and event.selection and event.selection.rows:
@@ -546,7 +571,9 @@ def _show_ranking(display, key: str, pending_key: str, extract_field: str) -> No
 
 col_t, col_s = st.columns(2)
 with col_t:
-    st.markdown("**Tiendas**")
+    st.markdown(
+        f"**Tiendas{' para SKU ' + str(view.sku) if view.sku else ''}**"
+    )
     _show_ranking(
         view.ranking_tiendas,
         f"tabla_tiendas_{_view_signature}",
@@ -554,7 +581,9 @@ with col_t:
         "store",
     )
 with col_s:
-    st.markdown("**SKU**")
+    st.markdown(
+        f"**SKU{' en tienda ' + str(view.store) if view.store else ''}**"
+    )
     _show_ranking(
         view.ranking_skus, f"tabla_skus_{_view_signature}", "_pending_sku", "sku"
     )
@@ -562,9 +591,7 @@ with col_s:
 hz = view.horizons
 st.markdown("#### Métricas")
 _metric_definition = (
-    "Métricas RLS = forecasts acumulados de bloques expanding-28; "
-    if _metrics_mode == "rolling_28" and view.node_kind in ("seccion", "tienda")
-    else "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
+    "WMAPE bottom-up = Σ|y−ŷ|/Σ|y| sobre hojas sku+tienda; "
 )
 st.caption(
     f"Agregación: **{view.freq}** · Unidad: **{view.unidad}** · "

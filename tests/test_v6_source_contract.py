@@ -15,9 +15,9 @@ def test_dashboard_metrics_are_bottom_up():
 
 def test_leaf_warmup_and_ses_contract_present():
     src = _read("app/forecasting/runner.py")
-    assert "Production leaf model: residual SES in log-space + parent RLS shape" in src
-    assert "leaf_warmup_mean_actuals" in src
-    assert "leaf_residual_ses:" in src
+    assert "Production leaf model: original-scale SES level + normalized RLS shape" in src
+    assert "leaf_warmup_calendar_mean" in src
+    assert "leaf_ses_level_driver:" in src
     assert "Initial structural level" in src
 
 
@@ -33,12 +33,11 @@ def test_sku_ranking_min_nonzero_rule_present():
 
 def test_leaf_parent_selection_is_leaf_level():
     src = _read("app/forecasting/runner.py")
-    assert "cumulative\n        WMAPE of earlier forecast blocks" in src
-    assert "_candidate_y" in src
-    assert "_candidate_v" in src
     method = src[src.index("def fast_leaf_forecasts"):src.index("def derive_sku_store_forecasts")]
-    assert "choices_block" in method
-    assert "cumulative errors only" in method
+    assert "STAGE 1: select alpha from PURE SES history only" in method
+    assert "STAGE 2: select parent shape with SES level already fixed" in method
+    assert "_wmape_ses_y" in method and "_wmape_ses_v" in method
+    assert "_wmape_parent_y" in method and "_wmape_parent_v" in method
 
 
 def test_no_direct_parent_wmape_selection_for_leaf():
@@ -59,9 +58,9 @@ def test_adaptive_leaf_components_present():
     src = _read("app/forecasting/runner.py")
     settings_src = _read("settings.py")
     assert "LEAF_SES_ALPHA_CANDIDATES" in src
-    assert "LEAF_RESIDUAL_LOG_SPACE" in settings_src
-    assert "_level_log_y" in src
-    assert "_level_log_v" in src
+    assert "LEAF_SES_SCALE" in settings_src
+    assert "_level_y" in src
+    assert "_level_v" in src
     assert "scale_source" not in src
 
 
@@ -85,14 +84,14 @@ def test_fast_leaf_has_no_shape_changing_filter_in_alpha_with_columns():
     assert "outer_coalesce" not in method
 
 
-def test_leaf_residual_ses_is_jointly_selected_without_scale():
+def test_leaf_ses_level_driver_is_two_stage_without_scale():
     src = _read("app/forecasting/runner.py")
-    assert "leaf_residual_ses:" in src
-    assert "_level_log_y" in src
-    assert "_level_log_v" in src
+    assert "leaf_ses_level_driver:" in src
+    assert "_level_y" in src
+    assert "_level_v" in src
     assert "scale_source" not in src
     assert "LEAF_SCALE_CLIP" not in src
-    assert "current block never tunes itself" in src
+    assert "parent/RLS performance can NEVER" in src
 
 
 def test_rls_ar_is_recursive_and_lambda_is_prior_block_selected():
@@ -113,4 +112,4 @@ def test_v8_removed_leaf_scale_from_forecast_logic():
     method = src[src.index("def fast_leaf_forecasts"):src.index("def derive_sku_store_forecasts")]
     assert "leaf_scale" not in method
     assert "LEAF_SCALE_CLIP" not in settings_src
-    assert "residual SES in log-space" in method
+    assert "original-scale SES level + normalized RLS shape" in method

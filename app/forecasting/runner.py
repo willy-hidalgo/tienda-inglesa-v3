@@ -329,7 +329,7 @@ class RLSForecastRunner:
             mode_y[s:e], lambda_y[s:e] = chosen_y; mode_v[s:e], lambda_v[s:e] = chosen_v
             origin_date = base["ds"][boundary]
             origin[s:e] = [origin_date] * (e - s)
-            valid_y = np.isfinite(y[s:e]) & (y[s:e] != 0); valid_v = np.isfinite(v[s:e]) & (v[s:e] != 0)
+            valid_y = np.isfinite(y[s:e]); valid_v = np.isfinite(v[s:e])
             for c in candidates:
                 if valid_y.any():
                     cum_ae_y[c] += float(np.abs(y[s:e][valid_y] - cand_y[c][valid_y]).sum()); cum_den_y[c] += float(np.abs(y[s:e][valid_y]).sum())
@@ -472,17 +472,18 @@ class RLSForecastRunner:
             clip = tuple(getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)))
         lo, hi = float(clip[0]), float(clip[1])
 
-        train = res_df.filter(pl.col("period_type") == "in_sample")
-        # Fast leaf forecasts are already robustly calibrated and can contain
-        # millions of sparse historical rows. Excluding them here avoids a
-        # costly leaf-level group_by and prevents bias correction from changing
-        # the benchmarked leaf model.
-        if "modelo_seleccionado" in train.columns:
-            train = train.filter(
-                ~pl.col("modelo_seleccionado")
-                .cast(pl.Utf8)
-                .str.starts_with("fast_leaf")
-            )
+        # SKU+tienda is the statistical source of truth for bottom-up
+        # metrics. Its forecast contract is exactly SES_level × driver_factor;
+        # NO post-hoc bias scaling is allowed. Detect leaves structurally so a
+        # future model rename can never re-enable correction by accident.
+        _uid = pl.col("unique_id").cast(pl.Utf8)
+        is_leaf_uid = (
+            _uid.str.contains(r"\|\|T:[^|]+")
+            & _uid.str.contains(r"\|\|S:[^|]+")
+        )
+        train = res_df.filter(
+            (pl.col("period_type") == "in_sample") & ~is_leaf_uid
+        )
         if train.height == 0:
             return res_df
 
@@ -622,16 +623,18 @@ class RLSForecastRunner:
             pl.col("bias_factor_v").fill_null(1.0),
         )
 
-        is_corr = pl.col("period_type").is_in(["out_sample", "forecast_only"])
+        _uid_out = pl.col("unique_id").cast(pl.Utf8)
+        is_leaf_out = (
+            _uid_out.str.contains(r"\|\|T:[^|]+")
+            & _uid_out.str.contains(r"\|\|S:[^|]+")
+        )
+        is_corr = (
+            pl.col("period_type").is_in(["out_sample", "forecast_only"])
+            & ~is_leaf_out
+        )
         if "modelo_seleccionado" in out.columns:
             _model = pl.col("modelo_seleccionado").cast(pl.Utf8)
-            is_corr = (
-                is_corr
-                & ~_model.str.starts_with("baseline:")
-                & ~_model.str.starts_with("fast_leaf")
-                & ~_model.str.starts_with("leaf_ses28")
-                & ~_model.str.starts_with("leaf_adaptive")
-            )
+            is_corr = is_corr & ~_model.str.starts_with("baseline:")
         exprs = [
             pl.when(is_corr)
             .then(
@@ -806,7 +809,7 @@ class RLSForecastRunner:
                     0.0,
                     np.expm1(base[val_local] + val_states),
                 )
-                mask = np.isfinite(y_val) & np.isfinite(pred_val) & (y_val != 0.0)
+                mask = np.isfinite(y_val) & np.isfinite(pred_val)
                 if int(mask.sum()) < min_points:
                     continue
                 denom = float(np.abs(y_val[mask]).sum())
@@ -858,7 +861,7 @@ class RLSForecastRunner:
         Python por punto; solo un paso por serie).
         """
         selection: dict[str, str] = {}
-        mask = is_train & np.isfinite(y) & (y != 0)
+        mask = is_train & np.isfinite(y)
         if not np.any(mask):
             for u in np.unique(uid):
                 selection[str(u)] = "seccion"
@@ -1064,11 +1067,16 @@ class RLSForecastRunner:
         parent_forecasts: pl.DataFrame | None = None,
         actual_extension_leaves: pl.DataFrame | None = None,
     ) -> pl.DataFrame:
-        """Production leaf model: residual SES in log-space + parent RLS shape.
+        """Production leaf model: original-scale SES level + normalized RLS shape.
 
-        The 28-day client contract is strict.  For every SKU+store and target
-        block, the candidate (parent, alpha) is chosen only from cumulative
-        WMAPE of earlier forecast blocks.  The current block never tunes itself.
+        SES owns the level of each SKU+store. Parent RLS forecasts are converted
+        to bounded multiplicative factors with arithmetic mean exactly 1 per
+        28-day block, so drivers can change shape but never the block mean level.
+
+        The 28-day client contract is strict. Alpha is chosen only from PURE
+        SES trajectories scored on earlier blocks; only after the SES level is
+        fixed is the parent shape (store/section) selected. The current block
+        never tunes itself.
         """
         if train_leaves.height == 0:
             return pl.DataFrame()
@@ -1127,44 +1135,77 @@ class RLSForecastRunner:
                 .alias("_block")
             )
 
-        # Initial structural level: mean of actual observations available in
-        # days 1..28, transformed once to log-space.  No sum/28 dilution.
-        min_initial = int(getattr(settings, "LEAF_INITIAL_MIN_POINTS", 7))
+        # Initial structural level is LEAF-SPECIFIC.  A SKU that enters the
+        # assortment later must not inherit the section's calendar warm-up.
+        # Each leaf uses its own first 28 calendar days of available history.
+        leaf_bounds = (
+            train_obs.group_by(uid_col)
+            .agg(pl.col("ds").min().alias("_leaf_start"))
+            .with_columns(
+                (pl.col("_leaf_start") + pl.duration(days=warmup_days - 1))
+                .alias("_leaf_warmup_end")
+            )
+        )
         initial = (
-            train_obs.filter(
-                (pl.col("ds") >= pl.lit(train_start))
-                & (pl.col("ds") <= pl.lit(warmup_end))
+            train_obs.join(leaf_bounds, on=uid_col, how="left")
+            .filter(
+                (pl.col("ds") >= pl.col("_leaf_start"))
+                & (pl.col("ds") <= pl.col("_leaf_warmup_end"))
             )
             .group_by(uid_col)
             .agg(
-                pl.col("y").filter(pl.col("y").is_finite()).mean().alias("_mean_y0"),
-                pl.col("y").filter(pl.col("y").is_finite()).median().alias("_med_y0"),
-                pl.col("y").filter(pl.col("y").is_finite()).len().alias("_n_y0"),
-                pl.col("value").filter(pl.col("value").is_finite()).mean().alias("_mean_v0"),
-                pl.col("value").filter(pl.col("value").is_finite()).median().alias("_med_v0"),
-                pl.col("value").filter(pl.col("value").is_finite()).len().alias("_n_v0"),
+                pl.when(pl.col("y").is_finite())
+                .then(pl.col("y").clip(lower_bound=0.0))
+                .otherwise(0.0)
+                .sum()
+                .alias("_sum_y0"),
+                pl.when(pl.col("value").is_finite())
+                .then(pl.col("value").clip(lower_bound=0.0))
+                .otherwise(0.0)
+                .sum()
+                .alias("_sum_v0"),
+                pl.when(pl.col("y").is_finite())
+                .then(1)
+                .otherwise(0)
+                .sum()
+                .alias("_n_obs_y0"),
+                pl.when(pl.col("value").is_finite())
+                .then(1)
+                .otherwise(0)
+                .sum()
+                .alias("_n_obs_v0"),
+            )
+            .with_columns(
+                # Contract: first 28 CALENDAR days. Missing sale dates are
+                # actual zero, so the denominator is always warmup_days.
+                (pl.col("_sum_y0") / pl.lit(float(warmup_days)))
+                .alias("_mean_y0"),
+                (pl.col("_sum_v0") / pl.lit(float(warmup_days)))
+                .alias("_mean_v0"),
             )
         )
         state0 = (
             ids.select(uid_col)
             .join(initial, on=uid_col, how="left")
             .with_columns(
-                pl.when(pl.col("_n_y0").fill_null(0) >= min_initial)
-                .then(pl.col("_mean_y0"))
-                .otherwise(pl.coalesce("_med_y0", "_mean_y0", pl.lit(0.0)))
-                .fill_nan(0.0).fill_null(0.0).clip(lower_bound=0.0)
-                .log1p().alias("_level_log_y"),
-                pl.when(pl.col("_n_v0").fill_null(0) >= min_initial)
-                .then(pl.col("_mean_v0"))
-                .otherwise(pl.coalesce("_med_v0", "_mean_v0", pl.lit(0.0)))
-                .fill_nan(0.0).fill_null(0.0).clip(lower_bound=0.0)
-                .log1p().alias("_level_log_v"),
+                pl.col("_mean_y0")
+                .fill_nan(0.0)
+                .fill_null(0.0)
+                .clip(lower_bound=0.0)
+                .alias("_level_y"),
+                pl.col("_mean_v0")
+                .fill_nan(0.0)
+                .fill_null(0.0)
+                .clip(lower_bound=0.0)
+                .alias("_level_v"),
             )
-            .select(uid_col, "_level_log_y", "_level_log_v")
+            .select(uid_col, "_level_y", "_level_v")
         )
 
-        # Parent RLS contributes SHAPE only.  Centering log1p(parent forecast)
-        # inside each 28-day block removes the parent intercept/level.
+        # Parent RLS contributes SHAPE only. The parent forecast is normalized
+        # forecast to an arithmetic mean of 1 inside every 28-day block.
+        # Therefore drivers can change the daily shape but CANNOT change the
+        # average level of the SKU+store series.
         parent = (
             parent_forecasts.with_columns(pl.col("ds").cast(pl.Date), block_expr())
             if parent_forecasts is not None and parent_forecasts.height
@@ -1172,16 +1213,130 @@ class RLSForecastRunner:
         )
         parent_effects = pl.DataFrame()
         if parent.height:
+            factor_lo, factor_hi = tuple(
+                float(x)
+                for x in getattr(
+                    settings,
+                    "FAST_LEAF_DRIVER_FACTOR_CLIP",
+                    (0.50, 2.00),
+                )
+            )
             parent_effects = (
                 parent.filter(pl.col("_block") >= 1)
                 .with_columns(
-                    pl.col("yhat").fill_null(0.0).clip(lower_bound=0.0).log1p().alias("_log_py"),
-                    pl.col("valuehat").fill_null(0.0).clip(lower_bound=0.0).log1p().alias("_log_pv"),
+                    pl.col("yhat").fill_null(0.0).clip(lower_bound=0.0).alias("_py"),
+                    pl.col("valuehat").fill_null(0.0).clip(lower_bound=0.0).alias("_pv"),
                 )
                 .with_columns(
-                    (pl.col("_log_py") - pl.col("_log_py").mean().over(["unique_id", "_block"]))
+                    pl.col("_py").mean().over(["unique_id", "_block"]).alias("_mean_py"),
+                    pl.col("_pv").mean().over(["unique_id", "_block"]).alias("_mean_pv"),
+                )
+                .with_columns(
+                    pl.when(pl.col("_mean_py") > 1e-12)
+                    .then(pl.col("_py") / pl.col("_mean_py"))
+                    .otherwise(1.0)
+                    .alias("_ratio_y"),
+                    pl.when(pl.col("_mean_pv") > 1e-12)
+                    .then(pl.col("_pv") / pl.col("_mean_pv"))
+                    .otherwise(1.0)
+                    .alias("_ratio_v"),
+                )
+                .with_columns(
+                    (pl.col("_ratio_y") - 1.0).alias("_dev_y"),
+                    (pl.col("_ratio_v") - 1.0).alias("_dev_v"),
+                )
+                .with_columns(
+                    pl.col("_dev_y").max().over(["unique_id", "_block"]).alias("_max_dy"),
+                    pl.col("_dev_y").min().over(["unique_id", "_block"]).alias("_min_dy"),
+                    pl.col("_dev_v").max().over(["unique_id", "_block"]).alias("_max_dv"),
+                    pl.col("_dev_v").min().over(["unique_id", "_block"]).alias("_min_dv"),
+                )
+                # Shrink deviations around 1 with ONE group-wise scalar. Since
+                # mean(ratio)=1, mean(deviation)=0 and mean(factor) stays EXACTLY 1.
+                # The scalar is the largest value that keeps every factor inside
+                # [factor_lo, factor_hi].
+                .with_columns(
+                    pl.min_horizontal(
+                        pl.lit(1.0),
+                        pl.when(pl.col("_max_dy") > 0)
+                        .then((factor_hi - 1.0) / pl.col("_max_dy"))
+                        .otherwise(1.0),
+                        pl.when(pl.col("_min_dy") < 0)
+                        .then((1.0 - factor_lo) / (-pl.col("_min_dy")))
+                        .otherwise(1.0),
+                    ).alias("_shape_scale_y"),
+                    pl.min_horizontal(
+                        pl.lit(1.0),
+                        pl.when(pl.col("_max_dv") > 0)
+                        .then((factor_hi - 1.0) / pl.col("_max_dv"))
+                        .otherwise(1.0),
+                        pl.when(pl.col("_min_dv") < 0)
+                        .then((1.0 - factor_lo) / (-pl.col("_min_dv")))
+                        .otherwise(1.0),
+                    ).alias("_shape_scale_v"),
+                )
+                .with_columns(
+                    (1.0 + pl.col("_shape_scale_y") * pl.col("_dev_y"))
+                    .alias("_factor_y"),
+                    (1.0 + pl.col("_shape_scale_v") * pl.col("_dev_v"))
+                    .alias("_factor_v"),
+                )
+                .with_columns(
+                    pl.col("_factor_y").log().alias("_effect_y"),
+                    pl.col("_factor_v").log().alias("_effect_v"),
+                )
+                .select("unique_id", "ds", "_block", "_effect_y", "_effect_v")
+            )
+
+            # Forecast-only must preserve a driver shape. If a parent's future
+            # block collapses to a flat factor, reuse the immediately preceding
+            # 28-day OOS factor shifted forward. This uses no future actuals.
+            prev_shape = (
+                parent_effects.filter(
+                    (pl.col("ds") >= pl.lit(test_start))
+                    & (pl.col("ds") <= pl.lit(test_end))
+                )
+                .with_columns(
+                    (pl.col("ds") + pl.duration(days=block_days)).alias("ds")
+                )
+                .select(
+                    "unique_id", "ds",
+                    pl.col("_effect_y").alias("_prev_effect_y"),
+                    pl.col("_effect_v").alias("_prev_effect_v"),
+                )
+            )
+            shape_stats = (
+                parent_effects.filter(
+                    (pl.col("ds") >= pl.lit(forecast_start))
+                    & (pl.col("ds") <= pl.lit(forecast_end))
+                )
+                .group_by("unique_id")
+                .agg(
+                    pl.col("_effect_y").std().fill_null(0.0).alias("_fc_std_y"),
+                    pl.col("_effect_v").std().fill_null(0.0).alias("_fc_std_v"),
+                )
+            )
+            parent_effects = (
+                parent_effects.join(shape_stats, on="unique_id", how="left")
+                .join(prev_shape, on=["unique_id", "ds"], how="left")
+                .with_columns(
+                    pl.when(
+                        (pl.col("ds") >= pl.lit(forecast_start))
+                        & (pl.col("ds") <= pl.lit(forecast_end))
+                        & (pl.col("_fc_std_y").fill_null(0.0) < 1e-10)
+                        & pl.col("_prev_effect_y").is_not_null()
+                    )
+                    .then(pl.col("_prev_effect_y"))
+                    .otherwise(pl.col("_effect_y"))
                     .alias("_effect_y"),
-                    (pl.col("_log_pv") - pl.col("_log_pv").mean().over(["unique_id", "_block"]))
+                    pl.when(
+                        (pl.col("ds") >= pl.lit(forecast_start))
+                        & (pl.col("ds") <= pl.lit(forecast_end))
+                        & (pl.col("_fc_std_v").fill_null(0.0) < 1e-10)
+                        & pl.col("_prev_effect_v").is_not_null()
+                    )
+                    .then(pl.col("_prev_effect_v"))
+                    .otherwise(pl.col("_effect_v"))
                     .alias("_effect_v"),
                 )
                 .select("unique_id", "ds", "_block", "_effect_y", "_effect_v")
@@ -1240,9 +1395,15 @@ class RLSForecastRunner:
         if meta_cols:
             forecast_grid = forecast_grid.join(ids, on=uid_col, how="left")
 
-        historical = train_obs.filter(pl.col("ds") >= pl.lit(metric_start)).select(
-            [c for c in (uid_col, "ds", "y", "value") + tuple(meta_cols) if c in train_obs.columns]
-        ).with_columns(pl.lit("in_sample").alias("period_type"))
+        historical = (
+            train_obs.join(leaf_bounds, on=uid_col, how="left")
+            .filter(pl.col("ds") > pl.col("_leaf_warmup_end"))
+            .select(
+                [c for c in (uid_col, "ds", "y", "value") + tuple(meta_cols)
+                 if c in train_obs.columns]
+            )
+            .with_columns(pl.lit("in_sample").alias("period_type"))
+        )
 
         rows = pl.concat(
             [historical, oos_grid, forecast_grid], how="diagonal_relaxed"
@@ -1278,8 +1439,12 @@ class RLSForecastRunner:
 
         # Actual observations receive the same causal parent effects used by
         # their forecast block; these residuals update SES only AFTER block close.
-        actual_resid = actual_obs.with_columns(
-            pl.col(uid_col).str.replace(r"\|\|S:.*$", "").alias("_store_uid")
+        actual_resid = (
+            actual_obs.join(leaf_bounds, on=uid_col, how="left")
+            .filter(pl.col("ds") > pl.col("_leaf_warmup_end"))
+            .with_columns(
+                pl.col(uid_col).str.replace(r"\|\|S:.*$", "").alias("_store_uid")
+            )
         )
         if parent_effects.height:
             actual_resid = actual_resid.join(
@@ -1294,50 +1459,77 @@ class RLSForecastRunner:
         max_block = int((forecast_end - train_start).days // block_days)
         actual_last_block = int((test_end - train_start).days // block_days)
 
-        # ── Vectorized candidate engine ────────────────────────────────────
-        # v8.2 keeps exactly the same 15 candidates (3 parents × 5 alphas),
-        # but evaluates ALL candidates of a leaf in one Polars pass per block.
-        # This replaces the v8.1 nested parent×alpha×block loop, which repeated
-        # filter/join/group_by hundreds of times over the same observations.
+        # ── v8.9: TWO-STAGE + level-stability engine ────────────────────────────────────────
+        # Stage 1 (PURE SES): choose alpha using SES-only block forecasts.
+        # Stage 2 (DRIVERS): with the SES level already fixed, choose whether
+        # store or section RLS shape gives the lower prior cumulative wMAPE.
+        #
+        # This separation is deliberate: parent/RLS performance can NEVER
+        # influence which alpha defines the structural leaf level.
         t_candidates = time.perf_counter()
 
-        actual_resid = actual_resid.with_columns(
-            pl.lit(0.0).alias("_none_ey"),
-            pl.lit(0.0).alias("_none_ev"),
+        alpha_params = pl.DataFrame(
+            [{"_alpha": float(a)} for a in alpha_candidates]
         )
-        rows = rows.with_columns(
-            pl.lit(0.0).alias("_none_ey"),
-            pl.lit(0.0).alias("_none_ev"),
+        driver_strengths = tuple(
+            float(x)
+            for x in getattr(
+                settings,
+                "LEAF_DRIVER_STRENGTH_CANDIDATES",
+                (0.25, 0.50, 0.75, 1.00),
+            )
         )
+        parent_candidates = [
+            {"_parent": "none", "_strength": 0.0}
+        ] + [
+            {"_parent": parent_name, "_strength": strength}
+            for parent_name in ("store", "section")
+            for strength in driver_strengths
+        ]
+        parent_params = pl.DataFrame(parent_candidates)
 
-        params = pl.DataFrame(
-            [
-                {
-                    "_parent": parent_name,
-                    "_alpha": float(alpha_c),
-                    "_candidate": f"{parent_name}|{float(alpha_c):.3f}",
-                }
-                for parent_name in ("store", "section", "none")
-                for alpha_c in alpha_candidates
-            ]
-        )
-
-        # One compact state row per SKU×candidate.  Cumulative errors live in
-        # this table, so no historical candidate-score DataFrame is rebuilt.
-        current = (
+        # Pure SES state: one level trajectory per leaf × alpha.
+        alpha_state = (
             ids.select(uid_col)
-            .join(params, how="cross")
+            .join(leaf_bounds, on=uid_col, how="left")
+            .join(alpha_params, how="cross")
             .join(state0, on=uid_col, how="left")
             .with_columns(
-                pl.lit(0.0).alias("_cae_y"),
-                pl.lit(0.0).alias("_cden_y"),
-                pl.lit(0.0).alias("_cae_v"),
-                pl.lit(0.0).alias("_cden_v"),
+                pl.lit(0.0).alias("_cae_ses_y"),
+                pl.lit(0.0).alias("_cden_ses_y"),
+                pl.lit(0.0).alias("_cae_ses_v"),
+                pl.lit(0.0).alias("_cden_ses_v"),
             )
         )
 
-        # Partition actual rows ONCE.  v8.1 re-filtered the full history inside
-        # every candidate/block iteration.
+        # Parent scores contain NO SES state and NO alpha. They evaluate only
+        # the shape added on top of the alpha/level selected by pure SES.
+        parent_state = (
+            ids.select(uid_col)
+            .join(parent_params, how="cross")
+            .with_columns(
+                pl.lit(0.0).alias("_cae_parent_y"),
+                pl.lit(0.0).alias("_cden_parent_y"),
+                pl.lit(0.0).alias("_cae_parent_v"),
+                pl.lit(0.0).alias("_cden_parent_v"),
+            )
+        )
+        driver_score_decay = float(
+            getattr(settings, "LEAF_DRIVER_SCORE_DECAY", 0.70)
+        )
+        driver_near_best_tol = float(
+            getattr(
+                settings,
+                "LEAF_DRIVER_NEAR_BEST_REL_TOLERANCE",
+                0.02,
+            )
+        )
+        default_driver_strength = float(
+            getattr(settings, "LEAF_DRIVER_DEFAULT_STRENGTH", 0.50)
+        )
+
+        # Partition actual rows once. Missing calendar dates are zeros and are
+        # handled analytically below; the full history is never densified.
         obs_by_block: dict[int, pl.DataFrame] = {}
         if actual_resid.height:
             for key, frame in actual_resid.partition_by(
@@ -1346,247 +1538,1216 @@ class RLSForecastRunner:
                 k = key[0] if isinstance(key, tuple) else key
                 obs_by_block[int(k)] = frame
 
+        # Precompute the causal stability reference without rescanning the
+        # full leaf history inside every block. 112 days = four 28-day blocks.
+        stability_enabled = bool(
+            getattr(settings, "LEAF_SES_STABILITY_ENABLED", True)
+        )
+        stability_days = int(
+            getattr(settings, "LEAF_SES_STABILITY_WINDOW_DAYS", 112)
+        )
+        stability_ratio = float(
+            getattr(settings, "LEAF_SES_LEVEL_MAX_RECENT_RATIO", 1.5)
+        )
+        stability_eps = float(
+            getattr(settings, "LEAF_SES_STABILITY_EPS", 1e-9)
+        )
+        if stability_days <= 0 or stability_days % block_days != 0:
+            raise ValueError(
+                "LEAF_SES_STABILITY_WINDOW_DAYS must be a positive multiple "
+                f"of RLS_BLOCK_DAYS={block_days}; got {stability_days}"
+            )
+        stability_blocks = stability_days // block_days
+
+        stability_block_sums = (
+            actual_obs.with_columns(
+                block_expr(),
+                (
+                    (pl.col("ds") - pl.lit(train_start)).dt.total_days()
+                    % block_days
+                )
+                .cast(pl.Int32)
+                .alias("_day_in_block"),
+            )
+            .group_by([uid_col, "_block"])
+            .agg(
+                pl.when(pl.col("y").is_finite())
+                .then(pl.col("y").clip(lower_bound=0.0))
+                .otherwise(0.0)
+                .sum()
+                .alias("_ref_sum_y"),
+                pl.when(pl.col("value").is_finite())
+                .then(pl.col("value").clip(lower_bound=0.0))
+                .otherwise(0.0)
+                .sum()
+                .alias("_ref_sum_v"),
+                (
+                    (pl.col("y").fill_null(0.0) > 0)
+                    & pl.col("y").is_finite()
+                )
+                .sum()
+                .cast(pl.Int32)
+                .alias("_ref_nz_y"),
+                (
+                    (pl.col("value").fill_null(0.0) > 0)
+                    & pl.col("value").is_finite()
+                )
+                .sum()
+                .cast(pl.Int32)
+                .alias("_ref_nz_v"),
+                pl.when(
+                    (pl.col("_day_in_block") >= block_days - 14)
+                    & pl.col("y").is_finite()
+                )
+                .then(pl.col("y").clip(lower_bound=0.0))
+                .otherwise(0.0)
+                .sum()
+                .alias("_last14_sum_y"),
+                pl.when(
+                    (pl.col("_day_in_block") >= block_days - 14)
+                    & pl.col("value").is_finite()
+                )
+                .then(pl.col("value").clip(lower_bound=0.0))
+                .otherwise(0.0)
+                .sum()
+                .alias("_last14_sum_v"),
+            )
+        )
+        recent_block_stats = stability_block_sums.with_columns(
+            (pl.col("_block") + 1).cast(pl.Int32).alias("_block")
+        ).select(
+            uid_col,
+            "_block",
+            pl.col("_ref_sum_y").alias("_recent28_sum_y"),
+            pl.col("_ref_sum_v").alias("_recent28_sum_v"),
+            pl.col("_ref_nz_y").alias("_recent28_nz_y"),
+            pl.col("_ref_nz_v").alias("_recent28_nz_v"),
+            pl.col("_last14_sum_y").alias("_recent14_sum_y"),
+            pl.col("_last14_sum_v").alias("_recent14_sum_v"),
+        )
+        stability_shifted: list[pl.DataFrame] = []
+        for lag_block in range(1, stability_blocks + 1):
+            stability_shifted.append(
+                stability_block_sums.with_columns(
+                    (pl.col("_block") + lag_block)
+                    .cast(pl.Int32)
+                    .alias("_block")
+                )
+            )
+        stability_ref_sums = (
+            pl.concat(stability_shifted, how="vertical_relaxed")
+            .group_by([uid_col, "_block"])
+            .agg(
+                pl.col("_ref_sum_y").sum().alias("_ref_sum_y"),
+                pl.col("_ref_sum_v").sum().alias("_ref_sum_v"),
+            )
+            if stability_shifted
+            else pl.DataFrame()
+        )
+
+        # v9.1 robust sparse reference: use the median of the previous four
+        # 28-day DAILY means. A single spike-heavy block can inflate the
+        # 112-day mean, but cannot dominate this median. This reference is
+        # diagnostic/selection-only: the forecast level remains a PURE SES
+        # state from alpha_state.
+        robust_block_shifted: list[pl.DataFrame] = []
+        for lag_block in range(1, stability_blocks + 1):
+            robust_block_shifted.append(
+                stability_block_sums.select(
+                    uid_col,
+                    (pl.col("_block") + lag_block)
+                    .cast(pl.Int32)
+                    .alias("_block"),
+                    (
+                        pl.col("_ref_sum_y") / pl.lit(float(block_days))
+                    ).alias("_block_mean_y"),
+                    (
+                        pl.col("_ref_sum_v") / pl.lit(float(block_days))
+                    ).alias("_block_mean_v"),
+                )
+            )
+        robust_block_refs = (
+            pl.concat(robust_block_shifted, how="vertical_relaxed")
+            .group_by([uid_col, "_block"])
+            .agg(
+                pl.col("_block_mean_y")
+                .median()
+                .alias("_robust_block_median_y"),
+                pl.col("_block_mean_v")
+                .median()
+                .alias("_robust_block_median_v"),
+                pl.col("_block_mean_y")
+                .mean()
+                .alias("_robust_block_mean_y"),
+                pl.col("_block_mean_v")
+                .mean()
+                .alias("_robust_block_mean_v"),
+                pl.col("_block_mean_y")
+                .max()
+                .alias("_robust_block_max_y"),
+                pl.col("_block_mean_v")
+                .max()
+                .alias("_robust_block_max_v"),
+                pl.len().cast(pl.Int32).alias("_robust_block_n"),
+            )
+            if robust_block_shifted
+            else pl.DataFrame()
+        )
+
+        alpha_score_decay = float(
+            getattr(settings, "LEAF_SES_SCORE_DECAY", 0.85)
+        )
+        regime_dense_coverage = float(
+            getattr(settings, "LEAF_REGIME_DENSE_COVERAGE", 0.85)
+        )
+        regime_shock_ratio = float(
+            getattr(settings, "LEAF_REGIME_SHOCK_RATIO", 1.50)
+        )
+        regime_decline_ratio = float(
+            getattr(settings, "LEAF_REGIME_DECLINE_RATIO", 0.60)
+        )
+        regime_recent14_weight = float(
+            getattr(settings, "LEAF_REGIME_RECENT14_WEIGHT", 0.65)
+        )
+        regime_score_tolerance = float(
+            getattr(settings, "LEAF_REGIME_SCORE_TOLERANCE", 0.20)
+        )
+        regime_growth_ratio = float(
+            getattr(settings, "LEAF_REGIME_GROWTH_RATIO", 1.15)
+        )
+        sparse_shock_ratio = float(
+            getattr(settings, "LEAF_REGIME_SPARSE_SHOCK_RATIO", 1.35)
+        )
+        sparse_stability_ratio = float(
+            getattr(settings, "LEAF_REGIME_SPARSE_STABILITY_RATIO", 1.25)
+        )
+
         chosen_frames: list[pl.DataFrame] = []
-        default_candidate = f"store|{default_alpha:.3f}"
+        default_parent = "store"
 
         for block_i in range(1, max_block + 1):
-            # Candidate choice at the block origin uses cumulative errors only
-            # through block_i-1.  Therefore the semantics are identical to v8.1.
-            if block_i == 1:
-                choices_block = ids.select(uid_col).with_columns(
-                    pl.lit(default_candidate).alias("_candidate_y"),
-                    pl.lit(default_candidate).alias("_candidate_v"),
-                )
-            else:
-                ranked = current.with_columns(
-                    pl.when(pl.col("_cden_y") > 0)
-                    .then(pl.col("_cae_y") / pl.col("_cden_y"))
-                    .otherwise(float("inf"))
-                    .alias("_wmape_y"),
-                    pl.when(pl.col("_cden_v") > 0)
-                    .then(pl.col("_cae_v") / pl.col("_cden_v"))
-                    .otherwise(float("inf"))
-                    .alias("_wmape_v"),
-                )
-                choices_block = ranked.group_by(uid_col).agg(
-                    pl.col("_candidate")
-                    .sort_by("_wmape_y", "_candidate")
-                    .first()
-                    .alias("_candidate_y"),
-                    pl.col("_candidate")
-                    .sort_by("_wmape_v", "_candidate")
-                    .first()
-                    .alias("_candidate_v"),
-                )
+            block_start = train_start + dt.timedelta(days=block_i * block_days)
+            block_end = block_start + dt.timedelta(days=block_days - 1)
 
-            # Store ONLY the two selected states required for final output.
-            # v8.1 retained all 15 states for all blocks and joined them later.
-            chosen_y = (
-                current.join(choices_block, on=uid_col, how="inner")
-                .filter(pl.col("_candidate") == pl.col("_candidate_y"))
-                .select(
-                    uid_col,
-                    pl.lit(block_i).cast(pl.Int32).alias("_block"),
-                    "_candidate_y",
-                    pl.col("_level_log_y"),
-                    pl.col("_parent").alias("_parent_y"),
-                    pl.col("_alpha").alias("_alpha_y"),
+            # Number of DAILY SES updates available after this leaf's own
+            # 28-day warm-up. This is independent of parent/RLS.
+            alpha_state = (
+                alpha_state.with_columns(
+                    pl.max_horizontal(
+                        pl.col("_leaf_warmup_end") + pl.duration(days=1),
+                        pl.lit(block_start),
+                    ).alias("_update_start")
                 )
-            )
-            chosen_v = (
-                current.join(choices_block, on=uid_col, how="inner")
-                .filter(pl.col("_candidate") == pl.col("_candidate_v"))
-                .select(
-                    uid_col,
-                    pl.lit(block_i).cast(pl.Int32).alias("_block"),
-                    "_candidate_v",
-                    pl.col("_level_log_v"),
-                    pl.col("_parent").alias("_parent_v"),
-                    pl.col("_alpha").alias("_alpha_v"),
-                )
-            )
-            chosen_frames.append(
-                chosen_y.join(
-                    chosen_v, on=[uid_col, "_block"], how="inner"
+                .with_columns(
+                    pl.when(pl.col("_update_start") <= pl.lit(block_end))
+                    .then(
+                        (pl.lit(block_end) - pl.col("_update_start"))
+                        .dt.total_days()
+                        + 1
+                    )
+                    .otherwise(0)
+                    .cast(pl.Int32)
+                    .alias("_n_calendar")
                 )
             )
 
-            obs_block = obs_by_block.get(block_i)
-            if obs_block is None or obs_block.height == 0:
-                continue
-
-            # Expand this 28-day block to the 15 candidates ONCE, score them
-            # and compute the SES end-state in the same grouped aggregation.
-            expanded = (
-                obs_block.join(
-                    current.select(
-                        uid_col,
-                        "_candidate",
-                        "_parent",
-                        "_alpha",
-                        "_level_log_y",
-                        "_level_log_v",
+            # Causal regime references for THIS forecast origin.
+            # 14/28-day statistics come only from the immediately closed block;
+            # 112-day statistics come from the four closed blocks before origin.
+            recent_ref = (
+                ids.select(uid_col)
+                .join(leaf_bounds, on=uid_col, how="left")
+                .join(
+                    stability_ref_sums.filter(
+                        pl.col("_block") == block_i
+                    ).select(
+                        uid_col, "_ref_sum_y", "_ref_sum_v"
                     ),
                     on=uid_col,
-                    how="inner",
+                    how="left",
                 )
-                .with_columns(
-                    pl.when(pl.col("_parent") == "store")
-                    .then(pl.col("_store_ey"))
-                    .when(pl.col("_parent") == "section")
-                    .then(pl.col("_sec_ey"))
-                    .otherwise(pl.col("_none_ey"))
-                    .alias("_ey"),
-                    pl.when(pl.col("_parent") == "store")
-                    .then(pl.col("_store_ev"))
-                    .when(pl.col("_parent") == "section")
-                    .then(pl.col("_sec_ev"))
-                    .otherwise(pl.col("_none_ev"))
-                    .alias("_ev"),
+                .join(
+                    recent_block_stats.filter(
+                        pl.col("_block") == block_i
+                    ).drop("_block"),
+                    on=uid_col,
+                    how="left",
                 )
-                .sort([uid_col, "_candidate", "ds"])
-                .with_columns(
-                    (
-                        pl.col("_level_log_y") + pl.col("_ey")
-                    )
-                    .clip(0.0, 30.0)
-                    .exp()
-                    .sub(1.0)
-                    .alias("_pred_y"),
-                    (
-                        pl.col("_level_log_v") + pl.col("_ev")
-                    )
-                    .clip(0.0, 30.0)
-                    .exp()
-                    .sub(1.0)
-                    .alias("_pred_v"),
-                    (
-                        pl.col("y").clip(lower_bound=0.0).log1p()
-                        - pl.col("_ey")
-                    ).alias("_zy"),
-                    (
-                        pl.col("value").clip(lower_bound=0.0).log1p()
-                        - pl.col("_ev")
-                    ).alias("_zv"),
-                    (
-                        pl.col("ds")
-                        .cum_count()
-                        .over([uid_col, "_candidate"])
-                        - 1
-                    ).alias("_j"),
-                    pl.len()
-                    .over([uid_col, "_candidate"])
-                    .alias("_n_obs"),
-                )
-                .with_columns(
-                    (
-                        pl.col("_alpha")
-                        * (pl.lit(1.0) - pl.col("_alpha")).pow(
-                            pl.col("_n_obs") - 1 - pl.col("_j")
-                        )
-                    ).alias("_w")
-                )
-                .group_by(
-                    [uid_col, "_candidate", "_parent", "_alpha"]
-                )
-                .agg(
-                    pl.when(
-                        pl.col("y").is_finite() & (pl.col("y") != 0)
-                    )
-                    .then((pl.col("y") - pl.col("_pred_y")).abs())
-                    .otherwise(None)
-                    .sum()
-                    .alias("_ae_y"),
-                    pl.when(
-                        pl.col("y").is_finite() & (pl.col("y") != 0)
-                    )
-                    .then(pl.col("y").abs())
-                    .otherwise(None)
-                    .sum()
-                    .alias("_den_y"),
-                    pl.when(
-                        pl.col("value").is_finite()
-                        & (pl.col("value") != 0)
-                    )
-                    .then((pl.col("value") - pl.col("_pred_v")).abs())
-                    .otherwise(None)
-                    .sum()
-                    .alias("_ae_v"),
-                    pl.when(
-                        pl.col("value").is_finite()
-                        & (pl.col("value") != 0)
-                    )
-                    .then(pl.col("value").abs())
-                    .otherwise(None)
-                    .sum()
-                    .alias("_den_v"),
-                    (pl.col("_zy") * pl.col("_w"))
-                    .sum()
-                    .alias("_wzy"),
-                    (pl.col("_zv") * pl.col("_w"))
-                    .sum()
-                    .alias("_wzv"),
-                    pl.col("_n_obs").max().alias("_n_obs"),
-                )
-            )
-
-            # Score the block for future selection.  Update SES only after a
-            # block whose actuals are legitimately known at the next origin.
-            current = (
-                current.join(
-                    expanded,
-                    on=[uid_col, "_candidate", "_parent", "_alpha"],
+                .join(
+                    robust_block_refs.filter(
+                        pl.col("_block") == block_i
+                    ).drop("_block"),
+                    on=uid_col,
                     how="left",
                 )
                 .with_columns(
                     (
-                        pl.col("_cae_y")
-                        + pl.col("_ae_y").fill_null(0.0)
-                    ).alias("_cae_y"),
-                    (
-                        pl.col("_cden_y")
-                        + pl.col("_den_y").fill_null(0.0)
-                    ).alias("_cden_y"),
-                    (
-                        pl.col("_cae_v")
-                        + pl.col("_ae_v").fill_null(0.0)
-                    ).alias("_cae_v"),
-                    (
-                        pl.col("_cden_v")
-                        + pl.col("_den_v").fill_null(0.0)
-                    ).alias("_cden_v"),
-                    pl.when(pl.lit(block_i <= actual_last_block))
-                    .then(
-                        (pl.lit(1.0) - pl.col("_alpha")).pow(
-                            pl.col("_n_obs").fill_null(0)
-                        )
-                        * pl.col("_level_log_y")
-                        + pl.col("_wzy").fill_null(0.0)
+                        pl.lit(block_start) - pl.col("_leaf_start")
                     )
-                    .otherwise(pl.col("_level_log_y"))
-                    .alias("_level_log_y"),
-                    pl.when(pl.lit(block_i <= actual_last_block))
-                    .then(
-                        (pl.lit(1.0) - pl.col("_alpha")).pow(
-                            pl.col("_n_obs").fill_null(0)
-                        )
-                        * pl.col("_level_log_v")
-                        + pl.col("_wzv").fill_null(0.0)
+                    .dt.total_days()
+                    .cast(pl.Int32)
+                    .alias("_leaf_age_days"),
+                    pl.col("_ref_sum_y").fill_null(0.0),
+                    pl.col("_ref_sum_v").fill_null(0.0),
+                    pl.col("_recent28_sum_y").fill_null(0.0),
+                    pl.col("_recent28_sum_v").fill_null(0.0),
+                    pl.col("_recent28_nz_y").fill_null(0),
+                    pl.col("_recent28_nz_v").fill_null(0),
+                    pl.col("_recent14_sum_y").fill_null(0.0),
+                    pl.col("_recent14_sum_v").fill_null(0.0),
+                    pl.col("_robust_block_median_y").fill_null(0.0),
+                    pl.col("_robust_block_median_v").fill_null(0.0),
+                    pl.col("_robust_block_mean_y").fill_null(0.0),
+                    pl.col("_robust_block_mean_v").fill_null(0.0),
+                    pl.col("_robust_block_max_y").fill_null(0.0),
+                    pl.col("_robust_block_max_v").fill_null(0.0),
+                    pl.col("_robust_block_n").fill_null(0),
+                )
+                .with_columns(
+                    pl.when(pl.col("_leaf_age_days") <= 0)
+                    .then(1)
+                    .when(pl.col("_leaf_age_days") < stability_days)
+                    .then(pl.col("_leaf_age_days"))
+                    .otherwise(stability_days)
+                    .cast(pl.Int32)
+                    .alias("_ref_days")
+                )
+                .with_columns(
+                    (
+                        pl.col("_ref_sum_y")
+                        / pl.col("_ref_days").cast(pl.Float64)
+                    ).alias("_reference_y"),
+                    (
+                        pl.col("_ref_sum_v")
+                        / pl.col("_ref_days").cast(pl.Float64)
+                    ).alias("_reference_v"),
+                    (
+                        pl.col("_recent28_sum_y") / pl.lit(float(block_days))
+                    ).alias("_recent28_y"),
+                    (
+                        pl.col("_recent28_sum_v") / pl.lit(float(block_days))
+                    ).alias("_recent28_v"),
+                    (
+                        pl.col("_recent14_sum_y") / pl.lit(14.0)
+                    ).alias("_recent14_y"),
+                    (
+                        pl.col("_recent14_sum_v") / pl.lit(14.0)
+                    ).alias("_recent14_v"),
+                    (
+                        pl.col("_recent28_nz_y").cast(pl.Float64)
+                        / pl.lit(float(block_days))
+                    ).alias("_coverage_y"),
+                    (
+                        pl.col("_recent28_nz_v").cast(pl.Float64)
+                        / pl.lit(float(block_days))
+                    ).alias("_coverage_v"),
+                )
+                .with_columns(
+                    # For sparse/intermittent leaves, the median of the four
+                    # closed 28-day means is a more robust structural anchor
+                    # than their arithmetic mean. Fallback to the 112-day mean
+                    # only when the median is unavailable/zero.
+                    pl.when(
+                        pl.col("_robust_block_median_y") > stability_eps
                     )
-                    .otherwise(pl.col("_level_log_v"))
-                    .alias("_level_log_v"),
+                    .then(pl.col("_robust_block_median_y"))
+                    .otherwise(pl.col("_reference_y"))
+                    .alias("_sparse_robust_y"),
+                    pl.when(
+                        pl.col("_robust_block_median_v") > stability_eps
+                    )
+                    .then(pl.col("_robust_block_median_v"))
+                    .otherwise(pl.col("_reference_v"))
+                    .alias("_sparse_robust_v"),
+                )
+                .with_columns(
+                    (
+                        (pl.col("_coverage_y") < regime_dense_coverage)
+                        & (pl.col("_sparse_robust_y") > stability_eps)
+                        & (
+                            pl.col("_recent28_y")
+                            > pl.col("_sparse_robust_y") * sparse_shock_ratio
+                        )
+                    ).alias("_sparse_shock_y"),
+                    (
+                        (pl.col("_coverage_v") < regime_dense_coverage)
+                        & (pl.col("_sparse_robust_v") > stability_eps)
+                        & (
+                            pl.col("_recent28_v")
+                            > pl.col("_sparse_robust_v") * sparse_shock_ratio
+                        )
+                    ).alias("_sparse_shock_v"),
+                )
+                .with_columns(
+                    # Dense series may follow a persistent recent trend.
+                    # Sparse series use the long reference unless a genuine
+                    # decline is already visible in the whole last 28-day block.
+                    pl.when(
+                        (pl.col("_reference_y") > stability_eps)
+                        & (
+                            pl.col("_recent28_y")
+                            < pl.col("_reference_y") * regime_decline_ratio
+                        )
+                    )
+                    .then(
+                        regime_recent14_weight * pl.col("_recent14_y")
+                        + (1.0 - regime_recent14_weight)
+                        * pl.col("_recent28_y")
+                    )
+                    .when(pl.col("_coverage_y") >= regime_dense_coverage)
+                    .then(
+                        pl.when(
+                            (pl.col("_recent28_y") > stability_eps)
+                            & (
+                                pl.col("_recent14_y")
+                                > pl.col("_recent28_y") * regime_shock_ratio
+                            )
+                        )
+                        .then(pl.col("_recent28_y"))
+                        .otherwise(
+                            regime_recent14_weight * pl.col("_recent14_y")
+                            + (1.0 - regime_recent14_weight)
+                            * pl.col("_recent28_y")
+                        )
+                    )
+                    .otherwise(pl.col("_sparse_robust_y"))
+                    .alias("_regime_anchor_y"),
+                    pl.when(
+                        (pl.col("_reference_v") > stability_eps)
+                        & (
+                            pl.col("_recent28_v")
+                            < pl.col("_reference_v") * regime_decline_ratio
+                        )
+                    )
+                    .then(
+                        regime_recent14_weight * pl.col("_recent14_v")
+                        + (1.0 - regime_recent14_weight)
+                        * pl.col("_recent28_v")
+                    )
+                    .when(pl.col("_coverage_v") >= regime_dense_coverage)
+                    .then(
+                        pl.when(
+                            (pl.col("_recent28_v") > stability_eps)
+                            & (
+                                pl.col("_recent14_v")
+                                > pl.col("_recent28_v") * regime_shock_ratio
+                            )
+                        )
+                        .then(pl.col("_recent28_v"))
+                        .otherwise(
+                            regime_recent14_weight * pl.col("_recent14_v")
+                            + (1.0 - regime_recent14_weight)
+                            * pl.col("_recent28_v")
+                        )
+                    )
+                    .otherwise(pl.col("_sparse_robust_v"))
+                    .alias("_regime_anchor_v"),
+                )
+                .with_columns(
+                    pl.when(pl.col("_regime_anchor_y") > stability_eps)
+                    .then(pl.col("_regime_anchor_y"))
+                    .otherwise(pl.col("_reference_y"))
+                    .alias("_regime_anchor_y"),
+                    pl.when(pl.col("_regime_anchor_v") > stability_eps)
+                    .then(pl.col("_regime_anchor_v"))
+                    .otherwise(pl.col("_reference_v"))
+                    .alias("_regime_anchor_v"),
                 )
                 .select(
                     uid_col,
-                    "_candidate",
+                    "_reference_y",
+                    "_reference_v",
+                    "_recent28_y",
+                    "_recent28_v",
+                    "_recent14_y",
+                    "_recent14_v",
+                    "_coverage_y",
+                    "_coverage_v",
+                    "_sparse_robust_y",
+                    "_sparse_robust_v",
+                    "_sparse_shock_y",
+                    "_sparse_shock_v",
+                    "_robust_block_median_y",
+                    "_robust_block_median_v",
+                    "_robust_block_mean_y",
+                    "_robust_block_mean_v",
+                    "_regime_anchor_y",
+                    "_regime_anchor_v",
+                )
+            )
+
+            # ── STAGE 1: select alpha from PURE SES history only ───────────
+            if block_i == 1:
+                alpha_choices = (
+                    ids.select(uid_col)
+                    .join(recent_ref, on=uid_col, how="left")
+                    .with_columns(
+                        pl.lit(default_alpha).alias("_alpha_y"),
+                        pl.lit(default_alpha).alias("_alpha_v"),
+                        pl.lit(False).alias("_ses_guard_y"),
+                        pl.lit(False).alias("_ses_guard_v"),
+                        pl.lit(True).alias("_stable_pool_y"),
+                        pl.lit(True).alias("_stable_pool_v"),
+                    )
+                )
+            else:
+                alpha_rel_tol = float(
+                    getattr(
+                        settings,
+                        "LEAF_SES_NEAR_BEST_REL_TOLERANCE",
+                        0.02,
+                    )
+                )
+                alpha_abs_tol = float(
+                    getattr(
+                        settings,
+                        "LEAF_SES_NEAR_BEST_ABS_TOLERANCE",
+                        1e-6,
+                    )
+                )
+                ranked_alpha = (
+                    alpha_state.with_columns(
+                        pl.when(pl.col("_cden_ses_y") > 0)
+                        .then(pl.col("_cae_ses_y") / pl.col("_cden_ses_y"))
+                        .otherwise(float("inf"))
+                        .alias("_wmape_ses_y"),
+                        pl.when(pl.col("_cden_ses_v") > 0)
+                        .then(pl.col("_cae_ses_v") / pl.col("_cden_ses_v"))
+                        .otherwise(float("inf"))
+                        .alias("_wmape_ses_v"),
+                    )
+                    .join(recent_ref, on=uid_col, how="left")
+                    .with_columns(
+                        pl.col("_wmape_ses_y")
+                        .min()
+                        .over(uid_col)
+                        .alias("_best_ses_y"),
+                        pl.col("_wmape_ses_v")
+                        .min()
+                        .over(uid_col)
+                        .alias("_best_ses_v"),
+                    )
+                    .with_columns(
+                        # Dense growth is allowed a higher ceiling by using the
+                        # regime anchor; sparse shocks retain the 112-day ceiling.
+                        pl.when(
+                            pl.col("_coverage_y") >= regime_dense_coverage
+                        )
+                        .then(
+                            pl.max_horizontal(
+                                pl.col("_reference_y"),
+                                pl.col("_regime_anchor_y"),
+                            )
+                        )
+                        .otherwise(pl.col("_sparse_robust_y"))
+                        .alias("_stability_anchor_y"),
+                        pl.when(
+                            pl.col("_coverage_v") >= regime_dense_coverage
+                        )
+                        .then(
+                            pl.max_horizontal(
+                                pl.col("_reference_v"),
+                                pl.col("_regime_anchor_v"),
+                            )
+                        )
+                        .otherwise(pl.col("_sparse_robust_v"))
+                        .alias("_stability_anchor_v"),
+                        pl.when(
+                            pl.col("_coverage_y") < regime_dense_coverage
+                        )
+                        .then(sparse_stability_ratio)
+                        .otherwise(stability_ratio)
+                        .alias("_stability_ratio_y"),
+                        pl.when(
+                            pl.col("_coverage_v") < regime_dense_coverage
+                        )
+                        .then(sparse_stability_ratio)
+                        .otherwise(stability_ratio)
+                        .alias("_stability_ratio_v"),
+                    )
+                    .with_columns(
+                        pl.when(
+                            pl.lit(stability_enabled)
+                            & (pl.col("_stability_anchor_y") > stability_eps)
+                        )
+                        .then(
+                            pl.col("_level_y")
+                            <= pl.col("_stability_anchor_y")
+                            * pl.col("_stability_ratio_y")
+                        )
+                        .otherwise(True)
+                        .alias("_stable_y"),
+                        pl.when(
+                            pl.lit(stability_enabled)
+                            & (pl.col("_stability_anchor_v") > stability_eps)
+                        )
+                        .then(
+                            pl.col("_level_v")
+                            <= pl.col("_stability_anchor_v")
+                            * pl.col("_stability_ratio_v")
+                        )
+                        .otherwise(True)
+                        .alias("_stable_v"),
+                    )
+                    .with_columns(
+                        pl.when(pl.col("_stable_y"))
+                        .then(pl.col("_wmape_ses_y"))
+                        .otherwise(float("inf"))
+                        .min()
+                        .over(uid_col)
+                        .alias("_best_stable_ses_y"),
+                        pl.when(pl.col("_stable_v"))
+                        .then(pl.col("_wmape_ses_v"))
+                        .otherwise(float("inf"))
+                        .min()
+                        .over(uid_col)
+                        .alias("_best_stable_ses_v"),
+                    )
+                    .with_columns(
+                        pl.when(
+                            (
+                                (pl.col("_reference_y") > stability_eps)
+                                & (
+                                    pl.col("_recent28_y")
+                                    < pl.col("_reference_y")
+                                    * regime_decline_ratio
+                                )
+                            )
+                            | (
+                                (pl.col("_coverage_y") >= regime_dense_coverage)
+                                & (pl.col("_reference_y") > stability_eps)
+                                & (
+                                    pl.col("_recent28_y")
+                                    > pl.col("_reference_y")
+                                    * regime_growth_ratio
+                                )
+                            )
+                        )
+                        .then(regime_score_tolerance)
+                        .otherwise(alpha_rel_tol)
+                        .alias("_regime_score_tol_y"),
+                        pl.when(
+                            (
+                                (pl.col("_reference_v") > stability_eps)
+                                & (
+                                    pl.col("_recent28_v")
+                                    < pl.col("_reference_v")
+                                    * regime_decline_ratio
+                                )
+                            )
+                            | (
+                                (pl.col("_coverage_v") >= regime_dense_coverage)
+                                & (pl.col("_reference_v") > stability_eps)
+                                & (
+                                    pl.col("_recent28_v")
+                                    > pl.col("_reference_v")
+                                    * regime_growth_ratio
+                                )
+                            )
+                        )
+                        .then(regime_score_tolerance)
+                        .otherwise(alpha_rel_tol)
+                        .alias("_regime_score_tol_v"),
+                    )
+                    .with_columns(
+                        pl.when(
+                            pl.col("_stable_y")
+                            & (
+                                pl.col("_wmape_ses_y")
+                                <= (
+                                    pl.col("_best_stable_ses_y")
+                                    * (1.0 + pl.col("_regime_score_tol_y"))
+                                    + alpha_abs_tol
+                                )
+                            )
+                            & (pl.col("_regime_anchor_y") > stability_eps)
+                        )
+                        .then(
+                            (
+                                pl.col("_level_y") - pl.col("_regime_anchor_y")
+                            ).abs()
+                            / pl.col("_regime_anchor_y")
+                        )
+                        .otherwise(float("inf"))
+                        .alias("_regime_dist_y"),
+                        pl.when(
+                            pl.col("_stable_v")
+                            & (
+                                pl.col("_wmape_ses_v")
+                                <= (
+                                    pl.col("_best_stable_ses_v")
+                                    * (1.0 + pl.col("_regime_score_tol_v"))
+                                    + alpha_abs_tol
+                                )
+                            )
+                            & (pl.col("_regime_anchor_v") > stability_eps)
+                        )
+                        .then(
+                            (
+                                pl.col("_level_v") - pl.col("_regime_anchor_v")
+                            ).abs()
+                            / pl.col("_regime_anchor_v")
+                        )
+                        .otherwise(float("inf"))
+                        .alias("_regime_dist_v"),
+                    )
+                )
+
+                alpha_choices = (
+                    ranked_alpha.group_by(uid_col)
+                    .agg(
+                        pl.when(
+                            pl.col("_wmape_ses_y")
+                            <= (
+                                pl.col("_best_ses_y")
+                                * (1.0 + alpha_rel_tol)
+                                + alpha_abs_tol
+                            )
+                        )
+                        .then(pl.col("_alpha"))
+                        .otherwise(None)
+                        .min()
+                        .alias("_alpha_y_unconstrained"),
+                        pl.when(
+                            pl.col("_wmape_ses_v")
+                            <= (
+                                pl.col("_best_ses_v")
+                                * (1.0 + alpha_rel_tol)
+                                + alpha_abs_tol
+                            )
+                        )
+                        .then(pl.col("_alpha"))
+                        .otherwise(None)
+                        .min()
+                        .alias("_alpha_v_unconstrained"),
+                        pl.col("_alpha")
+                        .sort_by("_regime_dist_y", "_alpha")
+                        .first()
+                        .alias("_alpha_y_regime"),
+                        pl.col("_alpha")
+                        .sort_by("_regime_dist_v", "_alpha")
+                        .first()
+                        .alias("_alpha_v_regime"),
+                        pl.col("_alpha")
+                        .sort_by("_level_y", "_alpha")
+                        .first()
+                        .alias("_alpha_y_lowlevel"),
+                        pl.col("_alpha")
+                        .sort_by("_level_v", "_alpha")
+                        .first()
+                        .alias("_alpha_v_lowlevel"),
+                        pl.col("_stable_y").any().alias("_stable_pool_y"),
+                        pl.col("_stable_v").any().alias("_stable_pool_v"),
+                        pl.col("_reference_y").first().alias("_reference_y"),
+                        pl.col("_reference_v").first().alias("_reference_v"),
+                        pl.col("_recent28_y").first().alias("_recent28_y"),
+                        pl.col("_recent28_v").first().alias("_recent28_v"),
+                        pl.col("_recent14_y").first().alias("_recent14_y"),
+                        pl.col("_recent14_v").first().alias("_recent14_v"),
+                        pl.col("_coverage_y").first().alias("_coverage_y"),
+                        pl.col("_coverage_v").first().alias("_coverage_v"),
+                        pl.col("_sparse_robust_y").first().alias("_sparse_robust_y"),
+                        pl.col("_sparse_robust_v").first().alias("_sparse_robust_v"),
+                        pl.col("_sparse_shock_y").first().alias("_sparse_shock_y"),
+                        pl.col("_sparse_shock_v").first().alias("_sparse_shock_v"),
+                        pl.col("_robust_block_median_y")
+                        .first()
+                        .alias("_robust_block_median_y"),
+                        pl.col("_robust_block_median_v")
+                        .first()
+                        .alias("_robust_block_median_v"),
+                        pl.col("_regime_anchor_y").first().alias("_regime_anchor_y"),
+                        pl.col("_regime_anchor_v").first().alias("_regime_anchor_v"),
+                    )
+                    .with_columns(
+                        pl.when(pl.col("_stable_pool_y"))
+                        .then(pl.col("_alpha_y_regime"))
+                        .otherwise(pl.col("_alpha_y_lowlevel"))
+                        .alias("_alpha_y"),
+                        pl.when(pl.col("_stable_pool_v"))
+                        .then(pl.col("_alpha_v_regime"))
+                        .otherwise(pl.col("_alpha_v_lowlevel"))
+                        .alias("_alpha_v"),
+                    )
+                    .with_columns(
+                        (
+                            pl.col("_alpha_y")
+                            != pl.col("_alpha_y_unconstrained")
+                        ).alias("_ses_guard_y"),
+                        (
+                            pl.col("_alpha_v")
+                            != pl.col("_alpha_v_unconstrained")
+                        ).alias("_ses_guard_v"),
+                    )
+                    .drop(
+                        "_alpha_y_regime",
+                        "_alpha_v_regime",
+                        "_alpha_y_lowlevel",
+                        "_alpha_v_lowlevel",
+                    )
+                )
+
+            selected_y = (
+                alpha_state.join(alpha_choices, on=uid_col, how="inner")
+                .filter(pl.col("_alpha") == pl.col("_alpha_y"))
+                .select(
+                    uid_col,
+                    "_alpha_y",
+                    "_ses_guard_y",
+                    "_stable_pool_y",
+                    "_reference_y",
+                    "_recent28_y",
+                    "_recent14_y",
+                    "_coverage_y",
+                    "_sparse_robust_y",
+                    "_sparse_shock_y",
+                    "_robust_block_median_y",
+                    "_regime_anchor_y",
+                    pl.col("_level_y"),
+                    pl.when(pl.col("_cden_ses_y") > 0)
+                    .then(pl.col("_cae_ses_y") / pl.col("_cden_ses_y"))
+                    .otherwise(None)
+                    .alias("_pure_ses_wmape_y"),
+                )
+            )
+            selected_v = (
+                alpha_state.join(alpha_choices, on=uid_col, how="inner")
+                .filter(pl.col("_alpha") == pl.col("_alpha_v"))
+                .select(
+                    uid_col,
+                    "_alpha_v",
+                    "_ses_guard_v",
+                    "_stable_pool_v",
+                    "_reference_v",
+                    "_recent28_v",
+                    "_recent14_v",
+                    "_coverage_v",
+                    "_sparse_robust_v",
+                    "_sparse_shock_v",
+                    "_robust_block_median_v",
+                    "_regime_anchor_v",
+                    pl.col("_level_v"),
+                    pl.when(pl.col("_cden_ses_v") > 0)
+                    .then(pl.col("_cae_ses_v") / pl.col("_cden_ses_v"))
+                    .otherwise(None)
+                    .alias("_pure_ses_wmape_v"),
+                )
+            )
+            selected_level = selected_y.join(
+                selected_v, on=uid_col, how="inner"
+            )
+
+            # ── STAGE 2: select parent shape with SES level already fixed ──
+            if block_i == 1:
+                parent_choices = ids.select(uid_col).with_columns(
+                    pl.lit(default_parent).alias("_parent_y"),
+                    pl.lit(default_parent).alias("_parent_v"),
+                    pl.lit(default_driver_strength).alias("_strength_y"),
+                    pl.lit(default_driver_strength).alias("_strength_v"),
+                )
+            else:
+                ranked_parent = (
+                    parent_state.with_columns(
+                        pl.when(pl.col("_cden_parent_y") > 0)
+                        .then(pl.col("_cae_parent_y") / pl.col("_cden_parent_y"))
+                        .otherwise(float("inf"))
+                        .alias("_wmape_parent_y"),
+                        pl.when(pl.col("_cden_parent_v") > 0)
+                        .then(pl.col("_cae_parent_v") / pl.col("_cden_parent_v"))
+                        .otherwise(float("inf"))
+                        .alias("_wmape_parent_v"),
+                    )
+                    .with_columns(
+                        pl.col("_wmape_parent_y")
+                        .min()
+                        .over(uid_col)
+                        .alias("_best_parent_y"),
+                        pl.col("_wmape_parent_v")
+                        .min()
+                        .over(uid_col)
+                        .alias("_best_parent_v"),
+                    )
+                )
+                ranked_parent = ranked_parent.with_columns(
+                    pl.when(
+                        pl.col("_wmape_parent_y")
+                        <= pl.col("_best_parent_y")
+                        * (1.0 + driver_near_best_tol)
+                    )
+                    .then(pl.col("_strength"))
+                    .otherwise(float("inf"))
+                    .alias("_driver_sort_y"),
+                    pl.when(
+                        pl.col("_wmape_parent_v")
+                        <= pl.col("_best_parent_v")
+                        * (1.0 + driver_near_best_tol)
+                    )
+                    .then(pl.col("_strength"))
+                    .otherwise(float("inf"))
+                    .alias("_driver_sort_v"),
+                )
+                parent_choices = ranked_parent.group_by(uid_col).agg(
+                    pl.col("_parent")
+                    .sort_by("_driver_sort_y", "_parent")
+                    .first()
+                    .alias("_parent_y"),
+                    pl.col("_strength")
+                    .sort_by("_driver_sort_y", "_parent")
+                    .first()
+                    .alias("_strength_y"),
+                    pl.col("_parent")
+                    .sort_by("_driver_sort_v", "_parent")
+                    .first()
+                    .alias("_parent_v"),
+                    pl.col("_strength")
+                    .sort_by("_driver_sort_v", "_parent")
+                    .first()
+                    .alias("_strength_v"),
+                )
+
+            # v9.0.1: group_by().agg() does not guarantee the same column
+            # order as the literal first-block DataFrame. vertical_relaxed
+            # relaxes dtypes, not schema-name position, so normalize the
+            # parent schema explicitly before building every chosen frame.
+            parent_choices = parent_choices.select(
+                uid_col,
+                "_parent_y",
+                "_parent_v",
+                "_strength_y",
+                "_strength_v",
+            )
+            chosen_frame = (
+                selected_level.join(
+                    parent_choices, on=uid_col, how="inner"
+                ).with_columns(
+                    pl.lit(block_i).cast(pl.Int32).alias("_block")
+                )
+            )
+
+            # Defensive release invariant: every frame entering pl.concat must
+            # have exactly the same names in exactly the same order. Reorder
+            # when the set is identical; fail early if a future change adds or
+            # removes a column in only some blocks.
+            if chosen_frames:
+                expected_cols = chosen_frames[0].columns
+                if set(chosen_frame.columns) != set(expected_cols):
+                    raise RuntimeError(
+                        "Leaf chosen-frame schema mismatch before concat: "
+                        f"block={block_i}, expected={expected_cols}, "
+                        f"got={chosen_frame.columns}"
+                    )
+                chosen_frame = chosen_frame.select(expected_cols)
+
+            chosen_frames.append(chosen_frame)
+
+            # Forecast-only has no actuals and is never allowed to affect
+            # alpha/parent selection or SES state.
+            if block_i > actual_last_block:
+                continue
+
+            obs_block = obs_by_block.get(block_i)
+
+            # ── Score ALL alpha candidates using SES ONLY ──────────────────
+            if obs_block is not None and obs_block.height:
+                alpha_eval = (
+                    obs_block.join(
+                        alpha_state.select(
+                            uid_col,
+                            "_alpha",
+                            "_level_y",
+                            "_level_v",
+                            "_n_calendar",
+                        ),
+                        on=uid_col,
+                        how="inner",
+                    )
+                    .with_columns(
+                        (
+                            pl.lit(block_end) - pl.col("ds")
+                        ).dt.total_days().cast(pl.Int32).alias("_days_to_end")
+                    )
+                    .with_columns(
+                        (
+                            pl.col("_alpha")
+                            * (pl.lit(1.0) - pl.col("_alpha")).pow(
+                                pl.col("_days_to_end")
+                            )
+                        ).alias("_w")
+                    )
+                    .group_by([uid_col, "_alpha"])
+                    .agg(
+                        (
+                            (pl.col("y") - pl.col("_level_y")).abs()
+                            - pl.col("_level_y")
+                        ).sum().alias("_ses_ae_adjust_y"),
+                        pl.col("y").abs().sum().alias("_ses_den_y"),
+                        (
+                            (pl.col("value") - pl.col("_level_v")).abs()
+                            - pl.col("_level_v")
+                        ).sum().alias("_ses_ae_adjust_v"),
+                        pl.col("value").abs().sum().alias("_ses_den_v"),
+                        (pl.col("y").clip(lower_bound=0.0) * pl.col("_w"))
+                        .sum().alias("_wzy"),
+                        (pl.col("value").clip(lower_bound=0.0) * pl.col("_w"))
+                        .sum().alias("_wzv"),
+                    )
+                )
+                alpha_state = alpha_state.join(
+                    alpha_eval, on=[uid_col, "_alpha"], how="left"
+                )
+            else:
+                alpha_state = alpha_state.with_columns(
+                    pl.lit(None).cast(pl.Float64).alias("_ses_ae_adjust_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_den_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_ae_adjust_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_den_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_wzy"),
+                    pl.lit(None).cast(pl.Float64).alias("_wzv"),
+                )
+
+            full_block = pl.col("_n_calendar") == block_days
+            alpha_state = (
+                alpha_state.with_columns(
+                    pl.when(full_block)
+                    .then(
+                        pl.col("_level_y") * pl.lit(float(block_days))
+                        + pl.col("_ses_ae_adjust_y").fill_null(0.0)
+                    )
+                    .otherwise(0.0)
+                    .alias("_block_ses_ae_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_ses_den_y").fill_null(0.0))
+                    .otherwise(0.0)
+                    .alias("_block_ses_den_y"),
+                    pl.when(full_block)
+                    .then(
+                        pl.col("_level_v") * pl.lit(float(block_days))
+                        + pl.col("_ses_ae_adjust_v").fill_null(0.0)
+                    )
+                    .otherwise(0.0)
+                    .alias("_block_ses_ae_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_ses_den_v").fill_null(0.0))
+                    .otherwise(0.0)
+                    .alias("_block_ses_den_v"),
+                )
+                .with_columns(
+                    (
+                        pl.lit(alpha_score_decay) * pl.col("_cae_ses_y")
+                        + pl.col("_block_ses_ae_y")
+                    ).alias("_cae_ses_y"),
+                    (
+                        pl.lit(alpha_score_decay) * pl.col("_cden_ses_y")
+                        + pl.col("_block_ses_den_y")
+                    ).alias("_cden_ses_y"),
+                    (
+                        pl.lit(alpha_score_decay) * pl.col("_cae_ses_v")
+                        + pl.col("_block_ses_ae_v")
+                    ).alias("_cae_ses_v"),
+                    (
+                        pl.lit(alpha_score_decay) * pl.col("_cden_ses_v")
+                        + pl.col("_block_ses_den_v")
+                    ).alias("_cden_ses_v"),
+                )
+            )
+            # PURE SES recurrence over daily actuals. Parent/RLS never enters
+            # these equations.
+            alpha_state = alpha_state.with_columns(
+                (
+                    (pl.lit(1.0) - pl.col("_alpha")).pow(
+                        pl.col("_n_calendar")
+                    ) * pl.col("_level_y")
+                    + pl.col("_wzy").fill_null(0.0)
+                ).alias("_level_y_next"),
+                (
+                    (pl.lit(1.0) - pl.col("_alpha")).pow(
+                        pl.col("_n_calendar")
+                    ) * pl.col("_level_v")
+                    + pl.col("_wzv").fill_null(0.0)
+                ).alias("_level_v_next"),
+            ).select(
+                uid_col,
+                "_leaf_start",
+                "_leaf_warmup_end",
+                "_alpha",
+                pl.col("_level_y_next").alias("_level_y"),
+                pl.col("_level_v_next").alias("_level_v"),
+                "_cae_ses_y",
+                "_cden_ses_y",
+                "_cae_ses_v",
+                "_cden_ses_v",
+            )
+
+            # ── Score parent shapes using ONLY the already-selected SES level ──
+            calendar_by_uid = (
+                alpha_state.select(uid_col, "_leaf_warmup_end")
+                .unique(subset=[uid_col])
+                .with_columns(
+                    pl.max_horizontal(
+                        pl.col("_leaf_warmup_end") + pl.duration(days=1),
+                        pl.lit(block_start),
+                    ).alias("_update_start")
+                )
+                .with_columns(
+                    pl.when(pl.col("_update_start") <= pl.lit(block_end))
+                    .then(
+                        (pl.lit(block_end) - pl.col("_update_start"))
+                        .dt.total_days()
+                        + 1
+                    )
+                    .otherwise(0)
+                    .cast(pl.Int32)
+                    .alias("_n_calendar")
+                )
+                .select(uid_col, "_n_calendar")
+            )
+            parent_eval_state = (
+                parent_state.join(
+                    selected_level, on=uid_col, how="left"
+                )
+                .join(calendar_by_uid, on=uid_col, how="left")
+            )
+
+            if obs_block is not None and obs_block.height:
+                parent_eval = (
+                    obs_block.join(
+                        parent_eval_state.select(
+                            uid_col,
+                            "_parent",
+                            "_strength",
+                            "_level_y",
+                            "_level_v",
+                            "_n_calendar",
+                        ),
+                        on=uid_col,
+                        how="inner",
+                    )
+                    .with_columns(
+                        pl.when(pl.col("_parent") == "store")
+                        .then(pl.col("_store_ey").exp())
+                        .when(pl.col("_parent") == "section")
+                        .then(pl.col("_sec_ey").exp())
+                        .otherwise(1.0)
+                        .alias("_raw_factor_y"),
+                        pl.when(pl.col("_parent") == "store")
+                        .then(pl.col("_store_ev").exp())
+                        .when(pl.col("_parent") == "section")
+                        .then(pl.col("_sec_ev").exp())
+                        .otherwise(1.0)
+                        .alias("_raw_factor_v"),
+                    )
+                    .with_columns(
+                        (
+                            1.0
+                            + pl.col("_strength")
+                            * (pl.col("_raw_factor_y") - 1.0)
+                        ).alias("_factor_candidate_y"),
+                        (
+                            1.0
+                            + pl.col("_strength")
+                            * (pl.col("_raw_factor_v") - 1.0)
+                        ).alias("_factor_candidate_v"),
+                    )
+                    .with_columns(
+                        (
+                            pl.col("_level_y")
+                            * pl.col("_factor_candidate_y")
+                        ).clip(lower_bound=0.0).alias("_pred_y"),
+                        (
+                            pl.col("_level_v")
+                            * pl.col("_factor_candidate_v")
+                        ).clip(lower_bound=0.0).alias("_pred_v"),
+                    )
+                    .group_by([uid_col, "_parent", "_strength"])
+                    .agg(
+                        (
+                            (pl.col("y") - pl.col("_pred_y")).abs()
+                            - pl.col("_pred_y")
+                        ).sum().alias("_parent_ae_adjust_y"),
+                        pl.col("y").abs().sum().alias("_parent_den_y"),
+                        (
+                            (pl.col("value") - pl.col("_pred_v")).abs()
+                            - pl.col("_pred_v")
+                        ).sum().alias("_parent_ae_adjust_v"),
+                        pl.col("value").abs().sum().alias("_parent_den_v"),
+                    )
+                )
+                parent_state = parent_state.join(
+                    parent_eval,
+                    on=[uid_col, "_parent", "_strength"],
+                    how="left",
+                )
+            else:
+                parent_state = parent_state.with_columns(
+                    pl.lit(None).cast(pl.Float64).alias("_parent_ae_adjust_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_parent_den_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_parent_ae_adjust_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_parent_den_v"),
+                )
+
+            parent_state = (
+                parent_state.join(
+                    selected_level.select(
+                        uid_col, "_level_y", "_level_v"
+                    ),
+                    on=uid_col,
+                    how="left",
+                )
+                .join(calendar_by_uid, on=uid_col, how="left")
+                .with_columns(
+                    pl.when(pl.col("_n_calendar") == block_days)
+                    .then(
+                        pl.col("_level_y") * pl.lit(float(block_days))
+                        + pl.col("_parent_ae_adjust_y").fill_null(0.0)
+                    )
+                    .otherwise(0.0)
+                    .alias("_block_parent_ae_y"),
+                    pl.when(pl.col("_n_calendar") == block_days)
+                    .then(pl.col("_parent_den_y").fill_null(0.0))
+                    .otherwise(0.0)
+                    .alias("_block_parent_den_y"),
+                    pl.when(pl.col("_n_calendar") == block_days)
+                    .then(
+                        pl.col("_level_v") * pl.lit(float(block_days))
+                        + pl.col("_parent_ae_adjust_v").fill_null(0.0)
+                    )
+                    .otherwise(0.0)
+                    .alias("_block_parent_ae_v"),
+                    pl.when(pl.col("_n_calendar") == block_days)
+                    .then(pl.col("_parent_den_v").fill_null(0.0))
+                    .otherwise(0.0)
+                    .alias("_block_parent_den_v"),
+                )
+                .with_columns(
+                    (
+                        pl.lit(driver_score_decay)
+                        * pl.col("_cae_parent_y")
+                        + pl.col("_block_parent_ae_y")
+                    ).alias("_cae_parent_y"),
+                    (
+                        pl.lit(driver_score_decay)
+                        * pl.col("_cden_parent_y")
+                        + pl.col("_block_parent_den_y")
+                    ).alias("_cden_parent_y"),
+                    (
+                        pl.lit(driver_score_decay)
+                        * pl.col("_cae_parent_v")
+                        + pl.col("_block_parent_ae_v")
+                    ).alias("_cae_parent_v"),
+                    (
+                        pl.lit(driver_score_decay)
+                        * pl.col("_cden_parent_v")
+                        + pl.col("_block_parent_den_v")
+                    ).alias("_cden_parent_v"),
+                )
+                .select(
+                    uid_col,
                     "_parent",
-                    "_alpha",
-                    "_level_log_y",
-                    "_level_log_v",
-                    "_cae_y",
-                    "_cden_y",
-                    "_cae_v",
-                    "_cden_v",
+                    "_strength",
+                    "_cae_parent_y",
+                    "_cden_parent_y",
+                    "_cae_parent_v",
+                    "_cden_parent_v",
                 )
             )
 
@@ -1594,57 +2755,331 @@ class RLSForecastRunner:
             chosen_frames, how="vertical_relaxed"
         )
 
+        logger.info(
+            "⏱ Sección %s: selección leaf 2-etapas (SES puro %d alphas + 2 padres): %.1fs",
+            section_id,
+            len(alpha_candidates),
+            time.perf_counter() - t_candidates,
+        )
+
+        # Reference level for audit: arithmetic mean of the immediately
+        # preceding 28 CALENDAR days, with missing sale dates treated as zero.
+        # This is not used to make the forecast; it is a diagnostic that makes
+        # any SES-level explosion visible in forecast.parquet.
+        reference_frames: list[pl.DataFrame] = []
+        for ref_block in range(1, max_block + 1):
+            ref_start = train_start + dt.timedelta(
+                days=(ref_block - 1) * block_days
+            )
+            ref_end = ref_start + dt.timedelta(days=block_days - 1)
+            ref = (
+                actual_obs.filter(
+                    (pl.col("ds") >= pl.lit(ref_start))
+                    & (pl.col("ds") <= pl.lit(ref_end))
+                )
+                .group_by(uid_col)
+                .agg(
+                    (
+                        pl.col("y").sum() / pl.lit(float(block_days))
+                    ).alias("_recent28_mean_y"),
+                    (
+                        pl.col("value").sum() / pl.lit(float(block_days))
+                    ).alias("_recent28_mean_v"),
+                )
+                .with_columns(
+                    pl.lit(ref_block).cast(pl.Int32).alias("_block")
+                )
+            )
+            reference_frames.append(ref)
+        recent_refs = (
+            pl.concat(reference_frames, how="vertical_relaxed")
+            if reference_frames
+            else pl.DataFrame()
+        )
+
         rows = (
             rows.join(
                 chosen_states, on=[uid_col, "_block"], how="left"
             )
-            .with_columns(
-                pl.when(pl.col("_parent_y") == "store")
-                .then(pl.col("_store_ey"))
-                .when(pl.col("_parent_y") == "section")
-                .then(pl.col("_sec_ey"))
-                .otherwise(pl.col("_none_ey"))
-                .alias("_ey"),
-                pl.when(pl.col("_parent_v") == "store")
-                .then(pl.col("_store_ev"))
-                .when(pl.col("_parent_v") == "section")
-                .then(pl.col("_sec_ev"))
-                .otherwise(pl.col("_none_ev"))
-                .alias("_ev"),
+            .join(
+                recent_refs, on=[uid_col, "_block"], how="left"
             )
             .with_columns(
                 (
-                    pl.col("_level_log_y") + pl.col("_ey")
+                    (pl.col("ds") - pl.lit(train_start)).dt.total_days()
+                    % block_days
                 )
-                .clip(0.0, 30.0)
-                .exp()
-                .sub(1.0)
-                .clip(lower_bound=0.0)
-                .round(0)
-                .alias("yhat"),
+                .cast(pl.Int32)
+                .alias("_day_in_block"),
+                pl.when(pl.col("_parent_y") == "store")
+                .then(pl.col("_store_ey").exp())
+                .when(pl.col("_parent_y") == "section")
+                .then(pl.col("_sec_ey").exp())
+                .otherwise(1.0)
+                .alias("_raw_factor_y"),
+                pl.when(pl.col("_parent_v") == "store")
+                .then(pl.col("_store_ev").exp())
+                .when(pl.col("_parent_v") == "section")
+                .then(pl.col("_sec_ev").exp())
+                .otherwise(1.0)
+                .alias("_raw_factor_v"),
+            )
+        )
+
+        # Direction guard is evaluated only for dense target blocks where the
+        # complete 28-day driver shape exists (OOS / forecast-only).
+        direction_ratio = float(
+            getattr(settings, "LEAF_DRIVER_DIRECTION_CONFLICT_RATIO", 0.85)
+        )
+        direction_recent_floor = float(
+            getattr(settings, "LEAF_DRIVER_RECENT_TREND_FLOOR", 0.95)
+        )
+        direction_recent_ceiling = float(
+            getattr(settings, "LEAF_DRIVER_RECENT_TREND_CEILING", 1.05)
+        )
+        direction_max_strength = float(
+            getattr(
+                settings,
+                "LEAF_DRIVER_DIRECTION_GUARD_MAX_STRENGTH",
+                0.25,
+            )
+        )
+        shape_guard_stats = (
+            rows.filter(
+                pl.col("period_type").is_in(
+                    ["out_sample", "forecast_only"]
+                )
+            )
+            .group_by([uid_col, "_block"])
+            .agg(
+                pl.col("_raw_factor_y")
+                .filter(pl.col("_day_in_block") < 7)
+                .mean()
+                .alias("_factor_first7_y"),
+                pl.col("_raw_factor_y")
+                .filter(pl.col("_day_in_block") >= block_days - 7)
+                .mean()
+                .alias("_factor_last7_y"),
+                pl.col("_raw_factor_v")
+                .filter(pl.col("_day_in_block") < 7)
+                .mean()
+                .alias("_factor_first7_v"),
+                pl.col("_raw_factor_v")
+                .filter(pl.col("_day_in_block") >= block_days - 7)
+                .mean()
+                .alias("_factor_last7_v"),
+            )
+            .with_columns(
+                pl.when(pl.col("_factor_first7_y") > 1e-12)
+                .then(
+                    pl.col("_factor_last7_y")
+                    / pl.col("_factor_first7_y")
+                )
+                .otherwise(1.0)
+                .alias("_driver_trend_y"),
+                pl.when(pl.col("_factor_first7_v") > 1e-12)
+                .then(
+                    pl.col("_factor_last7_v")
+                    / pl.col("_factor_first7_v")
+                )
+                .otherwise(1.0)
+                .alias("_driver_trend_v"),
+            )
+        )
+
+        rows = (
+            rows.join(
+                shape_guard_stats,
+                on=[uid_col, "_block"],
+                how="left",
+            )
+            .with_columns(
                 (
-                    pl.col("_level_log_v") + pl.col("_ev")
+                    2.0 * pl.col("_recent28_y") - pl.col("_recent14_y")
                 )
-                .clip(0.0, 30.0)
-                .exp()
-                .sub(1.0)
                 .clip(lower_bound=0.0)
-                .round(2)
-                .alias("valuehat"),
+                .alias("_previous14_y"),
+                (
+                    2.0 * pl.col("_recent28_v") - pl.col("_recent14_v")
+                )
+                .clip(lower_bound=0.0)
+                .alias("_previous14_v"),
+            )
+            .with_columns(
+                pl.when(pl.col("_previous14_y") > 1e-12)
+                .then(pl.col("_recent14_y") / pl.col("_previous14_y"))
+                .otherwise(1.0)
+                .alias("_recent_trend_y"),
+                pl.when(pl.col("_previous14_v") > 1e-12)
+                .then(pl.col("_recent14_v") / pl.col("_previous14_v"))
+                .otherwise(1.0)
+                .alias("_recent_trend_v"),
+            )
+            .with_columns(
+                (
+                    (pl.col("_coverage_y") >= regime_dense_coverage)
+                    & (
+                        (
+                            pl.col("_driver_trend_y").fill_null(1.0)
+                            < direction_ratio
+                        )
+                        & (
+                            pl.col("_recent_trend_y")
+                            >= direction_recent_floor
+                        )
+                        | (
+                            pl.col("_driver_trend_y").fill_null(1.0)
+                            > (1.0 / direction_ratio)
+                        )
+                        & (
+                            pl.col("_recent_trend_y")
+                            <= direction_recent_ceiling
+                        )
+                    )
+                ).alias("_direction_guard_y"),
+                (
+                    (pl.col("_coverage_v") >= regime_dense_coverage)
+                    & (
+                        (
+                            pl.col("_driver_trend_v").fill_null(1.0)
+                            < direction_ratio
+                        )
+                        & (
+                            pl.col("_recent_trend_v")
+                            >= direction_recent_floor
+                        )
+                        | (
+                            pl.col("_driver_trend_v").fill_null(1.0)
+                            > (1.0 / direction_ratio)
+                        )
+                        & (
+                            pl.col("_recent_trend_v")
+                            <= direction_recent_ceiling
+                        )
+                    )
+                ).alias("_direction_guard_v"),
+            )
+            .with_columns(
+                pl.when(pl.col("_direction_guard_y"))
+                .then(
+                    pl.min_horizontal(
+                        pl.col("_strength_y"),
+                        pl.lit(direction_max_strength),
+                    )
+                )
+                .otherwise(pl.col("_strength_y"))
+                .alias("_effective_strength_y"),
+                pl.when(pl.col("_direction_guard_v"))
+                .then(
+                    pl.min_horizontal(
+                        pl.col("_strength_v"),
+                        pl.lit(direction_max_strength),
+                    )
+                )
+                .otherwise(pl.col("_strength_v"))
+                .alias("_effective_strength_v"),
+            )
+            .with_columns(
+                (
+                    1.0
+                    + pl.col("_effective_strength_y")
+                    * (pl.col("_raw_factor_y") - 1.0)
+                ).alias("_factor_y_selected"),
+                (
+                    1.0
+                    + pl.col("_effective_strength_v")
+                    * (pl.col("_raw_factor_v") - 1.0)
+                ).alias("_factor_v_selected"),
+            )
+            .with_columns(
+                pl.col("_factor_y_selected").log().alias("_ey"),
+                pl.col("_factor_v_selected").log().alias("_ev"),
+            )
+            .with_columns(
+                (
+                    pl.col("_level_y")
+                    * pl.col("_ey").exp()
+                )
+                .clip(lower_bound=0.0)
+                .alias("_yhat_raw"),
+                (
+                    pl.col("_level_v")
+                    * pl.col("_ev").exp()
+                )
+                .clip(lower_bound=0.0)
+                .alias("_valuehat_raw"),
+            )
+            .with_columns(
+                pl.col("_yhat_raw").round(0).alias("yhat"),
+                pl.col("_valuehat_raw").round(2).alias("valuehat"),
+                pl.col("_yhat_raw").alias("yhat_raw"),
+                pl.col("_valuehat_raw").alias("valuehat_raw"),
                 pl.concat_str(
                     [
-                        pl.lit("leaf_residual_ses:"),
+                        pl.lit("leaf_ses_level_driver:"),
                         pl.col("_parent_y"),
+                        pl.lit("@"),
+                        pl.col("_effective_strength_y").round(2).cast(pl.Utf8),
                         pl.lit("/"),
                         pl.col("_parent_v"),
+                        pl.lit("@"),
+                        pl.col("_effective_strength_v").round(2).cast(pl.Utf8),
                     ]
                 ).alias("modelo_seleccionado"),
                 pl.col("_alpha_y").alias("ses_alpha_y"),
                 pl.col("_alpha_v").alias("ses_alpha_value"),
                 pl.col("_parent_y").alias("parent_model_y"),
                 pl.col("_parent_v").alias("parent_model_value"),
+                pl.col("_strength_y").alias("driver_strength_selected_y"),
+                pl.col("_strength_v").alias("driver_strength_selected_value"),
+                pl.col("_effective_strength_y").alias("driver_strength_y"),
+                pl.col("_effective_strength_v").alias("driver_strength_value"),
+                pl.col("_direction_guard_y").alias("driver_direction_guard_y"),
+                pl.col("_direction_guard_v").alias("driver_direction_guard_value"),
+                pl.col("_level_y").alias("ses_level_y"),
+                pl.col("_level_v").alias("ses_level_value"),
+                pl.col("_pure_ses_wmape_y").alias("pure_ses_wmape_y"),
+                pl.col("_pure_ses_wmape_v").alias("pure_ses_wmape_value"),
+                pl.col("_reference_y").alias("ses_stability_reference_y"),
+                pl.col("_reference_v").alias("ses_stability_reference_value"),
+                pl.col("_recent28_y").alias("ses_recent28_y"),
+                pl.col("_recent28_v").alias("ses_recent28_value"),
+                pl.col("_recent14_y").alias("ses_recent14_y"),
+                pl.col("_recent14_v").alias("ses_recent14_value"),
+                pl.col("_coverage_y").alias("ses_recent28_coverage_y"),
+                pl.col("_coverage_v").alias("ses_recent28_coverage_value"),
+                pl.col("_regime_anchor_y").alias("ses_regime_anchor_y"),
+                pl.col("_regime_anchor_v").alias("ses_regime_anchor_value"),
+                pl.col("_sparse_robust_y").alias("ses_sparse_robust_y"),
+                pl.col("_sparse_robust_v").alias("ses_sparse_robust_value"),
+                pl.col("_sparse_shock_y").alias("ses_sparse_shock_y"),
+                pl.col("_sparse_shock_v").alias("ses_sparse_shock_value"),
+                pl.col("_robust_block_median_y")
+                .alias("ses_robust_block_median_y"),
+                pl.col("_robust_block_median_v")
+                .alias("ses_robust_block_median_value"),
+                pl.col("_ses_guard_y").alias("ses_stability_guard_y"),
+                pl.col("_ses_guard_v").alias("ses_stability_guard_value"),
+                pl.col("_stable_pool_y").alias("ses_stable_pool_found_y"),
+                pl.col("_stable_pool_v").alias("ses_stable_pool_found_value"),
+                pl.col("_recent28_mean_y")
+                .fill_null(0.0)
+                .alias("recent28_mean_y"),
+                pl.col("_recent28_mean_v")
+                .fill_null(0.0)
+                .alias("recent28_mean_value"),
+                pl.when(pl.col("_recent28_mean_y") > 1e-12)
+                .then(pl.col("_level_y") / pl.col("_recent28_mean_y"))
+                .otherwise(None)
+                .alias("ses_vs_recent28_ratio_y"),
+                pl.when(pl.col("_recent28_mean_v") > 1e-12)
+                .then(pl.col("_level_v") / pl.col("_recent28_mean_v"))
+                .otherwise(None)
+                .alias("ses_vs_recent28_ratio_value"),
                 pl.col("_ey").alias("driver_effect"),
                 pl.col("_ev").alias("driver_effect_value"),
+                pl.col("_ey").exp().alias("driver_factor_y"),
+                pl.col("_ev").exp().alias("driver_factor_value"),
                 pl.lit(True).alias("rls_metric_eligible"),
                 pl.col("_block").alias("rls_block"),
                 (pl.col("_block") * block_days)
@@ -1653,28 +3088,252 @@ class RLSForecastRunner:
             )
         )
 
+        # Production invariant: OOS and forecast-only are dense 28-day
+        # blocks, so driver factors MUST average 1 and mean forecast must track
+        # the selected SES level (rounding aside).
+        audit_blocks = (
+            rows.filter(
+                pl.col("period_type").is_in(["out_sample", "forecast_only"])
+            )
+            .group_by([uid_col, "period_type", "rls_block"])
+            .agg(
+                pl.col("ds").min().alias("_block_start"),
+                pl.col("ds").max().alias("_block_end"),
+                pl.col("y").mean().alias("_actual_mean_y"),
+                pl.col("value").mean().alias("_actual_mean_v"),
+                pl.col("driver_factor_y").min().alias("_min_factor_y"),
+                pl.col("driver_factor_y").mean().alias("_mean_factor_y"),
+                pl.col("driver_factor_y").max().alias("_max_factor_y"),
+                pl.col("driver_factor_value").min().alias("_min_factor_v"),
+                pl.col("driver_factor_value").mean().alias("_mean_factor_v"),
+                pl.col("driver_factor_value").max().alias("_max_factor_v"),
+                pl.col("ses_level_y").first().alias("_ses_y"),
+                pl.col("ses_level_value").first().alias("_ses_v"),
+                pl.col("yhat_raw").min().alias("_min_yhat_raw"),
+                pl.col("yhat_raw").mean().alias("_mean_yhat_raw"),
+                pl.col("yhat_raw").max().alias("_max_yhat_raw"),
+                pl.col("valuehat_raw").min().alias("_min_vhat_raw"),
+                pl.col("valuehat_raw").mean().alias("_mean_vhat_raw"),
+                pl.col("valuehat_raw").max().alias("_max_vhat_raw"),
+                pl.col("yhat").min().alias("_min_yhat"),
+                pl.col("yhat").mean().alias("_mean_yhat"),
+                pl.col("yhat").max().alias("_max_yhat"),
+                pl.col("valuehat").min().alias("_min_vhat"),
+                pl.col("valuehat").mean().alias("_mean_vhat"),
+                pl.col("valuehat").max().alias("_max_vhat"),
+                pl.col("recent28_mean_y").first().alias("_recent_y"),
+                pl.col("recent28_mean_value").first().alias("_recent_v"),
+                pl.col("parent_model_y").first().alias("_parent_y"),
+                pl.col("parent_model_value").first().alias("_parent_v"),
+                pl.col("ses_alpha_y").first().alias("_alpha_y"),
+                pl.col("ses_alpha_value").first().alias("_alpha_v"),
+            )
+            .with_columns(
+                pl.when(pl.col("_recent_y") > 1e-12)
+                .then(pl.col("_ses_y") / pl.col("_recent_y"))
+                .otherwise(None)
+                .alias("_ses_recent_ratio_y"),
+                pl.when(pl.col("_recent_v") > 1e-12)
+                .then(pl.col("_ses_v") / pl.col("_recent_v"))
+                .otherwise(None)
+                .alias("_ses_recent_ratio_v"),
+                pl.when(pl.col("_ses_y") > 1e-12)
+                .then(pl.col("_mean_yhat_raw") / pl.col("_ses_y"))
+                .otherwise(None)
+                .alias("_forecast_ses_ratio_y"),
+                pl.when(pl.col("_ses_v") > 1e-12)
+                .then(pl.col("_mean_vhat_raw") / pl.col("_ses_v"))
+                .otherwise(None)
+                .alias("_forecast_ses_ratio_v"),
+            )
+        )
+        factor_tol = float(
+            getattr(settings, "LEAF_DRIVER_MEAN_TOLERANCE", 1e-6)
+        )
+        bad_factor = audit_blocks.filter(
+            ((pl.col("_mean_factor_y") - 1.0).abs() > factor_tol)
+            | ((pl.col("_mean_factor_v") - 1.0).abs() > factor_tol)
+        )
+        if bad_factor.height:
+            examples = bad_factor.head(5).select(
+                uid_col, "period_type", "_mean_factor_y", "_mean_factor_v"
+            ).to_dicts()
+            raise RuntimeError(
+                "Leaf driver invariant violated: block mean factor must be 1. "
+                f"Examples={examples}"
+            )
+
+        # Second invariant: after applying a mean-one driver, the mean forecast
+        # must remain at the SES level (apart from rounding). This detects any
+        # later transformation/overwrite of yhat or valuehat.
+        level_mean_tol = float(
+            getattr(settings, "LEAF_FORECAST_LEVEL_MEAN_TOLERANCE", 0.02)
+        )
+        bad_forecast_level = audit_blocks.filter(
+            (
+                pl.col("_forecast_ses_ratio_y").is_not_null()
+                & (
+                    (pl.col("_forecast_ses_ratio_y") - 1.0).abs()
+                    > level_mean_tol
+                )
+                & (pl.col("_ses_y") > 1.0)
+            )
+            | (
+                pl.col("_forecast_ses_ratio_v").is_not_null()
+                & (
+                    (pl.col("_forecast_ses_ratio_v") - 1.0).abs()
+                    > level_mean_tol
+                )
+                & (pl.col("_ses_v") > 1.0)
+            )
+        )
+        if bad_forecast_level.height:
+            examples = bad_forecast_level.head(5).select(
+                uid_col,
+                "period_type",
+                "_ses_y",
+                "_mean_yhat_raw",
+                "_mean_yhat",
+                "_forecast_ses_ratio_y",
+                "_ses_v",
+                "_mean_vhat_raw",
+                "_mean_vhat",
+                "_forecast_ses_ratio_v",
+            ).to_dicts()
+            raise RuntimeError(
+                "Leaf level invariant violated: mean forecast must match SES "
+                f"level after mean-one drivers. Examples={examples}"
+            )
+
+        level_warn_ratio = float(
+            getattr(settings, "LEAF_LEVEL_REFERENCE_WARN_RATIO", 4.0)
+        )
+        suspicious_level = audit_blocks.filter(
+            (
+                (pl.col("_recent_y") > 0)
+                & (
+                    (pl.col("_ses_y") / pl.col("_recent_y"))
+                    > level_warn_ratio
+                )
+            )
+            | (
+                (pl.col("_recent_v") > 0)
+                & (
+                    (pl.col("_ses_v") / pl.col("_recent_v"))
+                    > level_warn_ratio
+                )
+            )
+        )
+        diagnostic_ratio = float(
+            getattr(settings, "LEAF_DIAGNOSTIC_LEVEL_RATIO", 3.0)
+        )
+        diagnostic_forecast_ratio = float(
+            getattr(settings, "LEAF_DIAGNOSTIC_FORECAST_RATIO", 3.0)
+        )
+        diagnostic_top_n = int(
+            getattr(settings, "LEAF_DIAGNOSTIC_TOP_N", 10)
+        )
+        diagnostic_blocks = audit_blocks.filter(
+            (
+                pl.col("_ses_recent_ratio_y").is_not_null()
+                & (pl.col("_ses_recent_ratio_y") > diagnostic_ratio)
+            )
+            | (
+                pl.col("_ses_recent_ratio_v").is_not_null()
+                & (pl.col("_ses_recent_ratio_v") > diagnostic_ratio)
+            )
+            | (
+                (pl.col("_recent_y") > 1e-12)
+                & (
+                    (pl.col("_mean_yhat") / pl.col("_recent_y"))
+                    > diagnostic_forecast_ratio
+                )
+            )
+            | (
+                (pl.col("_recent_v") > 1e-12)
+                & (
+                    (pl.col("_mean_vhat") / pl.col("_recent_v"))
+                    > diagnostic_forecast_ratio
+                )
+            )
+        )
+        if suspicious_level.height or diagnostic_blocks.height:
+            diag = (
+                diagnostic_blocks
+                if diagnostic_blocks.height
+                else suspicious_level
+            )
+            logger.warning(
+                "DIAGNÓSTICO LEAF Sección %s: %d bloques OOS/forecast-only "
+                "con salto de nivel. Cada fila muestra actual_mean, recent28, "
+                "SES, drivers[min/mean/max] y forecast[min/mean/max]. %s",
+                section_id,
+                diag.height,
+                diag.head(diagnostic_top_n).select(
+                    uid_col,
+                    "period_type",
+                    "_block_start",
+                    "_block_end",
+                    "_actual_mean_y",
+                    "_recent_y",
+                    "_ses_y",
+                    "_ses_recent_ratio_y",
+                    "_min_factor_y",
+                    "_mean_factor_y",
+                    "_max_factor_y",
+                    "_min_yhat_raw",
+                    "_mean_yhat_raw",
+                    "_max_yhat_raw",
+                    "_min_yhat",
+                    "_mean_yhat",
+                    "_max_yhat",
+                    "_actual_mean_v",
+                    "_recent_v",
+                    "_ses_v",
+                    "_ses_recent_ratio_v",
+                    "_min_factor_v",
+                    "_mean_factor_v",
+                    "_max_factor_v",
+                    "_min_vhat_raw",
+                    "_mean_vhat_raw",
+                    "_max_vhat_raw",
+                    "_min_vhat",
+                    "_mean_vhat",
+                    "_max_vhat",
+                    "_parent_y",
+                    "_parent_v",
+                    "_alpha_y",
+                    "_alpha_v",
+                ).to_dicts(),
+            )
+
         logger.info(
-            "⏱ Sección %s: selección leaf vectorizada (%d candidatos): %.1fs",
+            "⏱ Sección %s: leaf 2-etapas SES puro (%d alphas) + padres (2): %.1fs",
             section_id,
-            params.height,
+            len(alpha_candidates),
             time.perf_counter() - t_candidates,
         )
 
         # Warm-up is visual continuity only; never official metrics.
         warm = (
-            train_obs.filter(pl.col("ds") <= pl.lit(warmup_end))
+            train_obs.join(leaf_bounds, on=uid_col, how="left")
+            .filter(pl.col("ds") <= pl.col("_leaf_warmup_end"))
             .join(state0, on=uid_col, how="left")
             .with_columns(
-                pl.col("_level_log_y").exp().sub(1.0).clip(lower_bound=0.0).round(0).alias("yhat"),
-                pl.col("_level_log_v").exp().sub(1.0).clip(lower_bound=0.0).round(2).alias("valuehat"),
+                pl.col("_level_y").clip(lower_bound=0.0).round(0).alias("yhat"),
+                pl.col("_level_v").clip(lower_bound=0.0).round(2).alias("valuehat"),
                 pl.lit("in_sample").alias("period_type"),
-                pl.lit("leaf_warmup_mean_actuals").alias("modelo_seleccionado"),
+                pl.lit("leaf_warmup_calendar_mean").alias("modelo_seleccionado"),
                 pl.lit(default_alpha).alias("ses_alpha_y"),
                 pl.lit(default_alpha).alias("ses_alpha_value"),
                 pl.lit("warmup").alias("parent_model_y"),
                 pl.lit("warmup").alias("parent_model_value"),
+                pl.col("_level_y").alias("ses_level_y"),
+                pl.col("_level_v").alias("ses_level_value"),
                 pl.lit(0.0).alias("driver_effect"),
                 pl.lit(0.0).alias("driver_effect_value"),
+                pl.lit(1.0).alias("driver_factor_y"),
+                pl.lit(1.0).alias("driver_factor_value"),
                 pl.lit(False).alias("rls_metric_eligible"),
                 pl.lit(0).cast(pl.Int32).alias("rls_block"),
                 pl.lit(warmup_days).cast(pl.Int32).alias("rls_train_days"),
@@ -1684,14 +3343,18 @@ class RLSForecastRunner:
         drop_tmp = [
             c for c in (
                 "_block", "_store_uid", "_store_ey", "_store_ev", "_sec_ey", "_sec_ev",
-                "_none_ey", "_none_ev",
-                "_candidate_y", "_candidate_v", "_level_log_y", "_level_log_v",
+                "_candidate_y", "_candidate_v", "_level_y", "_level_v",
                 "_parent_y", "_parent_v", "_alpha_y", "_alpha_v", "_ey", "_ev",
+                "_recent28_mean_y", "_recent28_mean_v",
+                "_yhat_raw", "_valuehat_raw",
+                "_reference_y", "_reference_v", "_ses_guard_y", "_ses_guard_v",
+                "_stable_pool_y", "_stable_pool_v",
             ) if c in rows.columns
         ]
         rows = rows.drop(drop_tmp)
         warm = warm.drop(
-            [c for c in ("_level_log_y", "_level_log_v") if c in warm.columns]
+            [c for c in ("_level_y", "_level_v", "_leaf_start", "_leaf_warmup_end")
+             if c in warm.columns]
         )
 
         if meta:
@@ -1699,8 +3362,8 @@ class RLSForecastRunner:
             rows = rows.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
 
         logger.info(
-            "Sección %s: leaf residual-SES log-space | %d hojas | alphas=%s | "
-            "candidato tienda/sección/SES-directo por WMAPE acumulado previo",
+            "Sección %s: leaf SES original-scale level + normalized RLS driver | %d hojas | alphas=%s | "
+            "candidato tienda/sección por wMAPE acumulado previo; drivers obligatorios",
             section_id, ids.height, alpha_candidates,
         )
         logger.info(

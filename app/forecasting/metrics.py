@@ -11,8 +11,8 @@ def compute_wmape(
         """
         WMAPE bottom-up, separado por in_sample / out_sample.
 
-        1. Errores solo en hojas SKU+tienda (y ≠ 0, no forecast_only):
-             e = |y − ŷ|
+        1. Errores en hojas SKU+tienda, incluyendo días con y=0:
+             e = |y − ŷ|. Los ceros aportan error al numerador y 0 al denominador.
         2. WMAPE hoja = Σe / Σ|y| por unique_id y period_type
         3. Tienda / sección = suma de numeradores y denominadores de sus hojas
            (no usa el yhat del RLS de esos niveles).
@@ -42,7 +42,6 @@ def compute_wmape(
             & pl.col("yhat").is_not_null()
             & pl.col("y").is_finite()
             & pl.col("yhat").is_finite()
-            & (pl.col("y") != 0)
         )
         if (
             "rls_metric_eligible" in leaves.columns

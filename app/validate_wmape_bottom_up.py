@@ -57,7 +57,8 @@ def _scored_leaves_manual(unit_df: pl.DataFrame) -> pl.DataFrame:
     leaves = leaves.filter(
         pl.col("y").is_not_null()
         & pl.col("yhat").is_not_null()
-        & (pl.col("y") != 0)
+        & pl.col("y").is_finite()
+        & pl.col("yhat").is_finite()
     )
     if leaves.height == 0:
         return leaves
@@ -95,7 +96,7 @@ def serie_agregada_wmape(unit_df: pl.DataFrame, uid: str) -> float | None:
     sub = unit_df.filter(pl.col("unique_id") == uid)
     if "period_type" in sub.columns:
         sub = sub.filter(pl.col("period_type") != "forecast_only")
-    sub = sub.filter(pl.col("y").is_not_null() & (pl.col("y") != 0))
+    sub = sub.filter(pl.col("y").is_not_null() & pl.col("yhat").is_not_null())
     if sub.height == 0:
         return None
     sum_y = float(sub["y"].sum())
