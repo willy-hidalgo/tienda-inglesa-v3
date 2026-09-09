@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 
-import sys
 from pathlib import Path
 
 import polars as pl
@@ -67,6 +66,8 @@ def audit_metrics(metrics: pl.DataFrame) -> list[str]:
 
         required = {
             "sum_abs_error", "sum_abs_y", "sum_signed_error", "wmape", "bias",
+            "sum_abs_y_all_points", "sum_abs_error_all_points", "sum_signed_error_all_points",
+            "wmape_all_points", "bias_all_points",
             "metric_active", "metric_cohort",
         }
         missing = sorted(required - set(u.columns))
@@ -247,8 +248,8 @@ def audit_metric_sample(
 
     La recomputación es independiente de ``metrics.parquet`` pero respeta la
     definición oficial: los días con actual == 0 no participan en wMAPE/BIAS.
-    El sobreforecast en demanda cero se audita por los componentes específicos
-    de zero-demand, no mezclándolo en la métrica oficial.
+    También verifica las métricas ácidas all-points, que sí incluyen y==0,
+    manteniendo exactamente el mismo denominador Σ|y|.
     """
     errors: list[str] = []
     if metrics.height == 0:
@@ -265,8 +266,9 @@ def audit_metric_sample(
         target = (
             leaves.filter(pl.col("unidad") == unidad)
             .select(
-                "unique_id", "wmape", "bias", "sum_abs_y",
-                "sum_abs_error", "sum_signed_error", "metric_cohort",
+                "unique_id", "wmape", "bias", "wmape_all_points", "bias_all_points", "sum_abs_y",
+                "sum_abs_error", "sum_signed_error", "sum_abs_y_all_points",
+                "sum_abs_error_all_points", "sum_signed_error_all_points", "metric_cohort",
             )
             .head(sample_per_unit)
         )
@@ -315,6 +317,9 @@ def audit_metric_sample(
                 .sum().alias("_sum_abs_y_calc"),
                 pl.when(scored).then(signed_err).otherwise(0.0)
                 .sum().alias("_sum_signed_error_calc"),
+                pl.col(actual_col).abs().sum().alias("_sum_abs_y_all_points_calc"),
+                abs_err.sum().alias("_sum_abs_error_all_points_calc"),
+                signed_err.sum().alias("_sum_signed_error_all_points_calc"),
             )
             .with_columns(
                 pl.when(pl.col("_sum_abs_y_calc") > 0)
@@ -325,6 +330,14 @@ def audit_metric_sample(
                 .then(pl.col("_sum_signed_error_calc") / pl.col("_sum_abs_y_calc"))
                 .otherwise(None)
                 .alias("_bias_calc"),
+                pl.when(pl.col("_sum_abs_y_all_points_calc") > 0)
+                .then(pl.col("_sum_abs_error_all_points_calc") / pl.col("_sum_abs_y_all_points_calc"))
+                .otherwise(None)
+                .alias("_wmape_all_points_calc"),
+                pl.when(pl.col("_sum_abs_y_all_points_calc") > 0)
+                .then(pl.col("_sum_signed_error_all_points_calc") / pl.col("_sum_abs_y_all_points_calc"))
+                .otherwise(None)
+                .alias("_bias_all_points_calc"),
             )
         )
 
@@ -335,6 +348,11 @@ def audit_metric_sample(
                 "sum_abs_y": "_sum_abs_y_metric",
                 "sum_abs_error": "_sum_abs_error_metric",
                 "sum_signed_error": "_sum_signed_error_metric",
+                "sum_abs_y_all_points": "_sum_abs_y_all_points_metric",
+                "wmape_all_points": "_wmape_all_points_metric",
+                "bias_all_points": "_bias_all_points_metric",
+                "sum_abs_error_all_points": "_sum_abs_error_all_points_metric",
+                "sum_signed_error_all_points": "_sum_signed_error_all_points_metric",
             })
             .join(calc, on="unique_id", how="left")
             .filter(
@@ -353,6 +371,19 @@ def audit_metric_sample(
                 | ((pl.col("_sum_abs_error_calc") - pl.col("_sum_abs_error_metric")).abs() > tolerance)
                 | ((pl.col("_sum_abs_y_calc") - pl.col("_sum_abs_y_metric")).abs() > tolerance)
                 | ((pl.col("_sum_signed_error_calc") - pl.col("_sum_signed_error_metric")).abs() > tolerance)
+                | (
+                    pl.col("_wmape_all_points_calc").is_not_null()
+                    & pl.col("_wmape_all_points_metric").is_not_null()
+                    & ((pl.col("_wmape_all_points_calc") - pl.col("_wmape_all_points_metric")).abs() > tolerance)
+                )
+                | (
+                    pl.col("_bias_all_points_calc").is_not_null()
+                    & pl.col("_bias_all_points_metric").is_not_null()
+                    & ((pl.col("_bias_all_points_calc") - pl.col("_bias_all_points_metric")).abs() > tolerance)
+                )
+                | ((pl.col("_sum_abs_y_all_points_calc") - pl.col("_sum_abs_y_all_points_metric")).abs() > tolerance)
+                | ((pl.col("_sum_abs_error_all_points_calc") - pl.col("_sum_abs_error_all_points_metric")).abs() > tolerance)
+                | ((pl.col("_sum_signed_error_all_points_calc") - pl.col("_sum_signed_error_all_points_metric")).abs() > tolerance)
             )
         )
         if cmp.height:

@@ -22,9 +22,11 @@ import polars as pl
 try:
     from app import backend
     from app import dashboard_artifacts as artifacts
+    from app.dashboard_diagnostics import add_leaf_edp
 except ImportError:  # pragma: no cover
     import backend  # type: ignore
     import dashboard_artifacts as artifacts  # type: ignore
+    from dashboard_diagnostics import add_leaf_edp  # type: ignore
 
 import settings
 
@@ -52,11 +54,11 @@ class DashboardView:
     store_context: str | None
     chart: dict[str, Any]
     detail: pl.DataFrame
+    audit_daily: pl.DataFrame | None
     ds_min: dt.date | None
     ds_max: dt.date | None
     cutoff: dt.date
     consistency_warnings: list[str]
-    model_compare: dict[str, Any] | None = None
     has_value_cols: bool = False
 
 
@@ -209,6 +211,11 @@ def _official_oos_metrics_from_artifact(
             "sum_abs_y": den,
             "sum_abs_error": float(_get("sum_abs_error", 0.0) or 0.0),
             "sum_signed_error": float(_get("sum_signed_error", 0.0) or 0.0),
+            "sum_abs_y_all_points": float(_get("sum_abs_y_all_points", 0.0) or 0.0),
+            "wmape_all_points": (None if _get("wmape_all_points") is None else float(_get("wmape_all_points"))),
+            "bias_all_points": (None if _get("bias_all_points") is None else float(_get("bias_all_points"))),
+            "sum_abs_error_all_points": float(_get("sum_abs_error_all_points", 0.0) or 0.0),
+            "sum_signed_error_all_points": float(_get("sum_signed_error_all_points", 0.0) or 0.0),
             "cohort": str(_get("metric_cohort", "active")),
         },
         "zero_demand": {
@@ -223,33 +230,6 @@ def _official_oos_metrics_from_artifact(
             "zero": int(_get("n_leaf_zero", 0) or 0),
         },
     }
-
-
-def load_model_compare_fast(
-    *,
-    seccion: str,
-    store: str | None,
-    sku: str | None,
-    unidad: str,
-    forecast_path: str | Path | None,
-    has_value: bool,
-) -> dict[str, Any] | None:
-    """Carga bajo demanda el diagnóstico pesado v11/v12.
-
-    Se mantiene fuera del hot path del dashboard: una vista de sección puede
-    implicar millones de filas hoja y no debe bloquear el arranque normal.
-    """
-    fpath = Path(forecast_path) if forecast_path else None
-    leaves = artifacts.load_leaves_for_scope(
-        seccion,
-        store=store,
-        sku=sku,
-        forecast_path=fpath,
-        unidad=unidad,
-        has_value=has_value,
-    )
-    return _v12_model_compare(leaves)
-
 
 
 def global_leaf_ranking_from_metrics(
@@ -273,7 +253,8 @@ def global_leaf_ranking_from_metrics(
     total_col = "forecast_in_sample_total" if is_in else "forecast_oos_total"
     cols = [
         "Rank", "Unidad", "Sección", "Tienda", "Tienda descripción",
-        "SKU", "SKU descripción", "wMAPE (%)", "BIAS (%)", "Rotación",
+        "SKU", "SKU descripción", "wMAPE (%)", "BIAS (%)",
+        "wMAPE incl. y=0 (%)", "BIAS incl. y=0 (%)", "Rotación",
         "N puntos", "Días con venta", "% ≠0", "Cohort",
         vol_label, fc_label, err_label, "unique_id",
     ]
@@ -298,6 +279,14 @@ def global_leaf_ranking_from_metrics(
         bi = pl.when(den > 0).then(pl.col("sum_signed_error").cast(pl.Float64).fill_null(0.0) / den).otherwise(pl.col("bias"))
     else:
         bi = pl.col("bias")
+    if "sum_abs_error_all_points" in base.columns:
+        wm_all = pl.when(den > 0).then(pl.col("sum_abs_error_all_points").cast(pl.Float64).fill_null(0.0) / den).otherwise(pl.col("wmape_all_points") if "wmape_all_points" in base.columns else pl.lit(None))
+    else:
+        wm_all = pl.col("wmape_all_points") if "wmape_all_points" in base.columns else pl.lit(None)
+    if "sum_signed_error_all_points" in base.columns:
+        bi_all = pl.when(den > 0).then(pl.col("sum_signed_error_all_points").cast(pl.Float64).fill_null(0.0) / den).otherwise(pl.col("bias_all_points") if "bias_all_points" in base.columns else pl.lit(None))
+    else:
+        bi_all = pl.col("bias_all_points") if "bias_all_points" in base.columns else pl.lit(None)
     if total_col in base.columns:
         total_expr = pl.col(total_col).cast(pl.Float64).fill_null(0.0)
     elif "sum_yhat" in base.columns:
@@ -316,6 +305,8 @@ def global_leaf_ranking_from_metrics(
         pl.col("sku").cast(pl.Utf8).alias("SKU"),
         (wm * 100.0).alias("wMAPE (%)"),
         (bi * 100.0).alias("BIAS (%)"),
+        (wm_all * 100.0).alias("wMAPE incl. y=0 (%)"),
+        (bi_all * 100.0).alias("BIAS incl. y=0 (%)"),
         rotation_expr.alias("Rotación"),
         pl.col("n_points").fill_null(0).cast(pl.Int64).alias("N puntos"),
         pl.col("n_with_sales").fill_null(0).cast(pl.Int64).alias("Días con venta"),
@@ -407,10 +398,19 @@ def _sync_selected_leaf_metric(
     code = str(store if axis == "store" else sku)
     wm_val = None if wm is None else float(wm) * 100.0
     bi_val = None if bi is None else float(bi) * 100.0
-    return ranking.with_columns(
+    wm_all_raw = exact["wmape_all_points"][0] if "wmape_all_points" in exact.columns else None
+    bi_all_raw = exact["bias_all_points"][0] if "bias_all_points" in exact.columns else None
+    wm_all_val = None if wm_all_raw is None else float(wm_all_raw) * 100.0
+    bi_all_val = None if bi_all_raw is None else float(bi_all_raw) * 100.0
+    exprs = [
         pl.when(pl.col("Código").cast(pl.Utf8) == code).then(pl.lit(wm_val)).otherwise(pl.col("wMAPE (%)")).alias("wMAPE (%)"),
         pl.when(pl.col("Código").cast(pl.Utf8) == code).then(pl.lit(bi_val)).otherwise(pl.col("BIAS (%)")).alias("BIAS (%)"),
-    )
+    ]
+    if "wMAPE incl. y=0 (%)" in ranking.columns:
+        exprs.append(pl.when(pl.col("Código").cast(pl.Utf8) == code).then(pl.lit(wm_all_val)).otherwise(pl.col("wMAPE incl. y=0 (%)")).alias("wMAPE incl. y=0 (%)"))
+    if "BIAS incl. y=0 (%)" in ranking.columns:
+        exprs.append(pl.when(pl.col("Código").cast(pl.Utf8) == code).then(pl.lit(bi_all_val)).otherwise(pl.col("BIAS incl. y=0 (%)")).alias("BIAS incl. y=0 (%)"))
+    return ranking.with_columns(exprs)
 
 
 def _ranking_from_metrics(
@@ -433,6 +433,8 @@ def _ranking_from_metrics(
             "Descripción": pl.Utf8,
             "wMAPE (%)": pl.Float64,
             "BIAS (%)": pl.Float64,
+            "wMAPE incl. y=0 (%)": pl.Float64,
+            "BIAS incl. y=0 (%)": pl.Float64,
             label_rot: pl.Float64,
             "N puntos": pl.UInt32,
             "% ≠0": pl.Float64,
@@ -545,6 +547,9 @@ def _ranking_from_metrics(
                         pl.col("sum_abs_error").sum().alias("sum_abs_error"),
                         pl.col("sum_abs_y").sum().alias("sum_abs_y"),
                         pl.col("sum_signed_error").sum().alias("sum_signed_error"),
+                        pl.col("sum_abs_error_all_points").sum().alias("sum_abs_error_all_points") if "sum_abs_error_all_points" in leaves.columns else pl.col("sum_abs_error").sum().alias("sum_abs_error_all_points"),
+                        pl.col("sum_signed_error_all_points").sum().alias("sum_signed_error_all_points") if "sum_signed_error_all_points" in leaves.columns else pl.col("sum_signed_error").sum().alias("sum_signed_error_all_points"),
+                        pl.col("sum_abs_y_all_points").sum().alias("sum_abs_y_all_points") if "sum_abs_y_all_points" in leaves.columns else pl.col("sum_abs_y").sum().alias("sum_abs_y_all_points"),
                         pl.col("sum_y").sum().alias("sum_y"),
                         pl.col("sum_yhat").sum().alias("sum_yhat"),
                         pl.col("n_with_sales").sum().alias("n_with_sales"),
@@ -559,6 +564,14 @@ def _ranking_from_metrics(
                         .then(pl.col("sum_signed_error") / pl.col("sum_abs_y"))
                         .otherwise(0.0)
                         .alias("bias"),
+                        pl.when(pl.col("sum_abs_y_all_points") > 0)
+                        .then(pl.col("sum_abs_error_all_points") / pl.col("sum_abs_y_all_points"))
+                        .otherwise(None)
+                        .alias("wmape_all_points"),
+                        pl.when(pl.col("sum_abs_y_all_points") > 0)
+                        .then(pl.col("sum_signed_error_all_points") / pl.col("sum_abs_y_all_points"))
+                        .otherwise(None)
+                        .alias("bias_all_points"),
                         pl.concat_str(
                             [pl.lit(seccion), pl.lit("||S:"), pl.col("sku")]
                         ).alias("unique_id"),
@@ -657,6 +670,8 @@ def _ranking_from_metrics(
             "Descripción": descriptions,
             "wMAPE (%)": [float(w) * 100.0 if w is not None else None for w in tabla["wmape"].to_list()],
             "BIAS (%)": [float(b) * 100.0 if b is not None else None for b in tabla["bias"].to_list()],
+            "wMAPE incl. y=0 (%)": [float(w) * 100.0 if w is not None else None for w in (tabla["wmape_all_points"].to_list() if "wmape_all_points" in tabla.columns else [None] * tabla.height)],
+            "BIAS incl. y=0 (%)": [float(b) * 100.0 if b is not None else None for b in (tabla["bias_all_points"].to_list() if "bias_all_points" in tabla.columns else [None] * tabla.height)],
             label_rot: [float(v or 0.0) for v in tabla["sum_y"].to_list()],
             "N puntos": [int(x) for x in n_with_sales],
             "% ≠0": [float(p) for p in pct],
@@ -690,231 +705,6 @@ def _ranking_from_metrics(
 
 
 
-def _v12_model_compare(leaves: pl.DataFrame) -> dict[str, Any]:
-    """Comparación OOS final/v11/v12 + oracle por leaf (solo diagnóstico).
-
-    El oracle usa verdad OOS y por definición NO es causal ni se usa para
-    producir forecasts. Sirve para cuantificar el límite del selector actual.
-    """
-    needed = {"unique_id", "ds", "y", "yhat", "period_type", "_compare_v11", "_compare_v12"}
-    if leaves.height == 0 or not needed.issubset(leaves.columns):
-        return {}
-    x = leaves.filter(pl.col("period_type") == "out_sample")
-    if x.height == 0:
-        return {}
-    min_days = int(getattr(settings, "OOS_ACTIVE_MIN_NONZERO_DAYS", 7))
-    active = (
-        x.group_by("unique_id")
-        .agg(pl.col("ds").filter(pl.col("y") > 0).n_unique().alias("_nz"))
-        .filter(pl.col("_nz") >= min_days)
-        .select("unique_id")
-    )
-    x = x.join(active, on="unique_id", how="semi").with_columns(
-        pl.coalesce([pl.col("_compare_v12"), pl.col("_compare_v11")]).alias("_v12")
-    )
-    if x.height == 0:
-        return {}
-    by_leaf = (
-        x.group_by("unique_id")
-        .agg(
-            pl.when(pl.col("y") > 0).then(pl.col("y").abs()).otherwise(0.0).sum().alias("den"),
-            pl.when(pl.col("y") > 0).then((pl.col("y") - pl.col("_compare_v11")).abs()).otherwise(0.0).sum().alias("ae11"),
-            pl.when(pl.col("y") > 0).then((pl.col("y") - pl.col("_v12")).abs()).otherwise(0.0).sum().alias("ae12"),
-            pl.when(pl.col("y") > 0).then((pl.col("y") - pl.col("yhat")).abs()).otherwise(0.0).sum().alias("aef"),
-            pl.when(pl.col("y") > 0).then(pl.col("_compare_v11") - pl.col("y")).otherwise(0.0).sum().alias("se11"),
-            pl.when(pl.col("y") > 0).then(pl.col("_v12") - pl.col("y")).otherwise(0.0).sum().alias("se12"),
-            pl.when(pl.col("y") > 0).then(pl.col("yhat") - pl.col("y")).otherwise(0.0).sum().alias("sef"),
-            pl.col("_v12_selected").fill_null(False).max().alias("selected_v12")
-            if "_v12_selected" in x.columns else pl.lit(False).alias("selected_v12"),
-            pl.col("_cal_factor").drop_nulls().median().alias("cal_factor")
-            if "_cal_factor" in x.columns else pl.lit(None).cast(pl.Float64).alias("cal_factor"),
-            pl.col("_shape_applied").fill_null(False).max().alias("shape_applied")
-            if "_shape_applied" in x.columns else pl.lit(False).alias("shape_applied"),
-            pl.col("_cal_applied").fill_null(False).max().alias("cal_applied")
-            if "_cal_applied" in x.columns else pl.lit(False).alias("cal_applied"),
-            pl.col("_meta_probability").drop_nulls().median().alias("meta_probability")
-            if "_meta_probability" in x.columns else pl.lit(None).cast(pl.Float64).alias("meta_probability"),
-            pl.col("_meta_available").fill_null(False).max().alias("meta_available")
-            if "_meta_available" in x.columns else pl.lit(False).alias("meta_available"),
-            pl.col("_meta_top_driver").drop_nulls().first().alias("meta_top_driver")
-            if "_meta_top_driver" in x.columns else pl.lit(None).cast(pl.Utf8).alias("meta_top_driver"),
-            pl.col("_meta_threshold").drop_nulls().first().alias("meta_threshold")
-            if "_meta_threshold" in x.columns else pl.lit(None).cast(pl.Float64).alias("meta_threshold"),
-            pl.col("_meta_portfolio_mode").drop_nulls().first().alias("meta_portfolio_mode")
-            if "_meta_portfolio_mode" in x.columns else pl.lit(None).cast(pl.Utf8).alias("meta_portfolio_mode"),
-            pl.col("_meta_bias_guard_pass").fill_null(False).max().alias("meta_bias_guard_pass")
-            if "_meta_bias_guard_pass" in x.columns else pl.lit(False).alias("meta_bias_guard_pass"),
-            pl.col("_meta_policy_available").fill_null(False).max().alias("meta_policy_available")
-            if "_meta_policy_available" in x.columns else pl.lit(False).alias("meta_policy_available"),
-            pl.col("_meta_policy_utility_gain").drop_nulls().first().alias("meta_policy_utility_gain")
-            if "_meta_policy_utility_gain" in x.columns else pl.lit(None).cast(pl.Float64).alias("meta_policy_utility_gain"),
-            pl.col("_value_safety_dominance_pass").fill_null(False).max().alias("value_safety_dominance_pass")
-            if "_value_safety_dominance_pass" in x.columns else pl.lit(False).alias("value_safety_dominance_pass"),
-            pl.col("_value_safety_recent_confirmations").drop_nulls().first().alias("value_safety_recent_confirmations")
-            if "_value_safety_recent_confirmations" in x.columns else pl.lit(None).cast(pl.Int8).alias("value_safety_recent_confirmations"),
-            pl.col("_value_safety_recent_blocks").drop_nulls().first().alias("value_safety_recent_blocks")
-            if "_value_safety_recent_blocks" in x.columns else pl.lit(None).cast(pl.Int8).alias("value_safety_recent_blocks"),
-            pl.col("_value_safety_bias_coverage").drop_nulls().first().alias("value_safety_bias_coverage")
-            if "_value_safety_bias_coverage" in x.columns else pl.lit(None).cast(pl.Float64).alias("value_safety_bias_coverage"),
-            pl.col("_value_safety_bias_coverage_threshold").drop_nulls().first().alias("value_safety_bias_coverage_threshold")
-            if "_value_safety_bias_coverage_threshold" in x.columns else pl.lit(None).cast(pl.Float64).alias("value_safety_bias_coverage_threshold"),
-            pl.col("_value_safety_bias_coverage_pass").fill_null(False).max().alias("value_safety_bias_coverage_pass")
-            if "_value_safety_bias_coverage_pass" in x.columns else pl.lit(False).alias("value_safety_bias_coverage_pass"),
-            pl.col("_value_safety_meta_margin_pass").fill_null(False).max().alias("value_safety_meta_margin_pass")
-            if "_value_safety_meta_margin_pass" in x.columns else pl.lit(False).alias("value_safety_meta_margin_pass"),
-            pl.col("_value_safety_best_all_mode").drop_nulls().first().alias("value_safety_best_all_mode")
-            if "_value_safety_best_all_mode" in x.columns else pl.lit(None).cast(pl.Utf8).alias("value_safety_best_all_mode"),
-            pl.col("_value_safety_reason").drop_nulls().first().alias("value_safety_reason")
-            if "_value_safety_reason" in x.columns else pl.lit(None).cast(pl.Utf8).alias("value_safety_reason"),
-            pl.col("_v129_wf_enabled").fill_null(False).max().alias("v129_wf_enabled")
-            if "_v129_wf_enabled" in x.columns else pl.lit(False).alias("v129_wf_enabled"),
-            pl.col("_v129_wf_available").fill_null(False).max().alias("v129_wf_available")
-            if "_v129_wf_available" in x.columns else pl.lit(False).alias("v129_wf_available"),
-            pl.col("_v129_wf_folds").drop_nulls().first().alias("v129_wf_folds")
-            if "_v129_wf_folds" in x.columns else pl.lit(None).cast(pl.Int8).alias("v129_wf_folds"),
-            pl.col("_v129_wf_win_rate").drop_nulls().first().alias("v129_wf_win_rate")
-            if "_v129_wf_win_rate" in x.columns else pl.lit(None).cast(pl.Float64).alias("v129_wf_win_rate"),
-            pl.col("_v129_wf_median_gain").drop_nulls().first().alias("v129_wf_median_gain")
-            if "_v129_wf_median_gain" in x.columns else pl.lit(None).cast(pl.Float64).alias("v129_wf_median_gain"),
-            pl.col("_v129_wf_worst_gain").drop_nulls().first().alias("v129_wf_worst_gain")
-            if "_v129_wf_worst_gain" in x.columns else pl.lit(None).cast(pl.Float64).alias("v129_wf_worst_gain"),
-            pl.col("_v129_wf_weighted_gain").drop_nulls().first().alias("v129_wf_weighted_gain")
-            if "_v129_wf_weighted_gain" in x.columns else pl.lit(None).cast(pl.Float64).alias("v129_wf_weighted_gain"),
-            pl.col("_v129_wf_weighted_utility_gain").drop_nulls().first().alias("v129_wf_weighted_utility_gain")
-            if "_v129_wf_weighted_utility_gain" in x.columns else pl.lit(None).cast(pl.Float64).alias("v129_wf_weighted_utility_gain"),
-            pl.col("_v129_wf_bias_worsen_max").drop_nulls().first().alias("v129_wf_bias_worsen_max")
-            if "_v129_wf_bias_worsen_max" in x.columns else pl.lit(None).cast(pl.Float64).alias("v129_wf_bias_worsen_max"),
-            pl.col("_v129_wf_meta_folds").drop_nulls().first().alias("v129_wf_meta_folds")
-            if "_v129_wf_meta_folds" in x.columns else pl.lit(None).cast(pl.Int8).alias("v129_wf_meta_folds"),
-            pl.col("_v129_wf_reason").drop_nulls().first().alias("v129_wf_reason")
-            if "_v129_wf_reason" in x.columns else pl.lit(None).cast(pl.Utf8).alias("v129_wf_reason"),
-        )
-        .with_columns((pl.col("ae12") < pl.col("ae11")).alias("oracle_v12"))
-        .with_columns(
-            pl.when(pl.col("oracle_v12")).then(pl.col("ae12")).otherwise(pl.col("ae11")).alias("ae_oracle"),
-            pl.when(pl.col("oracle_v12")).then(pl.col("se12")).otherwise(pl.col("se11")).alias("se_oracle"),
-        )
-    )
-    sums = by_leaf.select(
-        pl.col("den").sum(), pl.col("aef").sum(), pl.col("ae11").sum(),
-        pl.col("ae12").sum(), pl.col("ae_oracle").sum(), pl.col("sef").sum(),
-        pl.col("se11").sum(), pl.col("se12").sum(), pl.col("se_oracle").sum(),
-        pl.col("selected_v12").sum().alias("selected_v12"),
-        pl.col("oracle_v12").sum().alias("oracle_v12"),
-        pl.col("cal_factor").drop_nulls().median().alias("cal_factor"),
-        pl.col("shape_applied").sum().alias("shape_applied"),
-        pl.col("cal_applied").sum().alias("cal_applied"),
-        pl.col("meta_probability").drop_nulls().median().alias("meta_probability"),
-        pl.col("meta_probability").filter(pl.col("selected_v12")).drop_nulls().median().alias("meta_probability_selected"),
-        pl.col("meta_available").sum().alias("meta_available"),
-        pl.col("meta_threshold").drop_nulls().median().alias("meta_threshold"),
-        pl.col("meta_bias_guard_pass").sum().alias("meta_bias_guard_pass"),
-        pl.col("meta_policy_available").sum().alias("meta_policy_available"),
-        pl.col("meta_policy_utility_gain").drop_nulls().median().alias("meta_policy_utility_gain"),
-        pl.col("value_safety_dominance_pass").max().alias("value_safety_dominance_pass"),
-        pl.col("value_safety_recent_confirmations").drop_nulls().median().alias("value_safety_recent_confirmations"),
-        pl.col("value_safety_recent_blocks").drop_nulls().median().alias("value_safety_recent_blocks"),
-        pl.col("value_safety_bias_coverage").drop_nulls().median().alias("value_safety_bias_coverage"),
-        pl.col("value_safety_bias_coverage_threshold").drop_nulls().median().alias("value_safety_bias_coverage_threshold"),
-        pl.col("value_safety_bias_coverage_pass").max().alias("value_safety_bias_coverage_pass"),
-        pl.col("value_safety_meta_margin_pass").max().alias("value_safety_meta_margin_pass"),
-        pl.col("value_safety_best_all_mode").drop_nulls().first().alias("value_safety_best_all_mode"),
-        pl.col("value_safety_reason").drop_nulls().first().alias("value_safety_reason"),
-        pl.col("v129_wf_enabled").max().alias("v129_wf_enabled"),
-        pl.col("v129_wf_available").max().alias("v129_wf_available"),
-        pl.col("v129_wf_folds").drop_nulls().first().alias("v129_wf_folds"),
-        pl.col("v129_wf_win_rate").drop_nulls().first().alias("v129_wf_win_rate"),
-        pl.col("v129_wf_median_gain").drop_nulls().first().alias("v129_wf_median_gain"),
-        pl.col("v129_wf_worst_gain").drop_nulls().first().alias("v129_wf_worst_gain"),
-        pl.col("v129_wf_weighted_gain").drop_nulls().first().alias("v129_wf_weighted_gain"),
-        pl.col("v129_wf_weighted_utility_gain").drop_nulls().first().alias("v129_wf_weighted_utility_gain"),
-        pl.col("v129_wf_bias_worsen_max").drop_nulls().first().alias("v129_wf_bias_worsen_max"),
-        pl.col("v129_wf_meta_folds").drop_nulls().first().alias("v129_wf_meta_folds"),
-        pl.col("v129_wf_reason").drop_nulls().first().alias("v129_wf_reason"),
-    ).row(0, named=True)
-    den = float(sums["den"] or 0.0)
-    if den <= 0:
-        return {}
-    def scenario(ae: str, se: str) -> dict[str, float]:
-        return {"wmape": float(sums[ae] or 0.0) / den, "bias": float(sums[se] or 0.0) / den}
-
-    daily = (
-        x.group_by("ds")
-        .agg(
-            pl.col("y").sum().alias("actual"),
-            pl.col("yhat").sum().alias("final"),
-            pl.col("_compare_v11").sum().alias("v11"),
-            pl.col("_v12").sum().alias("v12"),
-        )
-        .sort("ds")
-    )
-    n = by_leaf.height
-    top_driver = None
-    if "meta_top_driver" in by_leaf.columns:
-        td = (
-            by_leaf.filter(pl.col("selected_v12") & pl.col("meta_top_driver").is_not_null())
-            .group_by("meta_top_driver")
-            .len()
-            .sort("len", descending=True)
-            .head(1)
-        )
-        if td.height:
-            top_driver = str(td["meta_top_driver"][0])
-    portfolio_mode = None
-    if "meta_portfolio_mode" in by_leaf.columns:
-        pm = by_leaf.group_by("meta_portfolio_mode").len().sort("len", descending=True).head(1)
-        if pm.height and pm["meta_portfolio_mode"][0] is not None:
-            portfolio_mode = str(pm["meta_portfolio_mode"][0])
-    return {
-        "scenarios": {
-            "Final seleccionado": scenario("aef", "sef"),
-            "v11 incumbent": scenario("ae11", "se11"),
-            "v12 all": scenario("ae12", "se12"),
-            "Oracle v11/v12 (no causal)": scenario("ae_oracle", "se_oracle"),
-        },
-        "n_active": n,
-        "selected_v12": int(sums["selected_v12"] or 0),
-        "oracle_v12": int(sums["oracle_v12"] or 0),
-        "selector_gap": scenario("aef", "sef")["wmape"] - scenario("ae_oracle", "se_oracle")["wmape"],
-        "cal_factor_median": float(sums["cal_factor"]) if sums["cal_factor"] is not None else None,
-        "shape_applied_pct": float(sums["shape_applied"] or 0) / max(n, 1),
-        "cal_applied_pct": float(sums["cal_applied"] or 0) / max(n, 1),
-        "meta_probability_median": float(sums["meta_probability"]) if sums["meta_probability"] is not None else None,
-        "meta_probability_selected_median": float(sums["meta_probability_selected"]) if sums["meta_probability_selected"] is not None else None,
-        "meta_available_pct": float(sums["meta_available"] or 0) / max(n, 1),
-        "meta_top_driver": top_driver,
-        "meta_threshold": (
-            float(sums["meta_threshold"])
-            if sums["meta_threshold"] is not None
-            else float(getattr(settings, "V12_META_SELECTOR_THRESHOLD", 0.55))
-        ),
-        "meta_portfolio_mode": portfolio_mode,
-        "meta_bias_guard_pass_pct": float(sums["meta_bias_guard_pass"] or 0) / max(n, 1),
-        "meta_policy_available_pct": float(sums["meta_policy_available"] or 0) / max(n, 1),
-        "meta_policy_utility_gain": float(sums["meta_policy_utility_gain"]) if sums["meta_policy_utility_gain"] is not None else None,
-        "value_safety_dominance_pass": bool(sums["value_safety_dominance_pass"]),
-        "value_safety_recent_confirmations": int(sums["value_safety_recent_confirmations"] or 0),
-        "value_safety_recent_blocks": int(sums["value_safety_recent_blocks"] or 0),
-        "value_safety_bias_coverage": float(sums["value_safety_bias_coverage"]) if sums["value_safety_bias_coverage"] is not None else None,
-        "value_safety_bias_coverage_threshold": float(sums["value_safety_bias_coverage_threshold"]) if sums["value_safety_bias_coverage_threshold"] is not None else None,
-        "value_safety_bias_coverage_pass": bool(sums["value_safety_bias_coverage_pass"]),
-        "value_safety_meta_margin_pass": bool(sums["value_safety_meta_margin_pass"]),
-        "value_safety_best_all_mode": str(sums["value_safety_best_all_mode"]) if sums["value_safety_best_all_mode"] is not None else None,
-        "value_safety_reason": str(sums["value_safety_reason"]) if sums["value_safety_reason"] is not None else None,
-        "v129_wf_enabled": bool(sums["v129_wf_enabled"]),
-        "v129_wf_available": bool(sums["v129_wf_available"]),
-        "v129_wf_folds": int(sums["v129_wf_folds"] or 0),
-        "v129_wf_win_rate": float(sums["v129_wf_win_rate"]) if sums["v129_wf_win_rate"] is not None else None,
-        "v129_wf_median_gain": float(sums["v129_wf_median_gain"]) if sums["v129_wf_median_gain"] is not None else None,
-        "v129_wf_worst_gain": float(sums["v129_wf_worst_gain"]) if sums["v129_wf_worst_gain"] is not None else None,
-        "v129_wf_weighted_gain": float(sums["v129_wf_weighted_gain"]) if sums["v129_wf_weighted_gain"] is not None else None,
-        "v129_wf_weighted_utility_gain": float(sums["v129_wf_weighted_utility_gain"]) if sums["v129_wf_weighted_utility_gain"] is not None else None,
-        "v129_wf_bias_worsen_max": float(sums["v129_wf_bias_worsen_max"]) if sums["v129_wf_bias_worsen_max"] is not None else None,
-        "v129_wf_meta_folds": int(sums["v129_wf_meta_folds"] or 0),
-        "v129_wf_reason": str(sums["v129_wf_reason"]) if sums["v129_wf_reason"] is not None else None,
-        "daily": {c: daily[c].to_list() for c in daily.columns},
-    }
-
 def prepare_dashboard_state_fast(
     *,
     index: dict[str, Any],
@@ -945,6 +735,11 @@ def prepare_dashboard_state_fast(
             unidad=unidad,
             has_value=has_value,
         )
+
+    # SKU+Tienda: derive EDP only for the selected leaf (hundreds of rows).
+    # This keeps the dashboard hot path fast and avoids leaf-wide EDP materialization.
+    if node_kind == "tienda_sku" and df_daily.height:
+        df_daily = add_leaf_edp(df_daily)
 
     horizons = _horizons_from_index(index, seccion, df_daily)
     test_start = horizons.get("test_start")
@@ -1002,15 +797,12 @@ def prepare_dashboard_state_fast(
     ranking_tiendas = _pin_selected(ranking_tiendas, store)
     ranking_skus = _pin_selected(ranking_skus, sku)
 
-    # Hot path: ``metrics.parquet`` ya contiene la métrica OOS bottom-up
-    # Active oficial. Recalcularla cargando todas las hojas de una sección es
-    # lento y, además, comparar contra la serie padre agregada mezcla
-    # definiciones. El diagnóstico v11/v12 queda bajo demanda en dashboard.py.
+    # Hot path: ``metrics.parquet`` contiene la métrica OOS bottom-up Active
+    # oficial. No se recalcula cargando todas las hojas de una sección.
     metrics_io = _official_oos_metrics_from_artifact(
         metrics, selected_id=selected_id, unidad=unidad
     )
     metrics_28 = backend.metrics_rolling28(df_view)
-    model_compare = None
     consistency_warnings = (
         []
         if metrics_io
@@ -1063,11 +855,11 @@ def prepare_dashboard_state_fast(
         store_context=store_context,
         chart=chart,
         detail=detail,
+        audit_daily=df_daily,
         ds_min=ds_min,
         ds_max=ds_max,
         cutoff=cutoff,
         consistency_warnings=consistency_warnings,
-        model_compare=model_compare,
         has_value_cols=has_value,
     )
 
@@ -1154,6 +946,8 @@ def prepare_dashboard_state(
         df_daily = _aggregate_pure_sku(unit_df, seccion, sku)
     else:
         df_daily = backend.filter_series(unit_df, selected_id)
+    if node_kind == "tienda_sku" and df_daily.height:
+        df_daily = add_leaf_edp(df_daily)
 
     horizons = backend.resolve_horizons(df_daily, seccion, cols)
     train_end = horizons["train_end"]
@@ -1215,14 +1009,6 @@ def prepare_dashboard_state(
         selected_code=sku,
     )
 
-    # Diagnóstico v12.7 sobre las hojas del alcance, usando la unidad ya normalizada.
-    leaves_scope = unit_df.filter(pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2)
-    if store is not None:
-        leaves_scope = leaves_scope.filter(pl.col("unique_id").str.contains(f"||T:{store}||", literal=True))
-    if sku is not None:
-        leaves_scope = leaves_scope.filter(pl.col("unique_id").str.ends_with(f"||S:{sku}"))
-    model_compare = _v12_model_compare(leaves_scope)
-
     # Métricas oficiales SIEMPRE bottom-up desde hojas SKU+tienda.
     metrics = backend.metrics_in_out_bottom_up(
         unit_df,
@@ -1278,10 +1064,10 @@ def prepare_dashboard_state(
         store_context=store_context,
         chart=chart,
         detail=detail,
+        audit_daily=df_daily,
         ds_min=ds_min,
         ds_max=ds_max,
         cutoff=cutoff,
         consistency_warnings=[],
-        model_compare=model_compare,
         has_value_cols=has_value,
     )

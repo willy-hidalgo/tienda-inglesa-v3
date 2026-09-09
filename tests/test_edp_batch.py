@@ -77,10 +77,10 @@ def test_edp_batched_matches_per_series_loop():
 def test_edp_batch_falls_back_on_failure(monkeypatch):
     """Si la llamada batched con indexors falla, debe caer al loop por serie
     en vez de propagar la excepción (robustez de producción)."""
-    import forecasts
+    import app.forecasting.pipeline as pipeline_mod
 
     panel = _synthetic_panel()
-    original = forecasts.decompose_price
+    original = pipeline_mod.decompose_price
 
     def _boom_only_for_indexors(*args, **kwargs):
         # Simula un fallo específico del camino batched (p.ej. numba no
@@ -91,7 +91,7 @@ def test_edp_batch_falls_back_on_failure(monkeypatch):
             raise RuntimeError("numba boom (batched indexors)")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(forecasts, "decompose_price", _boom_only_for_indexors)
+    monkeypatch.setattr(pipeline_mod, "decompose_price", _boom_only_for_indexors)
     out = RLSForecastPipeline._calculate_edp(panel)
     assert out.height == panel.height
     assert {"asp", "edp", "discount"} <= set(out.columns)

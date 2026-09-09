@@ -7,7 +7,6 @@ filtro de locales por sección en un solo join.
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 import sys
 from dataclasses import dataclass

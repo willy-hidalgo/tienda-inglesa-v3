@@ -231,3 +231,30 @@ def test_nesting_sums_leaf_le_store_le_section():
     sec_y = float(bu.filter(pl.col("unique_id") == "1")["sum_y"][0])
     assert leaf_y <= store_y + 1e-9
     assert store_y <= sec_y + 1e-9
+
+
+def test_backend_all_points_metrics_include_zero_y_without_changing_official_metric():
+    """Prueba ácida: y=0 entra solo en métricas all-points; oficial queda intacta."""
+    bu = backend.wmape_bottom_up(_ejemplo_df())
+
+    store = bu.filter(pl.col("unique_id") == "1||T:00001")
+    assert store.height == 1
+    assert abs(store["wmape"][0] - 16 / 32) < 1e-9
+    assert abs(store["bias"][0] - (-4 / 32)) < 1e-9
+    assert abs(store["wmape_all_points"][0] - 21 / 32) < 1e-9
+    assert abs(store["bias_all_points"][0] - (1 / 32)) < 1e-9
+
+    sec = bu.filter(pl.col("unique_id") == "1")
+    assert sec.height == 1
+    assert abs(sec["wmape"][0] - 63 / 85) < 1e-9
+    assert abs(sec["bias"][0] - (-3 / 85)) < 1e-9
+    assert abs(sec["wmape_all_points"][0] - 68 / 85) < 1e-9
+    assert abs(sec["bias_all_points"][0] - (2 / 85)) < 1e-9
+
+
+def test_backend_all_points_metric_is_same_pass_components():
+    """Las nuevas métricas se materializan desde componentes del mismo group_by."""
+    bu = backend.wmape_bottom_up(_ejemplo_df())
+    row = bu.filter(pl.col("unique_id") == "1").row(0, named=True)
+    assert abs(row["wmape_all_points"] - row["sum_abs_error_all_points"] / row["sum_abs_y"]) < 1e-12
+    assert abs(row["bias_all_points"] - row["sum_signed_error_all_points"] / row["sum_abs_y"]) < 1e-12

@@ -4,7 +4,6 @@ import datetime as dt
 import gc
 import logging
 import shutil
-import sys
 import time
 from pathlib import Path
 import numpy as np
@@ -24,29 +23,26 @@ from app.forecasting.utils import _stage_timer, _collect_streaming, _lf_columns
 logger = logging.getLogger(__name__)
 
 
-def _decompose_price_callable():
-    """Return the active EDP implementation, honoring the legacy facade.
-
-    Older callers/tests monkeypatch ``forecasts.decompose_price``. Production
-    code imports the implementation here directly. Consulting the facade when
-    present preserves that compatibility without changing normal execution.
-    """
-    facade = sys.modules.get("forecasts")
-    if facade is not None and hasattr(facade, "decompose_price"):
-        return getattr(facade, "decompose_price")
-    return decompose_price
-
 class RLSForecastPipeline:
     def __init__(
         self,
         config: ForecastConfig,
         n_jobs: int | None = None,
         limit_series: int | None = None,
+        optimization_diagnostics: bool = False,
+        optimization_phase2: bool = False,
     ):
         self._cfg = config
         # n_jobs = Nº de threads (ver docstring RLSForecastRunner)
         self._n_jobs = n_jobs
         self._limit_series = limit_series
+        self._optimization_diagnostics = bool(optimization_diagnostics)
+        self._optimization_phase2 = bool(optimization_phase2)
+        self._optimization_ses_frames: list[pl.DataFrame] = []
+        self._optimization_leaf_parent_frames: list[pl.DataFrame] = []
+        self._optimization_rls_frames: list[pl.DataFrame] = []
+        self._optimization_driver_frames: list[pl.DataFrame] = []
+        self._optimization_driver_refit_frames: list[pl.DataFrame] = []
         self._calendar: HolidayCalendar | None = None
         self._feature_builder: CalendarFeatureBuilder | None = None
         self._aggregator = DataAggregator(
@@ -55,6 +51,23 @@ class RLSForecastPipeline:
             config.price_column,
             config.aggregation_levels,
         )
+
+    def optimization_diagnostics(self) -> dict[str, pl.DataFrame]:
+        """Return compact statistical-tuning artifacts collected during a run."""
+        def _concat(frames: list[pl.DataFrame]) -> pl.DataFrame:
+            return (
+                pl.concat([f for f in frames if f.height], how="diagonal_relaxed")
+                if any(f.height for f in frames)
+                else pl.DataFrame()
+            )
+
+        return {
+            "ses_candidates": _concat(self._optimization_ses_frames),
+            "leaf_parent_candidates": _concat(self._optimization_leaf_parent_frames),
+            "rls_candidates": _concat(self._optimization_rls_frames),
+            "driver_screen": _concat(self._optimization_driver_frames),
+            "driver_refit": _concat(self._optimization_driver_refit_frames),
+        }
 
     def _load(self) -> pl.LazyFrame:
         """
@@ -252,11 +265,7 @@ class RLSForecastPipeline:
         groups = df.sort(["unique_id", "ds"]).partition_by(
             "unique_id", maintain_order=True
         )
-        decomp = _decompose_price_callable()
-        if not decomp:
-            raise TypeError(
-                "El componente decompose_price no ha sido definido, instalar tqdm y probar nuevamente..."
-            )
+        decomp = decompose_price
         for part in tqdm(
             groups,
             desc="EDP (loop)",
@@ -274,9 +283,6 @@ class RLSForecastPipeline:
                 "asp": np.asarray(asp, dtype=np.float64).ravel(),
                 "edp": np.asarray(edp, dtype=np.float64).ravel(),
                 "discount": np.asarray(discount, dtype=np.float64).ravel(),
-                # "asp": np.asarray(asp, dtype=np.float32).ravel(),
-                # "edp": np.asarray(edp, dtype=np.float32).ravel(),
-                # "discount": np.asarray(discount, dtype=np.float32).ravel(),
             }
             for name, arr in computed.items():
                 if arr.shape[0] != part.height:
@@ -303,20 +309,18 @@ class RLSForecastPipeline:
         `decompose_price` ya soporta `indexors: Sequence[slice]`; solo había
         que construir los slices por grupo y llamarlo una vez.
 
-        Fallback vectorizado aproximado si no hay rls_opt o hay demasiadas
-        series (umbral); fallback a loop por serie si el batch falla.
+        Fallback vectorizado aproximado cuando hay demasiadas series
+        (umbral); fallback a loop por serie si el batch falla.
         """
         if df.height == 0:
             return df
         n_series = df["unique_id"].n_unique()
-        decomp = _decompose_price_callable()
-        use_fast = decomp is None or n_series > 5000
-        if use_fast:
-            if decomp is not None and n_series > 5000:
-                logger.warning(
-                    "EDP: %d series → modo rápido vectorizado (umbral 5000)",
-                    n_series,
-                )
+        decomp = decompose_price
+        if n_series > 5000:
+            logger.warning(
+                "EDP: %d series → modo rápido vectorizado (umbral 5000)",
+                n_series,
+            )
             return df.with_columns(
                 (pl.col("value") / pl.col("y").clip(lower_bound=1e-8))
                 .fill_nan(0.0)
@@ -427,7 +431,7 @@ class RLSForecastPipeline:
             (pl.col(date_col) >= hz["test_start"])
             & (pl.col(date_col) <= hz["test_end"])
         )
-        # v11.2: OOS is the latest 28 actual days. By contract there is no
+        # OOS is the latest 28 actual days. By contract there is no
         # actual_extension or observed_tail after OOS.
 
         # ── Agregación TRAIN: separar nodos RLS de hojas SKU+tienda ───────────
@@ -548,7 +552,7 @@ class RLSForecastPipeline:
                 df_oos.shape,
             )
 
-        # v11.2: no post-OOS actual period exists; OOS ends at last_actual.
+        # No existe un período observado posterior a OOS; OOS termina en last_actual.
 
         # ── Forecast-only (calendario sintético + carry-forward de precios) ───
         uids = df_train["unique_id"].unique().to_list()
@@ -614,8 +618,9 @@ class RLSForecastPipeline:
             rmse_error=self._cfg.rmse_error,
             forgetting_factor=self._cfg.forgetting_factor,
             min_y_to_update=self._cfg.min_y_to_update,
-            use_correction_factor=self._cfg.correction_factor,
             n_jobs=self._n_jobs,
+            optimization_diagnostics=self._optimization_diagnostics,
+            optimization_phase2=self._optimization_phase2,
         )
 
         meta = {
@@ -657,16 +662,8 @@ class RLSForecastPipeline:
 
         if res_section.height:
             res_section = res_section.with_columns(
-                pl.when(pl.col("period_type") == "forecast_only")
-                .then(0.0)
-                .otherwise(pl.col("y"))
-                .alias("y"),
-                pl.when(pl.col("period_type") == "forecast_only")
-                .then(0.0)
-                .otherwise(pl.col("value"))
-                .alias("value"),
-                pl.lit(None).cast(pl.Float64).alias("driver_effect"),
-                pl.lit(None).cast(pl.Float64).alias("driver_effect_value"),
+                pl.when(pl.col("period_type") == "forecast_only").then(0.0).otherwise(pl.col("y")).alias("y"),
+                pl.when(pl.col("period_type") == "forecast_only").then(0.0).otherwise(pl.col("value")).alias("value"),
             )
 
         if not section_coefs:
@@ -678,7 +675,7 @@ class RLSForecastPipeline:
             return res_section, pl.DataFrame(), driver_cols
 
         # ── 2) RLS a nivel tienda: batch único ────────────────────────────
-        # v11.2 elimina el bucle externo store-by-store. El runner particiona
+        # El runner evita el bucle externo store-by-store y particiona
         # train/targets una sola vez y paraleliza UIDs independientes.
         locales = settings.SECCIONES[seccion]["locales"]
         store_uids = [
@@ -702,16 +699,8 @@ class RLSForecastPipeline:
 
         if res_store.height:
             res_store = res_store.with_columns(
-                pl.when(pl.col("period_type") == "forecast_only")
-                .then(0.0)
-                .otherwise(pl.col("y"))
-                .alias("y"),
-                pl.when(pl.col("period_type") == "forecast_only")
-                .then(0.0)
-                .otherwise(pl.col("value"))
-                .alias("value"),
-                pl.lit(None).cast(pl.Float64).alias("driver_effect"),
-                pl.lit(None).cast(pl.Float64).alias("driver_effect_value"),
+                pl.when(pl.col("period_type") == "forecast_only").then(0.0).otherwise(pl.col("y")).alias("y"),
+                pl.when(pl.col("period_type") == "forecast_only").then(0.0).otherwise(pl.col("value")).alias("value"),
             )
 
         logger.info(
@@ -722,18 +711,13 @@ class RLSForecastPipeline:
             len(store_uids),
         )
 
-        # ── 3) SKU+tienda — única ruta productiva v11 ─────────────────────
-        # SES puro = nivel base. RLS tienda/sección aporta forma y, cuando
-        # gana causalmente, también el uplift de nivel del bloque.
-        # No existen rutas alternativas ni fallbacks legacy.
+        # ── 3) SKU+tienda — única ruta productiva SES+RLS ──────────────────
+        # El SES estima la magnitud positiva de la hoja; el RLS elegido
+        # (tienda o sección) aporta exactamente el mismo efecto de drivers que
+        # usa su nodo padre. No existe una segunda familia de modelo leaf.
         res_derived = pl.DataFrame()
-        if not bool(getattr(settings, "FAST_LEAF_MODE", True)):
-            raise RuntimeError(
-                "v11 requiere FAST_LEAF_MODE=True; la ruta SKU+tienda legacy "
-                "fue eliminada para evitar implementaciones estadísticas paralelas."
-            )
 
-        with _stage_timer(f"{seccion}: SKU+tienda v11 SES+RLS"):
+        with _stage_timer(f"{seccion}: SKU+tienda SES+RLS"):
             parent_forecasts = (
                 pl.concat(
                     [f for f in (res_section, res_store) if f.height],
@@ -742,25 +726,44 @@ class RLSForecastPipeline:
                 if (res_section.height or res_store.height)
                 else pl.DataFrame()
             )
-            res_derived = runner.fast_leaf_forecasts(
+            res_derived = runner.predict_leaf_series(
                 train_leaves,
                 oos_leaves,
                 seccion,
                 hz,
                 meta=meta,
                 parent_forecasts=parent_forecasts,
+                diagnostics_out=(
+                    self._optimization_ses_frames
+                    if self._optimization_diagnostics
+                    else None
+                ),
+                parent_diagnostics_out=(
+                    self._optimization_leaf_parent_frames
+                    if self._optimization_diagnostics and self._optimization_phase2
+                    else None
+                ),
             )
 
         logger.info(
-            "Sección %s: %d filas SKU+tienda v11",
+            "Sección %s: %d filas SKU+tienda SES+RLS",
             seccion,
             res_derived.height,
         )
 
-        # ── Corrección de sesgo SOLO en padres + combinación ─────────────────
-        # SKU+tienda is explicitly excluded from post-hoc bias correction.
-        # Never join bias factors across millions of leaf rows merely to leave
-        # them unchanged: correct the tiny section/store frame first, then concat.
+        if self._optimization_diagnostics:
+            rls_diag = runner.optimization_candidate_frame()
+            driver_diag = runner.optimization_driver_frame()
+            driver_refit_diag = runner.optimization_driver_refit_frame()
+            if rls_diag.height:
+                self._optimization_rls_frames.append(rls_diag)
+            if driver_diag.height:
+                self._optimization_driver_frames.append(driver_diag)
+            if driver_refit_diag.height:
+                self._optimization_driver_refit_frames.append(driver_refit_diag)
+
+        # Una sola familia de modelo en los tres períodos. No se aplican
+        # correcciones post-hoc que modifiquen únicamente OOS/forecast-only.
         parent_res = (
             pl.concat(
                 [f for f in (res_section, res_store) if f.height],
@@ -769,16 +772,6 @@ class RLSForecastPipeline:
             if (res_section.height or res_store.height)
             else pl.DataFrame()
         )
-        if getattr(settings, "BIAS_CORRECTION", True) and parent_res.height:
-            with _stage_timer(f"{seccion}: bias correction padres OOS"):
-                parent_res = RLSForecastRunner.apply_bias_correction(parent_res)
-            logger.info(
-                "Sección %s: bias correction padres aplicada (min_points=%s, clip=%s)",
-                seccion,
-                getattr(settings, "BIAS_CORRECTION_MIN_POINTS", 7),
-                getattr(settings, "BIAS_CORRECTION_CLIP", (0.5, 2.0)),
-            )
-
         res_df = pl.concat(
             [f for f in (parent_res, res_derived) if f.height],
             how="diagonal_relaxed",
@@ -828,7 +821,7 @@ class RLSForecastPipeline:
         memory_safe = (
             bool(getattr(settings, "MULTIBLOCK_MEMORY_SAFE", True))
             and int(getattr(settings, "RLS_BLOCK_DAYS", 28))
-            < int(getattr(settings, "MULTIBLOCK_MEMORY_SAFE_THRESHOLD_DAYS", 28))
+            <= int(getattr(settings, "MULTIBLOCK_MEMORY_SAFE_THRESHOLD_DAYS", 28))
         )
         section_spill_dir = self._cfg.out_dir / "_section_spill"
         if memory_safe:
@@ -977,7 +970,7 @@ class RLSForecastPipeline:
             logger.warning("Sin filas forecast-only a nivel SKU para export Excel")
             return
 
-        # Parse unique_id completamente en Polars.  v11.2 convertía ~1M filas
+        # Parse unique_id completamente en Polars para evitar conversiones masivas
         # forecast-only a listas Python y llamaba split_unique_id por fila.
         parts = sku_level.with_columns(
             pl.col("unique_id").str.split("||").list.get(0).alias("SECCION"),

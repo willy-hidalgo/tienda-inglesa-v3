@@ -46,150 +46,26 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 20
+ARTIFACT_VERSION = 22
 
 SERIES_COLS_PREFERRED = [
-    "unique_id",
-    "ds",
-    "y",
-    "yhat",
-    "yhat28",
-    "value",
-    "valuehat",
-    "valuehat28",
-    "period_type",
-    "update_block_days",
-    "sku_desc",
-    "store_name",
-    "seccion",
-    "train_start",
-    "train_end",
-    "test_start",
-    "test_end",
-    "forecast_start",
-    "forecast_end",
-    # Dashboard v12.9.11 BU visual contract: daily leaf-level error components.
-    # These do NOT redefine official wMAPE; they expose the exact bottom-up
-    # numerator/denominator contributions behind the existing metric.
-    "bu_abs_error_daily_y",
-    "bu_abs_y_daily_y",
-    "bu_signed_error_daily_y",
-    "bu_abs_error_daily_value",
-    "bu_abs_y_daily_value",
-    "bu_signed_error_daily_value",
-    "ses_level_y",
-    "ses_level_value",
-    "driver_effect",
-    "driver_effect_value",
-    "driver_factor_y",
-    "driver_factor_value",
-    "driver_strength_y",
-    "driver_strength_value",
-    "ses_recent28_y",
-    "ses_recent28_value",
-    "ses_recent14_y",
-    "ses_recent14_value",
-    "ses_recent28_coverage_y",
-    "ses_recent28_coverage_value",
-    "ses_regime_anchor_y",
-    "ses_regime_anchor_value",
-    "ses_stability_reference_y",
-    "ses_stability_reference_value",
-    "ses_stability_guard_y",
-    "ses_stability_guard_value",
-    "rls_metric_eligible",
-    "rls_block",
-    "rls_train_days",
-    # v12.8: candidatos, meta-selector y challengers para diagnóstico visual.
-    "v11_yhat_raw_before_v12",
-    "v11_valuehat_raw_before_v12",
-    "v12_candidate_yhat_raw",
-    "v12_candidate_valuehat_raw",
-    "v12_selected_y",
-    "v12_selected_value",
-    "leaf_model_family_y",
-    "leaf_model_family_value",
-    "v12_sku_forecast_uncalibrated_y",
-    "v12_sku_forecast_uncalibrated_value",
-    "v12_sku_forecast_calibrated_challenger_y",
-    "v12_sku_forecast_calibrated_challenger_value",
-    "v12_sku_level_calibration_applied_y",
-    "v12_sku_level_calibration_applied_value",
-    "v12_sku_forecast_base_y",
-    "v12_sku_forecast_base_value",
-    "v12_sku_forecast_y",
-    "v12_sku_forecast_value",
-    "v12_sku_level_calibration_raw_ratio_y",
-    "v12_sku_level_calibration_raw_ratio_value",
-    "v12_sku_level_calibration_factor_y",
-    "v12_sku_level_calibration_factor_value",
-    "v12_sku_level_calibration_blocks_y",
-    "v12_sku_level_calibration_blocks_value",
-    "v12_sku_shape_applied_y",
-    "v12_sku_shape_applied_value",
-    "v12_sku_shape_model_y",
-    "v12_sku_shape_model_value",
-    "v12_validation_improvement_y",
-    "v12_validation_improvement_value",
-    "v12_validation_utility_improvement_y",
-    "v12_validation_utility_improvement_value",
-    "v12_validation_recent_improvement_y",
-    "v12_validation_recent_improvement_value",
-    "v12_validation_recent_utility_improvement_y",
-    "v12_validation_recent_utility_improvement_value",
-    "v12_meta_probability_y",
-    "v12_meta_probability_value",
-    "v12_meta_model_available_y",
-    "v12_meta_model_available_value",
-    "v12_meta_training_rows_y",
-    "v12_meta_training_rows_value",
-    "v12_meta_recent_gain_y",
-    "v12_meta_recent_gain_value",
-    "v12_meta_weighted_gain_y",
-    "v12_meta_weighted_gain_value",
-    "v12_meta_win_rate_y",
-    "v12_meta_win_rate_value",
-    "v12_meta_top_driver_y",
-    "v12_meta_top_driver_value",
-    "v12_meta_bias11_y",
-    "v12_meta_bias11_value",
-    "v12_meta_bias12_y",
-    "v12_meta_bias12_value",
-    "v12_meta_bias_guard_pass_y",
-    "v12_meta_bias_guard_pass_value",
-    "v12_meta_threshold_y",
-    "v12_meta_threshold_value",
-    "v12_meta_portfolio_mode_y",
-    "v12_meta_portfolio_mode_value",
-    "v12_meta_policy_available_y",
-    "v12_meta_policy_available_value",
-    "v12_meta_policy_utility_gain_y",
-    "v12_meta_policy_utility_gain_value",
-    "v12_value_safety_enabled",
-    "v12_value_safety_dominance_pass",
-    "v12_value_safety_recent_confirmations",
-    "v12_value_safety_recent_blocks",
-    "v12_value_safety_bias_coverage",
-    "v12_value_safety_bias_coverage_threshold",
-    "v12_value_safety_bias_coverage_pass",
-    "v12_value_safety_meta_margin_pass",
-    "v12_value_safety_best_all_mode",
-    "v12_value_safety_reason",
-    "v129_value_wf_enabled",
-    "v129_value_wf_available",
-    "v129_value_wf_folds",
-    "v129_value_wf_win_rate",
-    "v129_value_wf_median_gain",
-    "v129_value_wf_worst_gain",
-    "v129_value_wf_weighted_gain",
-    "v129_value_wf_weighted_utility_gain",
-    "v129_value_wf_bias_worsen_max",
-    "v129_value_wf_meta_folds",
-    "v129_value_wf_fold1_gain",
-    "v129_value_wf_fold2_gain",
-    "v129_value_wf_fold3_gain",
-    "v129_value_wf_reason",
+    "unique_id", "ds", "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
+    "period_type", "update_block_days", "sku_desc", "store_name", "seccion",
+    "train_start", "train_end", "test_start", "test_end", "forecast_start", "forecast_end",
+    # Exact bottom-up daily metric contributions used only for explanation.
+    "bu_abs_error_daily_y", "bu_abs_y_daily_y", "bu_signed_error_daily_y",
+    "bu_abs_error_daily_value", "bu_abs_y_daily_value", "bu_signed_error_daily_value",
+    # v13 coherent leaf traceability.
+    "initial_level_y", "initial_level_value", "warmup_positive_days", "leaf_start", "leaf_warmup_end",
+    "ses_level_y", "ses_level_value", "ses_alpha_y", "ses_alpha_value",
+    "driver_effect", "driver_effect_value", "driver_factor_y", "driver_factor_value",
+    "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
+    "parent_driver_mode_y", "parent_driver_mode_value",
+    "leaf_level_method_y", "leaf_level_method_value", "modelo_seleccionado",
+    "rls_metric_eligible", "rls_block", "rls_train_days",
+    "rls_lambda_y", "rls_lambda_value", "rls_dynamics_y", "rls_dynamics_value", "rls_forecast_origin",
 ]
+
 
 # Columnas mínimas para WMAPE (reduce picos de memoria al preparar unidades)
 _WMAPE_COLS = ("unique_id", "ds", "y", "yhat", "period_type", "value", "valuehat", "valuehat28")
@@ -405,6 +281,11 @@ def _wmape_table_for_unit(
             "sum_abs_y": pl.Float64,
             "sum_abs_error": pl.Float64,
             "sum_signed_error": pl.Float64,
+            "sum_abs_y_all_points": pl.Float64,
+            "sum_abs_error_all_points": pl.Float64,
+            "sum_signed_error_all_points": pl.Float64,
+            "wmape_all_points": pl.Float64,
+            "bias_all_points": pl.Float64,
             "n_points": pl.UInt32,
             "n_with_sales": pl.UInt32,
             "metric_cohort": pl.Utf8,
@@ -508,6 +389,11 @@ def _wmape_table_for_unit(
                 "sum_abs_y",
                 "sum_abs_error",
                 "sum_signed_error",
+                "sum_abs_y_all_points",
+                "sum_abs_error_all_points",
+                "sum_signed_error_all_points",
+                "wmape_all_points",
+                "bias_all_points",
                 "n_points",
                 "n_with_sales",
                 "metric_cohort",
@@ -540,7 +426,8 @@ def _build_bottom_up_aggregate_series_vectorized(res_df: pl.DataFrame) -> pl.Dat
 
     Además se materializan contribuciones diarias de error bottom-up calculadas
     hoja por hoja con y != 0. Sirven únicamente para explicar visualmente el wMAPE
-    oficial existente; no cambian su definición ni metrics.parquet.
+    oficial existente. Además se precalculan en el mismo group_by las métricas
+    ácidas que incluyen también y==0; no alteran el ranking ni la métrica oficial.
     """
     if res_df.height == 0 or "unique_id" not in res_df.columns:
         return pl.DataFrame()
@@ -551,8 +438,6 @@ def _build_bottom_up_aggregate_series_vectorized(res_df: pl.DataFrame) -> pl.Dat
             "valuehat28", "period_type", "sku_desc", "store_name", "seccion",
             "train_start", "train_end", "test_start", "test_end",
             "forecast_start", "forecast_end", "update_block_days",
-            "v11_yhat_raw_before_v12", "v11_valuehat_raw_before_v12",
-            "v12_candidate_yhat_raw", "v12_candidate_valuehat_raw",
         ) if c in res_df.columns
     ]
     leaves = res_df.select(needed).filter(
@@ -589,8 +474,6 @@ def _build_bottom_up_aggregate_series_vectorized(res_df: pl.DataFrame) -> pl.Dat
     additive = [
         c for c in (
             "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
-            "v11_yhat_raw_before_v12", "v11_valuehat_raw_before_v12",
-            "v12_candidate_yhat_raw", "v12_candidate_valuehat_raw",
         ) if c in leaves.columns
     ]
     first_common = [
@@ -756,7 +639,7 @@ def _build_index(
             skus_for_store[seccion] = {}
 
         # Prefer the horizons actually used by the forecast run. Settings
-        # contain only fallback/preferences; v11 resolves OOS and forecast-only
+        # contain only fallback/preferences; the pipeline resolves OOS and forecast-only
         # from the real first/last actual dates.
         hz = settings.section_horizons(seccion)
         sec_source = res_df.filter(
@@ -1041,7 +924,7 @@ def _assert_bottom_up_metric_identities(metrics: pl.DataFrame) -> None:
 def _leaf_description_lookup(desc_map: dict[str, str]) -> dict[tuple[str, str], str]:
     """O(n_ids) lookup for pure SKU labels.
 
-    v11.2 searched the complete desc_map for every pure SKU (roughly
+    A previous implementation searched the complete desc_map for every pure SKU (roughly
     8.5k × 37k string checks in the sample).  Build the mapping once instead.
     """
     out: dict[tuple[str, str], str] = {}
@@ -1423,50 +1306,6 @@ def load_series_many(
     if not chunks:
         return pl.DataFrame()
     return pl.concat(chunks, how="diagonal_relaxed").sort("unique_id", "ds")
-
-
-def load_leaves_for_scope(
-    seccion: str,
-    store: str | None = None,
-    sku: str | None = None,
-    forecast_path: Path | None = None,
-    *,
-    unidad: str = "Unidades",
-    has_value: bool = False,
-) -> pl.DataFrame:
-    """
-    Hojas sku+tienda del alcance desde artefactos (métricas bottom-up).
-    """
-    adir = artifacts_dir(forecast_path)
-    sdir = _series_dir(adir)
-    part = sdir / f"seccion={seccion}" / "data.parquet"
-    if part.exists():
-        lf = pl.scan_parquet(part)
-    else:
-        legacy = _series_legacy_path(adir)
-        if not legacy.exists():
-            return pl.DataFrame()
-        lf = pl.scan_parquet(legacy).filter(
-            (pl.col("unique_id") == seccion)
-            | pl.col("unique_id").str.starts_with(f"{seccion}||")
-        )
-
-    lf = lf.filter(pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 2)
-
-    if store is not None and sku is not None:
-        uid = f"{seccion}||T:{store}||S:{sku}"
-        lf = lf.filter(pl.col("unique_id") == uid)
-    elif store is not None:
-        prefix = f"{seccion}||T:{store}||"
-        lf = lf.filter(pl.col("unique_id").str.starts_with(prefix))
-    elif sku is not None:
-        needle = f"||S:{sku}"
-        lf = lf.filter(pl.col("unique_id").str.ends_with(needle))
-
-    df = lf.collect()
-    if df.height == 0:
-        return df
-    return backend.prepare_unit_df(df, unidad, has_value)
 
 
 def main(argv: list[str] | None = None) -> None:

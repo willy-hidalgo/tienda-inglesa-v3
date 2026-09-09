@@ -1,7 +1,6 @@
 """Calendar and retail feature engineering."""
 from __future__ import annotations
 import datetime as dt
-import numpy as np
 import polars as pl
 from app.forecasting.calendar import HolidayCalendar
 
