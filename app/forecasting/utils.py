@@ -31,10 +31,12 @@ def _collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
             return lf.collect()
 
 def _lf_columns(lf: pl.LazyFrame | pl.DataFrame) -> list[str]:
+    """Return column names without triggering Polars' deprecated LazyFrame.columns path."""
     if isinstance(lf, pl.DataFrame):
         return list(lf.columns)
-    try:
-        return list(lf.collect_schema().names())
-    except Exception:
-        return list(lf.columns)
+    # Polars >=1.43 is a project dependency; collect_schema is the supported
+    # lazy, metadata-only path.  Do not catch FileNotFoundError and retry via
+    # lf.columns because that repeats the same schema resolution and emits a
+    # misleading PerformanceWarning.
+    return list(lf.collect_schema().names())
 

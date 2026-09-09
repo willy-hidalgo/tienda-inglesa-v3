@@ -29,12 +29,8 @@ FIELDS = [
     "ses_vs_recent28_ratio_value",
     "driver_factor_y",
     "driver_factor_value",
-    "driver_strength_selected_y",
-    "driver_strength_selected_value",
     "driver_strength_y",
     "driver_strength_value",
-    "driver_direction_guard_y",
-    "driver_direction_guard_value",
     "ses_recent28_y",
     "ses_recent28_value",
     "ses_recent14_y",
@@ -43,18 +39,39 @@ FIELDS = [
     "ses_recent28_coverage_value",
     "ses_regime_anchor_y",
     "ses_regime_anchor_value",
-    "ses_sparse_robust_y",
-    "ses_sparse_robust_value",
-    "ses_sparse_shock_y",
-    "ses_sparse_shock_value",
-    "ses_robust_block_median_y",
-    "ses_robust_block_median_value",
+    "ses_regime_class_y",
+    "ses_regime_class_value",
+    "ses_model_reference_block",
+    "ses_structural_level_y",
+    "ses_structural_level_value",
+    "ses_structural_history_blocks_y",
+    "ses_structural_history_blocks_value",
+    "ses_block_b0_y",
+    "ses_block_b0_value",
+    "ses_block_b1_y",
+    "ses_block_b1_value",
+    "ses_block_b2_y",
+    "ses_block_b2_value",
+    "ses_block_b3_y",
+    "ses_block_b3_value",
     "parent_model_y",
     "parent_model_value",
     "ses_alpha_y",
     "ses_alpha_value",
+    "ses_alpha_unconstrained_y",
+    "ses_alpha_unconstrained_value",
     "pure_ses_wmape_y",
+    "pure_ses_bias_y",
     "pure_ses_wmape_value",
+    "pure_ses_bias_value",
+    "pure_ses_score_y",
+    "pure_ses_score_value",
+    "ses_score_history_blocks_y",
+    "ses_score_history_blocks_value",
+    "ses_score_window_y",
+    "ses_score_window_value",
+    "ses_guard_status_y",
+    "ses_guard_status_value",
     "ses_stability_reference_y",
     "ses_stability_reference_value",
     "ses_stability_guard_y",
@@ -71,6 +88,11 @@ def main() -> int:
         "--forecast",
         default=str(settings.FORECAST_PATH),
         help="Ruta a forecast.parquet",
+    )
+    parser.add_argument(
+        "--all-rows",
+        action="store_true",
+        help="Imprime las 28 filas del período; por defecto muestra un resumen.",
     )
     args = parser.parse_args()
 
@@ -113,22 +135,50 @@ def main() -> int:
             print(g.select(expressions).to_dicts()[0])
 
         if period in ("out_sample", "forecast_only"):
-            print(
-                g.select(
-                    [c for c in (
-                        "ds", "value", "valuehat", "valuehat_raw",
-                        "ses_level_value", "recent28_mean_value",
-                        "ses_stability_reference_value",
-                        "ses_sparse_robust_value",
-                        "ses_sparse_shock_value",
-                        "ses_robust_block_median_value",
-                        "ses_stability_guard_value",
-                        "pure_ses_wmape_value",
-                        "driver_factor_value", "driver_strength_value", "parent_model_value",
-                        "ses_alpha_value",
-                    ) if c in g.columns]
-                ).to_dicts()
-            )
+            diag_cols = [
+                c for c in (
+                    "ses_model_reference_block",
+                    "ses_regime_class_value",
+                    "ses_structural_level_value",
+                    "ses_structural_history_blocks_value",
+                    "ses_block_b0_value",
+                    "ses_block_b1_value",
+                    "ses_block_b2_value",
+                    "ses_block_b3_value",
+                    "ses_alpha_value",
+                    "ses_guard_status_value",
+                    "pure_ses_wmape_value",
+                    "pure_ses_bias_value",
+                    "pure_ses_score_value",
+                    "ses_level_value",
+                    "recent28_mean_value",
+                    "parent_model_value",
+                    "driver_strength_value",
+                )
+                if c in g.columns
+            ]
+            if diag_cols:
+                print("modelo:", g.select(diag_cols).head(1).to_dicts()[0])
+
+            if "driver_factor_value" in g.columns:
+                factor = g.select(
+                    pl.col("driver_factor_value").min().alias("min"),
+                    pl.col("driver_factor_value").mean().alias("mean"),
+                    pl.col("driver_factor_value").max().alias("max"),
+                    pl.col("driver_factor_value").std().fill_null(0.0).alias("std"),
+                ).to_dicts()[0]
+                print("driver_factor_value:", factor)
+
+            if args.all_rows:
+                print(
+                    g.select(
+                        [c for c in (
+                            "ds", "value", "valuehat", "valuehat_raw",
+                            "ses_level_value", "driver_factor_value",
+                            "parent_model_value",
+                        ) if c in g.columns]
+                    ).to_dicts()
+                )
     return 0
 
 

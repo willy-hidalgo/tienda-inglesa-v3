@@ -19,6 +19,40 @@ class RLSConvergenceError(Exception):
         super().__init__(message)
         self.message = message
 
+@jit(nopython=True, cache=True, nogil=True)
+def _dot_1d(x1: np.ndarray, x2: np.ndarray) -> float:
+    """BLAS-free dot product for small vectors used by the RLS hot path."""
+    total = 0.0
+    for i in range(len(x1)):
+        total += x1[i] * x2[i]
+    return total
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _matvec_inplace(matrix: np.ndarray, vector: np.ndarray, out: np.ndarray) -> None:
+    """Compute matrix @ vector without NumPy/BLAS temporaries."""
+    n_rows, n_cols = matrix.shape
+    for i in range(n_rows):
+        total = 0.0
+        for j in range(n_cols):
+            total += matrix[i, j] * vector[j]
+        out[i] = total
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _vecmat_inplace(
+    vector: np.ndarray, matrix: np.ndarray, scale: float, out: np.ndarray
+) -> None:
+    """Compute (scale * vector) @ matrix without NumPy/BLAS temporaries."""
+    n_rows, n_cols = matrix.shape
+    for j in range(n_cols):
+        total = 0.0
+        for i in range(n_rows):
+            total += vector[i] * matrix[i, j]
+        out[j] = scale * total
+
+
+@jit(nopython=True, cache=True, nogil=True)
 def _rls(
     x: np.ndarray,
     y: np.ndarray,
@@ -87,24 +121,23 @@ def _rls(
     all_coeffs = np.zeros_like(x, dtype=np.float64)
 
     BxxtwB = np.empty((num_vars, num_vars))
+    Bx = np.empty(num_vars, dtype=np.float64)
+    xtwB = np.empty(num_vars, dtype=np.float64)
     oos_error = []
     for i in range(num_obs):
         y_i = y[i]
 
         if y_i > min_y_to_update:
             x_i = x[i, :]
-            z_i = _rls_predict(coeffs=coeffs, x=x_i)
+            z_i = _dot_1d(coeffs, x_i)
 
-            if weighting_function is None:
-                xtwB = x_i @ B
-            else:
-                xtwB = (weighting_function(y_i) * x_i) @ B
-
-            Bx = B @ x_i
+            weight = 1.0 if weighting_function is None else weighting_function(y_i)
+            _vecmat_inplace(x_i, B, weight, xtwB)
+            _matvec_inplace(B, x_i, Bx)
             _numba_outer(
                 Bx, xtwB, BxxtwB
             )  # Re-implement numpy.outer as inplace operation.
-            xtwBx: float = xtwB @ x_i
+            xtwBx: float = _dot_1d(xtwB, x_i)
             alpha = 1 / (forgetting_factor + xtwBx)
 
             if math.isnan(alpha):
@@ -134,9 +167,77 @@ def _rls(
 
     return coeffs, all_coeffs, oos_error
 
+
+@jit(nopython=True, cache=True, nogil=True)
+def _predict_loglink_base(x: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
+    """Fast log1p-link forecast for calendar-only RLS rows."""
+    n = x.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        lp = _dot_1d(x[i, :], coeffs)
+        if lp < 0.0:
+            lp = 0.0
+        elif lp > 30.0:
+            lp = 30.0
+        out[i] = math.expm1(lp)
+    return out
+
+
+@jit(nopython=True, cache=True, nogil=True)
+def _predict_loglink_ar(
+    x_base: np.ndarray, coeffs: np.ndarray, history_tail: np.ndarray
+) -> np.ndarray:
+    """Recursive AR forecast without Python row loops/concatenations.
+
+    ``history_tail`` needs at most the 28 latest log1p target values available
+    at the forecast origin.  The four trailing coefficients correspond to
+    lag7, lag28, rolling-mean7 and rolling-mean28.
+    """
+    n = x_base.shape[0]
+    p = x_base.shape[1]
+    out = np.empty(n, dtype=np.float64)
+    h0 = history_tail.shape[0]
+    hist = np.empty(h0 + n, dtype=np.float64)
+    for i in range(h0):
+        hist[i] = history_tail[i]
+
+    for j in range(n):
+        pos = h0 + j
+        lag7 = hist[pos - 7] if pos >= 7 else 0.0
+        lag28 = hist[pos - 28] if pos >= 28 else 0.0
+
+        s7 = 0.0
+        n7 = 7 if pos >= 7 else pos
+        for k in range(n7):
+            s7 += hist[pos - 1 - k]
+        mean7 = s7 / n7 if n7 > 0 else 0.0
+
+        s28 = 0.0
+        n28 = 28 if pos >= 28 else pos
+        for k in range(n28):
+            s28 += hist[pos - 1 - k]
+        mean28 = s28 / n28 if n28 > 0 else 0.0
+
+        lp = 0.0
+        for k in range(p):
+            lp += x_base[j, k] * coeffs[k]
+        lp += lag7 * coeffs[p]
+        lp += lag28 * coeffs[p + 1]
+        lp += mean7 * coeffs[p + 2]
+        lp += mean28 * coeffs[p + 3]
+        if lp < 0.0:
+            lp = 0.0
+        elif lp > 30.0:
+            lp = 30.0
+        hist[pos] = lp
+        out[j] = math.expm1(lp)
+    return out
+
+@jit(nopython=True, cache=True)
 def _log_weighting(x):
     return sqrt(exp(x) / x)
 
+@jit(nopython=True, cache=True, nogil=True)
 def _rls_predict(coeffs: np.ndarray, x: np.ndarray) -> np.ndarray:
     """
 
@@ -159,8 +260,15 @@ def _rls_predict(coeffs: np.ndarray, x: np.ndarray) -> np.ndarray:
 
     assert num_vars == len(coeffs)
 
-    return x @ coeffs
+    if x.ndim == 1:
+        return _dot_1d(x, coeffs)
 
+    out = np.empty(num_obs, dtype=np.float64)
+    for i in range(num_obs):
+        out[i] = _dot_1d(x[i, :], coeffs)
+    return out
+
+@jit(nopython=True, cache=True, nogil=True)
 def _numba_outer(x1: np.ndarray, x2: np.ndarray, out: np.ndarray) -> None:
     """Re-implements np.outer as an inplace operation at ~10x the speed of np.outer.
 

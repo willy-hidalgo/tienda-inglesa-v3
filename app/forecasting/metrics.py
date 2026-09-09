@@ -11,8 +11,9 @@ def compute_wmape(
         """
         WMAPE bottom-up, separado por in_sample / out_sample.
 
-        1. Errores en hojas SKU+tienda, incluyendo días con y=0:
-             e = |y − ŷ|. Los ceros aportan error al numerador y 0 al denominador.
+        1. Métrica oficial del cliente: solo días con venta real y != 0.
+             Los falsos positivos en días y=0 se auditan por separado como
+             zero-demand y NO inflan el wMAPE/BIAS oficial.
         2. WMAPE hoja = Σe / Σ|y| por unique_id y period_type
         3. Tienda / sección = suma de numeradores y denominadores de sus hojas
            (no usa el yhat del RLS de esos niveles).
@@ -27,7 +28,9 @@ def compute_wmape(
                 "n_points": pl.UInt32,
                 "sum_y": pl.Float64,
                 "sum_yhat": pl.Float64,
+                "sum_abs_y": pl.Float64,
                 "sum_abs_error": pl.Float64,
+                "sum_signed_error": pl.Float64,
             }
         )
         if res_df.height == 0 or "yhat" not in res_df.columns:
@@ -65,17 +68,37 @@ def compute_wmape(
         leaves = leaves.with_columns(
             pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
             pl.col("unique_id").str.split("||").list.first().alias("_seccion"),
-            (pl.col("y") - pl.col("yhat")).abs().alias("_abs_error"),
-            pl.col("y").abs().alias("_abs_y"),
+            pl.when(pl.col("y") != 0)
+            .then((pl.col("y") - pl.col("yhat")).abs())
+            .otherwise(0.0)
+            .alias("_abs_error"),
+            pl.when(pl.col("y") != 0)
+            .then(pl.col("y").abs())
+            .otherwise(0.0)
+            .alias("_abs_y"),
+            pl.when(pl.col("y") != 0)
+            .then(pl.col("yhat") - pl.col("y"))
+            .otherwise(0.0)
+            .alias("_signed_error"),
+            pl.when(pl.col("y") != 0)
+            .then(pl.col("yhat"))
+            .otherwise(0.0)
+            .alias("_metric_yhat"),
         )
 
         def _finalize(df: pl.DataFrame, nivel: str) -> pl.DataFrame:
             return df.with_columns(
-                (pl.col("sum_abs_error") / pl.col("sum_abs_y")).alias("wmape"),
-                (
-                    (pl.col("sum_yhat") - pl.col("sum_y"))
-                    / pl.col("sum_y").replace(0, None)
-                ).alias("bias"),
+                pl.when(pl.col("sum_abs_y") > 0)
+                .then(pl.col("sum_abs_error") / pl.col("sum_abs_y"))
+                .otherwise(None)
+                .alias("wmape"),
+                pl.when(pl.col("sum_abs_y") > 0)
+                .then(
+                    pl.col("sum_signed_error")
+                    / pl.col("sum_abs_y").replace(0, None)
+                )
+                .otherwise(None)
+                .alias("bias"),
                 pl.lit(nivel).alias("nivel"),
             ).select(
                 [
@@ -87,7 +110,9 @@ def compute_wmape(
                     "n_points",
                     "sum_y",
                     "sum_yhat",
+                    "sum_abs_y",
                     "sum_abs_error",
+                    "sum_signed_error",
                 ]
             )
 
@@ -95,8 +120,9 @@ def compute_wmape(
         leaf_agg = leaves.group_by(["unique_id", "period_type"]).agg(
             pl.col("_abs_error").sum().alias("sum_abs_error"),
             pl.col("_abs_y").sum().alias("sum_abs_y"),
+            pl.col("_signed_error").sum().alias("sum_signed_error"),
             pl.col("y").sum().alias("sum_y"),
-            pl.col("yhat").sum().alias("sum_yhat"),
+            pl.col("_metric_yhat").sum().alias("sum_yhat"),
             pl.len().alias("n_points"),
         )
         out_leaf = _finalize(leaf_agg, "sku_tienda")
@@ -107,8 +133,9 @@ def compute_wmape(
             .agg(
                 pl.col("_abs_error").sum().alias("sum_abs_error"),
                 pl.col("_abs_y").sum().alias("sum_abs_y"),
+                pl.col("_signed_error").sum().alias("sum_signed_error"),
                 pl.col("y").sum().alias("sum_y"),
-                pl.col("yhat").sum().alias("sum_yhat"),
+                pl.col("_metric_yhat").sum().alias("sum_yhat"),
                 pl.len().alias("n_points"),
             )
             .rename({"_store_uid": "unique_id"})
@@ -121,8 +148,9 @@ def compute_wmape(
             .agg(
                 pl.col("_abs_error").sum().alias("sum_abs_error"),
                 pl.col("_abs_y").sum().alias("sum_abs_y"),
+                pl.col("_signed_error").sum().alias("sum_signed_error"),
                 pl.col("y").sum().alias("sum_y"),
-                pl.col("yhat").sum().alias("sum_yhat"),
+                pl.col("_metric_yhat").sum().alias("sum_yhat"),
                 pl.len().alias("n_points"),
             )
             .rename({"_seccion": "unique_id"})

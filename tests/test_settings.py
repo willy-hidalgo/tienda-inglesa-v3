@@ -68,34 +68,33 @@ def test_compute_train_window_aligned_28():
 
 
 def test_section_horizons_23():
+    last = dt.date(2026, 2, 15)
     hz = settings.section_horizons(
         "23",
         first_data=dt.date(2024, 5, 1),
-        last_actual=dt.date(2026, 2, 15),
+        last_actual=last,
     )
-    assert hz["first_monday"].weekday() == 0
-    assert hz["test_start"].weekday() == 0
-    assert hz["test_end"].weekday() == 6
+    assert hz["test_end"] == last
+    assert hz["test_start"] == last - dt.timedelta(days=27)
     assert (hz["test_end"] - hz["test_start"]).days + 1 == 28
     assert ((hz["train_end"] - hz["train_start"]).days + 1) % 28 == 0
-    assert hz["forecast_start"].weekday() == 0
+    assert hz["forecast_start"] == last + dt.timedelta(days=1)
     assert (hz["forecast_end"] - hz["forecast_start"]).days + 1 == 28
-    assert hz["forecast_start"] == hz["test_end"] + dt.timedelta(days=1)
 
 
 
 def test_section_horizons_1():
+    last = dt.date(2026, 5, 6)
     hz = settings.section_horizons(
         "1",
         first_data=dt.date(2024, 6, 1),
-        last_actual=dt.date(2026, 5, 6),
+        last_actual=last,
     )
-    assert hz["first_monday"] == dt.date(2024, 6, 3)
-    assert hz["test_start"].weekday() == 0
-    assert hz["test_end"].weekday() == 6
+    assert hz["test_end"] == last
+    assert hz["test_start"] == last - dt.timedelta(days=27)
     assert (hz["test_end"] - hz["test_start"]).days + 1 == 28
     assert ((hz["train_end"] - hz["train_start"]).days + 1) % 28 == 0
-    assert hz["forecast_start"] == hz["test_end"] + dt.timedelta(days=1)
+    assert hz["forecast_start"] == last + dt.timedelta(days=1)
 
 
 
@@ -167,25 +166,23 @@ def test_client_required_rls_defaults():
     assert settings.RLS_FIT_MODE == "expanding_28"
     assert settings.RLS_BLOCK_DAYS == 28
     assert settings.METRICS_MODE == "rolling_28"
-    assert settings.FAST_LEAF_DRIVER_EFFECTS is True
-    assert settings.FAST_LEAF_DRIVER_FACTOR_CLIP == (0.50, 2.00)
+    assert settings.FAST_LEAF_DRIVER_FACTOR_CLIP == (0.20, 5.00)
 
 
-def test_v6_leaf_and_metric_contract():
+def test_v11_leaf_and_metric_contract():
+    assert settings.APP_VERSION == "12.9.12"
     assert settings.RLS_FIT_MODE == "expanding_28"
     assert settings.RLS_BLOCK_DAYS == 28
     assert settings.METRICS_MODE == "rolling_28"
     assert settings.METRICS_START_DAY == 29
     assert settings.LEAF_INITIAL_LEVEL_DAYS == 28
     assert 0 < settings.LEAF_SES_ALPHA <= 1
-    assert settings.LEAF_INITIAL_MIN_POINTS == 7
     assert settings.LEAF_SES_ALPHA in settings.LEAF_SES_ALPHA_CANDIDATES
-    assert settings.LEAF_PARENT_SELECTION == "prior_cumulative_wmape"
-    assert settings.LEAF_SES_SCALE == "original"
-    assert settings.RLS_AUTOREGRESSIVE_DRIVERS is True
-    assert settings.RLS_FORGETTING_FACTOR_CANDIDATES == (0.970, 0.985, 0.995)
+    assert settings.LEAF_PARENT_CANDIDATES == ("store", "section")
+    assert settings.LEAF_PARENT_DRIVER_STRENGTH == 1.0
+    assert settings.LEAF_REGIME_HISTORY_BLOCKS == 5
+    assert settings.LEAF_RESET_TRANSIENT is True
     assert settings.RANKING_SKU_MIN_NONZERO_POINTS == 15
-    assert settings.FAST_LEAF_DRIVER_EFFECTS is True
 
 
 def test_train_windows_are_exact_multiples_of_28():
@@ -196,33 +193,39 @@ def test_train_windows_are_exact_multiples_of_28():
         assert n_days >= settings.RLS_BLOCK_DAYS
 
 
-def test_section_horizon_oos_is_28_days_and_starts_monday():
-    first = dt.date(2024, 5, 1)   # first available Wednesday -> Monday 2024-05-06
+def test_section_horizon_oos_is_latest_28_actual_days():
+    first = dt.date(2024, 5, 1)
     last = dt.date(2026, 5, 10)
     for sec in settings.FOCUS_SECTIONS:
         hz = settings.section_horizons(sec, first, last)
-        assert hz["first_monday"].weekday() == 0
-        assert hz["test_start"].weekday() == 0
-        assert hz["test_end"].weekday() == 6
+        assert hz["test_end"] == last
+        assert hz["test_start"] == last - dt.timedelta(days=27)
         assert (hz["test_end"] - hz["test_start"]).days + 1 == 28
+        assert hz["train_end"] == hz["test_start"] - dt.timedelta(days=1)
         assert (hz["train_end"] - hz["train_start"]).days + 1 >= 28
         assert ((hz["train_end"] - hz["train_start"]).days + 1) % 28 == 0
 
 
-def test_forecast_only_is_immediate_28_day_block_after_oos():
+def test_forecast_only_never_overlaps_known_actuals():
     first = dt.date(2024, 5, 1)
-    # Even if later actuals exist, forecast-only is the immediate next block.
-    last = dt.date(2026, 5, 6)
+    last = dt.date(2026, 4, 30)
     hz = settings.section_horizons("1", first, last)
-    assert hz["forecast_start"] == hz["test_end"] + dt.timedelta(days=1)
-    assert hz["forecast_start"].weekday() == 0
-    assert hz["forecast_end"].weekday() == 6
+    assert hz["test_start"] == dt.date(2026, 4, 3)
+    assert hz["test_end"] == last
+    assert hz["forecast_start"] == last + dt.timedelta(days=1)
     assert (hz["forecast_end"] - hz["forecast_start"]).days + 1 == 28
+    assert hz["actual_extension_start"] is None
+    assert hz["observed_tail_start"] is None
 
 
-def test_post_oos_actual_extension_is_disabled_for_forecast_generation():
+def test_no_actual_extension_or_observed_tail_after_oos():
     hz = settings.section_horizons(
         "1", dt.date(2024, 5, 1), dt.date(2026, 6, 28)
     )
+    assert hz["test_end"] == dt.date(2026, 6, 28)
     assert hz["actual_extension_start"] is None
     assert hz["actual_extension_end"] is None
+    assert hz["observed_tail_start"] is None
+    assert hz["observed_tail_end"] is None
+    assert hz["forecast_start"] == dt.date(2026, 6, 29)
+

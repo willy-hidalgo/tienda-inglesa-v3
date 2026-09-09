@@ -34,21 +34,18 @@ class DemandAnalysisConfig:
     selected_path: Path
     out_dir: Path
     focus_sections: list[str]
-    analysis_end_date: dt.date
     demo_mode: bool
 
     @classmethod
     def from_settings(cls) -> DemandAnalysisConfig:
-        max_end = max(
-            cfg["test_end"] for cfg in settings.SECCIONES.values()
-        ) + dt.timedelta(days=settings.METRIC_HORIZON_DAYS)
+        # Keep every available actual. OOS/forecast-only horizons are resolved
+        # later from the real first/last actual date of each section.
         return cls(
             master_path=Path(settings.MASTER_PATH),
             sales_path=Path(settings.SALES_PATH),
             selected_path=Path(settings.SELECTED_PATH),
             out_dir=Path(settings.OUT_DIR),
             focus_sections=list(settings.FOCUS_SECTIONS),
-            analysis_end_date=max_end,
             demo_mode=settings.DEMO_MODE,
         )
 
@@ -65,7 +62,7 @@ def _allowed_locales_df() -> pl.DataFrame:
 class SalesCatalogLoader:
     """Carga master + ventas en modo lazy y materializa una sola vez."""
 
-    _SALES_COLUMNS = ["STORE_ID", "SKU_ID", "SALES_DATE", "SLS_VAL", "SLS_QTY"]
+    _SALES_COLUMNS = ["STORE_ID", "SKU_ID", "SALES_DATE", "TRAN_TYPE", "SLS_VAL", "SLS_QTY"]
     _MASTER_KEEP = [
         "SKU",
         "SECCION",
@@ -101,9 +98,18 @@ class SalesCatalogLoader:
         )
 
         logger.info("Scan ventas: %s", self._cfg.sales_path)
+        sales_scan = pl.scan_parquet(self._cfg.sales_path)
+        sales_names = set(sales_scan.collect_schema().names())
+        required_sales = {"STORE_ID", "SKU_ID", "SALES_DATE", "SLS_VAL", "SLS_QTY"}
+        missing_sales = sorted(required_sales - sales_names)
+        if missing_sales:
+            raise ValueError(
+                f"Ventas sin columnas requeridas: {missing_sales}"
+            )
+        sales_cols = [c for c in self._SALES_COLUMNS if c in sales_names]
         sales_lf = (
-            pl.scan_parquet(self._cfg.sales_path)
-            .select(self._SALES_COLUMNS)
+            sales_scan
+            .select(sales_cols)
             .filter((pl.col("SLS_VAL") > 0) | (pl.col("SLS_QTY") > 0))
             .with_columns(
                 pl.col("SKU_ID").cast(pl.Utf8).str.strip_chars(),
@@ -124,9 +130,8 @@ class SalesCatalogLoader:
 
 
 class SectionDemandSelector:
-    def __init__(self, focus_sections: list[str], analysis_end_date: dt.date):
+    def __init__(self, focus_sections: list[str]):
         self._focus_sections = focus_sections
-        self._analysis_end_date = analysis_end_date
 
     def select(self, df: pl.DataFrame, demo_mode) -> pl.DataFrame:
 
@@ -143,13 +148,8 @@ class SectionDemandSelector:
         )
         logger.info("Rango de fechas por sección:\n%s", by_sec)
 
-        min_date = by_sec["min_date"].min()
-        out = df.filter(
-            (pl.col("SALES_DAY") >= min_date)
-            & (pl.col("SALES_DAY") <= self._analysis_end_date)
-        )
-        logger.info("Filas seleccionadas: %d", out.height)
-        return out
+        logger.info("Filas seleccionadas (historia completa): %d", df.height)
+        return df
 
     @staticmethod
     def select_best_skus(df: pl.DataFrame) -> pl.DataFrame:
@@ -261,9 +261,7 @@ class SectionDemandSelector:
 class DemandAnalysisPipeline:
     def __init__(self, config: DemandAnalysisConfig | None = None):
         self._cfg = config or DemandAnalysisConfig.from_settings()
-        self._selector = SectionDemandSelector(
-            self._cfg.focus_sections, self._cfg.analysis_end_date
-        )
+        self._selector = SectionDemandSelector(self._cfg.focus_sections)
 
     def run(self) -> pl.DataFrame:
         df = SalesCatalogLoader(self._cfg).load()

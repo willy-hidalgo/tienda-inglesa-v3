@@ -1,20 +1,21 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tienda-inglesa"
-version = "0.1.0"
+version = "12.9.0"
 description = "Assessment Tienda Inglesa"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13,<3.14"
 dependencies = [
-    "fastexcel>=0.20.2",
-    "ipykernel>=7.3.0",
-    "ipympl>=0.10.0",
-    "matplotlib>=3.11.1",
-    "mplcursors>=0.7.1",
-    "numba>=0.66.0",
-    "plotly>=6.9.0",
     "python-dateutil>=2.9.0",
+    "fastexcel>=0.20.2",
+    "lightgbm>=4.6.0",
+    "numpy>=2.2,<3",
+    "numba>=0.65.1",
+    "plotly>=6.9.0",
     "polars>=1.43.0",
-    "scipy>=1.18.0",
     "streamlit>=1.60.0",
     "tqdm>=4.70.0",
     "xlsxwriter>=3.2.9",
@@ -24,3 +25,13 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+notebook = [
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.11.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app", "app.*", "rls_opt", "rls_opt.*"]
+exclude = ["data", "data.*", "notebook", "notebook.*", "tests", "tests.*"]
+namespaces = false

@@ -1,28 +1,73 @@
 """RLS forecasting runner and leaf-level derivation."""
 from __future__ import annotations
 import datetime as dt
+import gc
 import logging
+import tempfile
 import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import polars as pl
 import settings
 from rls_opt import RecursiveLeastSquaresRegression, RLSConstantPrior, RLSPrior
+from rls_opt.kernels import (
+    _rls as _rls_numba_kernel,
+    _predict_loglink_base,
+    _predict_loglink_ar,
+)
 from app.forecasting.metrics import compute_wmape
-from app.forecasting.robust_baseline import robust_baseline_forecast, validation_score as robust_validation_score, wmape_np
+from app.forecasting.leaf_fallback import apply_robust_leaf_fallbacks
+from app.forecasting.leaf_v12 import apply_v12_occurrence_share_challenger
 
 logger = logging.getLogger(__name__)
 
 class RLSForecastRunner:
     """
-    RLS a nivel sección y tienda; deriva SKU+tienda sin re-fit.
+    RLS a nivel sección/tienda + incumbent v11 y challenger leaf v12.
 
-      - `fit_and_predict_sections`: RLS real (sección o tienda) en train/OOS/fcst.
-        El RLS se ajusta sobre log1p(y); las predicciones se reconstruyen con
-        `expm1()`.
-      - `derive_sku_store_forecasts`: selección sección vs tienda por WMAPE
-        in-sample; yhat RLS en train; en OOS/fcst reconstruye en log-space
-        `expm1(intercept + efecto + SES(log-residuo))`.
+      - `fit_and_predict_sections`: RLS para sección y tienda.
+      - `fast_leaf_forecasts`: construye el incumbent SES+RLS v11 y luego el
+        challenger v12.6 SKU-total + pooled LightGBM shape + occurrence/store-share, seleccionado solo
+        con bloques cerrados anteriores al horizonte objetivo.
     """
+
+    _numba_kernel_warmed: bool = False
+
+    @classmethod
+    def _ensure_numba_rls_kernel(cls) -> None:
+        """Fail fast if RLS lost Numba acceleration; warm one cached signature."""
+        if cls._numba_kernel_warmed:
+            return
+        if bool(getattr(settings, "RLS_NUMBA_KERNELS_REQUIRED", True)):
+            try:
+                from numba.core.registry import CPUDispatcher
+            except Exception as exc:  # pragma: no cover - dependency contract
+                raise RuntimeError("Numba no disponible para el kernel RLS") from exc
+            if not isinstance(_rls_numba_kernel, CPUDispatcher):
+                raise RuntimeError(
+                    "RLS performance invariant violated: _rls is not a Numba "
+                    "CPUDispatcher. Refusing Python fallback."
+                )
+        t0 = time.perf_counter()
+        x = np.ascontiguousarray(np.ones((4, 2), dtype=np.float64))
+        y = np.ascontiguousarray(np.ones(4, dtype=np.float64))
+        priors = np.zeros(2, dtype=np.float64)
+        inv = np.eye(2, dtype=np.float64)
+        _rls_numba_kernel(x, y, priors, inv, 0.995, None, True, 1e-8)
+        # Warm recursive prediction kernels serially before the store thread
+        # pool starts. Otherwise multiple workers may contend on first JIT.
+        _predict_loglink_base(x, priors)
+        _predict_loglink_ar(
+            x,
+            np.zeros(x.shape[1] + 4, dtype=np.float64),
+            np.zeros(28, dtype=np.float64),
+        )
+        cls._numba_kernel_warmed = True
+        logger.info(
+            "RLS Numba kernel listo (nopython+cache+nogil): %.2fs",
+            time.perf_counter() - t0,
+        )
 
     def __init__(
         self,
@@ -233,8 +278,8 @@ class RLSForecastRunner:
     ) -> tuple[list[pl.DataFrame], tuple[np.ndarray, np.ndarray] | None]:
         """Expanding-28 with prior-block selection of RLS dynamics.
 
-        v8.1 audits the v8 AR recursion problem by treating the AR specification
-        itself as a candidate.  For every 28-day target block we choose only
+        The AR specification is treated as a candidate. For every 28-day
+        target block we choose only
         from errors accumulated in PREVIOUS blocks:
 
           * base: calendar/commercial drivers only;
@@ -250,13 +295,17 @@ class RLSForecastRunner:
 
         parts = [train_g.with_columns(pl.lit("in_sample").alias("_source_period"))]
         if oos_g is not None and oos_g.height:
-            parts.append(oos_g.sort("ds").with_columns(pl.lit("out_sample").alias("_source_period")))
+            parts.append(
+                oos_g.sort("ds").with_columns(
+                    pl.lit("out_sample").alias("_source_period")
+                )
+            )
         actual = pl.concat(parts, how="diagonal_relaxed").sort("ds")
         n = actual.height
         if n == 0:
             return [], None
 
-        seed_n = min(block_days, n)
+        seed_n = min(max(block_days, int(getattr(settings, "RLS_INITIAL_SEED_DAYS", 28))), n)
         base = actual.drop("_source_period")
         y = base["y"].to_numpy().astype(np.float64, copy=False)
         v = base["value"].to_numpy().astype(np.float64, copy=False)
@@ -292,15 +341,14 @@ class RLSForecastRunner:
             paths_v[(mode, lam)] = np.asarray(mv.all_coef_[0], dtype=np.float64)
 
         def predict_block(Xbase, coef, history_actual, start, end, mode):
-            hist = list(history_actual[:start].astype(float, copy=False))
-            pred = np.zeros(end - start, dtype=np.float64)
-            for j, i in enumerate(range(start, end)):
-                xrow = np.concatenate([Xbase[i], self._ar_recursive_row(hist)]) if mode == "ar" else Xbase[i]
-                lp = float(np.clip(xrow @ coef, 0.0, 30.0))
-                pred[j] = max(0.0, np.expm1(lp))
-                if mode == "ar":
-                    hist.append(lp)
-            return pred
+            xrows = np.ascontiguousarray(Xbase[start:end], dtype=np.float64)
+            c = np.ascontiguousarray(coef, dtype=np.float64)
+            if mode == "ar":
+                tail = np.ascontiguousarray(
+                    history_actual[max(0, start - 28):start], dtype=np.float64
+                )
+                return _predict_loglink_ar(xrows, c, tail)
+            return _predict_loglink_base(xrows, c)
 
         yh = np.full(n, np.nan); vh = np.full(n, np.nan)
         eligible = np.zeros(n, dtype=bool); block = np.zeros(n, dtype=np.int32)
@@ -359,12 +407,12 @@ class RLSForecastRunner:
             Xvf_base = self._finite_matrix(fcst_g, self._driver_cols_price, uid=uid, stage="RLS forecast value")
             cy = choose(cum_ae_y, cum_den_y); cv = choose(cum_ae_v, cum_den_v)
             def predict_future(Xbase, coef, hist_actual, mode):
-                hist = list(hist_actual.astype(float, copy=False)); pred = np.zeros(Xbase.shape[0], dtype=np.float64)
-                for j in range(Xbase.shape[0]):
-                    xrow = np.concatenate([Xbase[j], self._ar_recursive_row(hist)]) if mode == "ar" else Xbase[j]
-                    lp = float(np.clip(xrow @ coef, 0.0, 30.0)); pred[j] = max(0.0, np.expm1(lp))
-                    if mode == "ar": hist.append(lp)
-                return pred
+                xrows = np.ascontiguousarray(Xbase, dtype=np.float64)
+                c = np.ascontiguousarray(coef, dtype=np.float64)
+                if mode == "ar":
+                    tail = np.ascontiguousarray(hist_actual[-28:], dtype=np.float64)
+                    return _predict_loglink_ar(xrows, c, tail)
+                return _predict_loglink_base(xrows, c)
             fy = np.round(predict_future(Xyf_base, paths_y[cy][-1], log_y, cy[0]), 0)
             fv = np.round(predict_future(Xvf_base, paths_v[cv][-1], log_v, cv[0]), 2)
             forecast_origin = base["ds"][-1]
@@ -399,44 +447,125 @@ class RLSForecastRunner:
         return [out.sort("ds")], (final_py, final_pv)
 
     def fit_and_predict_sections(
-        self, train: pl.DataFrame, targets: dict[str, pl.DataFrame],
-        section_ids: list[str], desc: str="RLS sección", meta: dict|None=None,
-    ) -> tuple[pl.DataFrame, dict[str, tuple[np.ndarray,np.ndarray]]]:
-        train_parts=self._normalize_partition_dict(train.partition_by("unique_id",as_dict=True))
-        target_parts={name:self._normalize_partition_dict(df.partition_by("unique_id",as_dict=True))
-                      for name,df in targets.items() if df.height}
-        results=[]; coefs={}
-        mode=str(getattr(settings,"RLS_FIT_MODE","expanding_28")).lower()
-        block_days=int(getattr(settings,"RLS_BLOCK_DAYS",28))
-        for uid in section_ids:
-            g=train_parts.get(uid)
-            if g is None or g.height==0: continue
-            if mode=="expanding_28":
+        self,
+        train: pl.DataFrame,
+        targets: dict[str, pl.DataFrame],
+        section_ids: list[str],
+        desc: str = "RLS sección",
+        meta: dict | None = None,
+    ) -> tuple[pl.DataFrame, dict[str, tuple[np.ndarray, np.ndarray]]]:
+        """Fit/predict independent RLS series with one partition pass.
+
+        v11.2 avoids the previous store-by-store orchestration, which repeatedly
+        filtered and partitioned the same frames. Frames are partitioned once
+        and independent UIDs can then run in parallel.
+        """
+        if train.height == 0 or not section_ids:
+            return pl.DataFrame(), {}
+
+        self._ensure_numba_rls_kernel()
+
+        train_parts = self._normalize_partition_dict(
+            train.partition_by("unique_id", as_dict=True)
+        )
+        target_parts = {
+            name: self._normalize_partition_dict(
+                df.partition_by("unique_id", as_dict=True)
+            )
+            for name, df in targets.items()
+            if df.height
+        }
+        mode = str(getattr(settings, "RLS_FIT_MODE", "expanding_28")).lower()
+        block_days = int(getattr(settings, "RLS_BLOCK_DAYS", 28))
+
+        def _one(uid: str):
+            g = train_parts.get(uid)
+            if g is None or g.height == 0:
+                return uid, [], None
+            if mode == "expanding_28":
                 try:
-                    parts,cf=self._fit_and_predict_expanding_blocks(uid,g,target_parts,meta=meta,desc=desc,block_days=block_days)
-                    results.extend(parts)
-                    if cf is not None: coefs[uid]=cf
+                    parts, cf = self._fit_and_predict_expanding_blocks(
+                        uid,
+                        g,
+                        target_parts,
+                        meta=meta,
+                        desc=desc,
+                        block_days=block_days,
+                    )
+                    return uid, parts, cf
                 except Exception as exc:
-                    logger.warning("%s: expanding-%d falló para %s: %s",desc,block_days,uid,exc)
-                continue
-            try: my,mv=self._fit_models(g)
+                    logger.warning(
+                        "%s: expanding-%d falló para %s: %s",
+                        desc, block_days, uid, exc,
+                    )
+                    return uid, [], None
+
+            try:
+                my, mv = self._fit_models(g)
             except Exception as exc:
-                logger.warning("%s: fit falló para %s: %s",desc,uid,exc); continue
-            coefs[uid]=(np.asarray(my.final_coef_[0],dtype=np.float64).ravel(),
-                        np.asarray(mv.final_coef_[0],dtype=np.float64).ravel())
-            for name,parts in target_parts.items():
-                tg=parts.get(uid)
-                if tg is None or tg.height==0: continue
-                try: fr=self._predict_with_models(uid,my,mv,g,tg,meta)
+                logger.warning("%s: fit falló para %s: %s", desc, uid, exc)
+                return uid, [], None
+            cf = (
+                np.asarray(my.final_coef_[0], dtype=np.float64).ravel(),
+                np.asarray(mv.final_coef_[0], dtype=np.float64).ravel(),
+            )
+            parts: list[pl.DataFrame] = []
+            for name, by_uid in target_parts.items():
+                tg = by_uid.get(uid)
+                if tg is None or tg.height == 0:
+                    continue
+                try:
+                    fr = self._predict_with_models(uid, my, mv, g, tg, meta)
                 except Exception as exc:
-                    logger.warning("%s: predict falló para %s/%s: %s",desc,uid,name,exc); continue
+                    logger.warning(
+                        "%s: predict falló para %s/%s: %s",
+                        desc, uid, name, exc,
+                    )
+                    continue
                 if fr is not None and fr.height:
-                    results.append(fr.with_columns(
-                        pl.lit(name).alias("period_type"),
-                        pl.lit(True).alias("rls_metric_eligible"),
-                        pl.lit(None).cast(pl.Int32).alias("rls_block"),
-                        pl.lit(g.height).cast(pl.Int32).alias("rls_train_days")))
-        return (pl.concat(results,how="diagonal_relaxed") if results else pl.DataFrame()),coefs
+                    parts.append(
+                        fr.with_columns(
+                            pl.lit(name).alias("period_type"),
+                            pl.lit(True).alias("rls_metric_eligible"),
+                            pl.lit(None).cast(pl.Int32).alias("rls_block"),
+                            pl.lit(g.height).cast(pl.Int32).alias("rls_train_days"),
+                        )
+                    )
+            return uid, parts, cf
+
+        ordered_ids = [str(uid) for uid in section_ids]
+        results_by_uid: dict[str, list[pl.DataFrame]] = {}
+        coefs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        workers = min(max(int(self._n_jobs or 1), 1), len(ordered_ids))
+
+        if workers > 1 and len(ordered_ids) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_one, uid): uid for uid in ordered_ids}
+                for fut in as_completed(futures):
+                    uid, parts, cf = fut.result()
+                    if parts:
+                        results_by_uid[uid] = parts
+                    if cf is not None:
+                        coefs[uid] = cf
+        else:
+            for uid in ordered_ids:
+                uid, parts, cf = _one(uid)
+                if parts:
+                    results_by_uid[uid] = parts
+                if cf is not None:
+                    coefs[uid] = cf
+
+        results = [
+            frame
+            for uid in ordered_ids
+            for frame in results_by_uid.get(uid, [])
+        ]
+        return (
+            pl.concat(results, how="diagonal_relaxed")
+            if results
+            else pl.DataFrame(),
+            coefs,
+        )
 
     # ── Corrección de sesgo OOS / forecast ────────────────────────────────
     @staticmethod
@@ -661,402 +790,7 @@ class RLSForecastRunner:
         )
         return out
 
-    # ── SKU+tienda: efecto RLS seleccionado + SES causal ──────────────────
-    @staticmethod
-    def _apply_ses(
-        df: pl.DataFrame, src_col: str, out_col: str, alpha: float
-    ) -> pl.DataFrame:
-        """Causal SES for train and frozen residual state for OOS/forecast.
-
-        In-sample predictions are one-step-ahead: the state used at t contains
-        residuals only through t-1.  For out_sample/forecast_only, the state is
-        the *final raw SES state from train*, including the last train residual,
-        and remains frozen for the entire horizon.  This avoids both leakage
-        from OOS actuals and the former off-by-one state bug.
-        """
-        df = df.sort(["unique_id", "ds"])
-        has_period = "period_type" in df.columns
-        is_train = (
-            (pl.col("period_type") == "in_sample") if has_period else pl.lit(True)
-        )
-
-        train = (
-            df.filter(is_train)
-            .with_columns(
-                pl.col(src_col)
-                .ewm_mean(alpha=alpha, adjust=False)
-                .over("unique_id")
-                .alias("_s_raw")
-            )
-            .with_columns(
-                pl.col("_s_raw")
-                .shift(1)
-                .over("unique_id")
-                .alias("_s_prev")
-            )
-            .with_columns(
-                pl.coalesce(pl.col("_s_prev"), pl.col(src_col))
-                .fill_null(0.0)
-                .alias(out_col)
-            )
-        )
-
-        if not has_period:
-            return train.drop(["_s_raw", "_s_prev"]).sort(["unique_id", "ds"])
-
-        # IMPORTANT: use raw final state, not the shifted one-step state.
-        last_state = train.group_by("unique_id").agg(
-            pl.col("_s_raw").last().alias("_last_s")
-        )
-        train = train.drop(["_s_raw", "_s_prev"])
-
-        future = df.filter(~is_train)
-        if future.height:
-            future = (
-                future.join(last_state, on="unique_id", how="left")
-                .with_columns(pl.col("_last_s").fill_null(0.0).alias(out_col))
-                .drop("_last_s")
-            )
-            return pl.concat([train, future], how="diagonal_relaxed").sort(
-                ["unique_id", "ds"]
-            )
-        return train.sort(["unique_id", "ds"])
-
-    @staticmethod
-    def _apply_ses_tuned(
-        df: pl.DataFrame,
-        src_col: str,
-        out_col: str,
-        *,
-        actual_col: str,
-        base_log_cols: tuple[str, ...],
-        default_alpha: float,
-    ) -> pl.DataFrame:
-        """Tune SES alpha per unique_id using only the tail of train.
-
-        Candidate alphas are scored on one-step-ahead forecasts reconstructed in
-        the original target space, using client WMAPE (y==0 excluded). OOS and
-        forecast-only keep the final train state frozen, so there is no leakage.
-        """
-        if df.height == 0:
-            return df
-        out = df.sort(["unique_id", "ds"])
-        uids = np.asarray(out["unique_id"].to_list(), dtype=object)
-        periods = (
-            np.asarray(out["period_type"].to_list(), dtype=object)
-            if "period_type" in out.columns
-            else np.full(out.height, "in_sample", dtype=object)
-        )
-        residual = out[src_col].to_numpy().astype(np.float64, copy=False)
-        actual = out[actual_col].to_numpy().astype(np.float64, copy=False)
-        base_log = np.zeros(out.height, dtype=np.float64)
-        for col in base_log_cols:
-            base_log += out[col].to_numpy().astype(np.float64, copy=False)
-
-        candidates = tuple(
-            float(a) for a in getattr(
-                settings, "SES_ALPHA_CANDIDATES",
-                (0.05, 0.10, 0.20, 0.35, 0.50, 0.70),
-            )
-            if 0.0 < float(a) <= 1.0
-        )
-        if not candidates:
-            candidates = (float(default_alpha),)
-        val_days = int(getattr(settings, "SES_TUNE_VALIDATION_DAYS", 28))
-        min_points = int(getattr(settings, "SES_TUNE_MIN_VALID_POINTS", 7))
-
-        pred_state = np.zeros(out.height, dtype=np.float64)
-        alpha_used = np.full(out.height, float(default_alpha), dtype=np.float64)
-
-        change = np.empty(len(uids), dtype=bool)
-        change[0] = True
-        change[1:] = uids[1:] != uids[:-1]
-        starts = np.flatnonzero(change)
-        ends = np.r_[starts[1:], len(uids)]
-
-        tuned = 0
-        for a, b in zip(starts, ends):
-            p = periods[a:b]
-            train_idx = np.flatnonzero(p == "in_sample")
-            future_idx = np.flatnonzero(p != "in_sample")
-            if train_idx.size == 0:
-                continue
-
-            r = residual[a:b]
-            y = actual[a:b]
-            base = base_log[a:b]
-            best_alpha = float(default_alpha)
-            best_score = float("inf")
-
-            # Score each alpha on recent train only.
-            for alpha in candidates:
-                states = np.empty(train_idx.size, dtype=np.float64)
-                state = None
-                for j, local_i in enumerate(train_idx):
-                    rv = r[local_i]
-                    if not np.isfinite(rv):
-                        rv = 0.0
-                    states[j] = rv if state is None else state
-                    state = rv if state is None else alpha * rv + (1.0 - alpha) * state
-
-                n_val = min(val_days, max(0, train_idx.size - 1))
-                if n_val < 1:
-                    continue
-                val_local = train_idx[-n_val:]
-                val_states = states[-n_val:]
-                y_val = y[val_local]
-                pred_val = np.maximum(
-                    0.0,
-                    np.expm1(base[val_local] + val_states),
-                )
-                mask = np.isfinite(y_val) & np.isfinite(pred_val)
-                if int(mask.sum()) < min_points:
-                    continue
-                denom = float(np.abs(y_val[mask]).sum())
-                if denom <= 0:
-                    continue
-                score = float(np.abs(y_val[mask] - pred_val[mask]).sum() / denom)
-                if score < best_score:
-                    best_score = score
-                    best_alpha = float(alpha)
-
-            # Generate train one-step states and freeze the final train state.
-            state = None
-            for local_i in train_idx:
-                rv = r[local_i]
-                if not np.isfinite(rv):
-                    rv = 0.0
-                pred_state[a + local_i] = rv if state is None else state
-                state = rv if state is None else best_alpha * rv + (1.0 - best_alpha) * state
-            frozen = 0.0 if state is None or not np.isfinite(state) else float(state)
-            for local_i in future_idx:
-                pred_state[a + local_i] = frozen
-            alpha_used[a:b] = best_alpha
-            if abs(best_alpha - float(default_alpha)) > 1e-12:
-                tuned += 1
-
-        result = out.with_columns(
-            pl.Series(out_col, pred_state),
-            pl.Series(f"{out_col}_alpha", alpha_used),
-        )
-        if tuned:
-            logger.info(
-                "SES adaptativo %s: %d series con alpha distinto del default %.2f",
-                actual_col, tuned, float(default_alpha),
-            )
-        return result
-
-
-    @staticmethod
-    def _select_model_wmape(
-        y: np.ndarray,
-        yhat_sec: np.ndarray,
-        yhat_sto: np.ndarray,
-        uid: np.ndarray,
-        is_train: np.ndarray,
-    ) -> dict[str, str]:
-        """WMAPE/BIAS solo in-sample → {unique_id: 'seccion'|'tienda'}.
-
-        Vectorizado con reduceat sobre grupos contiguos de uid (sin loop
-        Python por punto; solo un paso por serie).
-        """
-        selection: dict[str, str] = {}
-        mask = is_train & np.isfinite(y)
-        if not np.any(mask):
-            for u in np.unique(uid):
-                selection[str(u)] = "seccion"
-            return selection
-
-        # Solo filas train con venta; ordenar por uid
-        idx = np.flatnonzero(mask)
-        uid_m = np.asarray(uid)[idx]
-        order = np.argsort(uid_m, kind="mergesort")
-        uid_s = uid_m[order]
-        y_s = np.asarray(y, dtype=np.float64)[idx][order]
-        ys_s = np.asarray(yhat_sec, dtype=np.float64)[idx][order]
-        yt_s = np.asarray(yhat_sto, dtype=np.float64)[idx][order]
-
-        # Bordes de grupo
-        change = np.empty(len(uid_s), dtype=bool)
-        change[0] = True
-        change[1:] = uid_s[1:] != uid_s[:-1]
-        starts = np.flatnonzero(change)
-        # reduceat acumula por grupo
-        sum_abs_y = np.add.reduceat(np.abs(y_s), starts)
-        err_sec = np.add.reduceat(np.abs(y_s - ys_s), starts)
-        err_sto = np.add.reduceat(np.abs(y_s - yt_s), starts)
-        sum_y = np.add.reduceat(y_s, starts)
-        bias_sec = np.add.reduceat(ys_s - y_s, starts)
-        bias_sto = np.add.reduceat(yt_s - y_s, starts)
-
-        uids_grp = uid_s[starts]
-        for k, u in enumerate(uids_grp):
-            denom = float(sum_abs_y[k])
-            if denom == 0.0:
-                selection[str(u)] = "seccion"
-                continue
-            es, et = float(err_sec[k]), float(err_sto[k])
-            if et < es:
-                selection[str(u)] = "tienda"
-            elif et > es:
-                selection[str(u)] = "seccion"
-            else:
-                sy = float(sum_y[k])
-                if sy == 0.0:
-                    selection[str(u)] = "seccion"
-                else:
-                    selection[str(u)] = (
-                        "tienda"
-                        if abs(float(bias_sto[k]) / sy) <= abs(float(bias_sec[k]) / sy)
-                        else "seccion"
-                    )
-
-        # Series sin puntos train con venta → sección por defecto
-        for u in np.unique(uid):
-            su = str(u)
-            if su not in selection:
-                selection[su] = "seccion"
-        return selection
-
-    def _apply_leaf_guardrail(
-        self, block: pl.DataFrame, section_id: str
-    ) -> pl.DataFrame:
-        """Replace/clip weak leaf OOS forecasts using a leakage-free baseline.
-
-        A baseline is allowed to replace the RLS+SES candidate only when it
-        beats the model by a configurable margin on the recent train tail.
-        Regardless of replacement, future model forecasts are clipped to a
-        broad multiple of the robust baseline to prevent numerical explosions.
-        """
-        if not bool(getattr(settings, "LEAF_BASELINE_GUARDRAIL", True)):
-            return block
-        required = {"unique_id", "ds", "period_type", "y", "yhat"}
-        if block.height == 0 or not required.issubset(block.columns):
-            return block
-
-        method_map = getattr(settings, "LEAF_BASELINE_METHOD_BY_SECTION", {})
-        fallback_method = str(method_map.get(str(section_id), "median_pos56"))
-        methods = tuple(
-            str(m)
-            for m in getattr(
-                settings,
-                "LEAF_BASELINE_CANDIDATES",
-                (fallback_method,),
-            )
-        ) or (fallback_method,)
-        val_days = int(getattr(settings, "LEAF_BASELINE_VALIDATION_DAYS", 28))
-        lookback = int(getattr(settings, "LEAF_BASELINE_LOOKBACK_DAYS", 56))
-        min_points = int(getattr(settings, "LEAF_BASELINE_MIN_VALID_POINTS", 7))
-        min_improvement = float(
-            getattr(settings, "LEAF_BASELINE_MIN_IMPROVEMENT", 0.03)
-        )
-        clip_lo, clip_hi = tuple(
-            getattr(settings, "LEAF_BASELINE_CLIP_RATIO", (0.35, 2.50))
-        )
-
-        out = block.sort(["unique_id", "ds"])
-        uids = np.asarray(out["unique_id"].to_list(), dtype=object)
-        periods = np.asarray(out["period_type"].to_list(), dtype=object)
-        dates = out["ds"].to_list()
-        y = out["y"].to_numpy().astype(np.float64, copy=False)
-        yhat = out["yhat"].to_numpy().astype(np.float64, copy=True)
-        model_labels = (
-            np.asarray(out["modelo_seleccionado"].to_list(), dtype=object)
-            if "modelo_seleccionado" in out.columns
-            else np.full(len(out), "rls_ses", dtype=object)
-        )
-
-        if len(uids) == 0:
-            return out
-        change = np.empty(len(uids), dtype=bool)
-        change[0] = True
-        change[1:] = uids[1:] != uids[:-1]
-        starts = np.flatnonzero(change)
-        ends = np.r_[starts[1:], len(uids)]
-
-        replaced = 0
-        clipped = 0
-        for a, b in zip(starts, ends):
-            p = periods[a:b]
-            train_local = np.flatnonzero(p == "in_sample")
-            future_local = np.flatnonzero(
-                (p == "out_sample") | (p == "forecast_only")
-            )
-            if train_local.size < max(val_days + 1, min_points + 1) or future_local.size == 0:
-                continue
-
-            yy = y[a:b]
-            yh = yhat[a:b]
-            dd = dates[a:b]
-            y_train = yy[train_local]
-            d_train = [dd[i] for i in train_local]
-            n_val = min(val_days, len(y_train) - 1)
-            if np.count_nonzero(y_train[-n_val:] > 0) < min_points:
-                continue
-
-            # Challenger adaptativo: elegir el mejor baseline por serie usando
-            # exclusivamente la cola de train. No se fija un método por sección.
-            scored_methods: list[tuple[float, str]] = []
-            for candidate in methods:
-                try:
-                    score = robust_validation_score(
-                        y_train,
-                        d_train,
-                        method=candidate,
-                        validation_days=n_val,
-                        lookback_days=lookback,
-                    )
-                except ValueError:
-                    continue
-                if np.isfinite(score):
-                    scored_methods.append((float(score), candidate))
-            if not scored_methods:
-                continue
-            base_score, method = min(scored_methods, key=lambda x: x[0])
-
-            model_score = wmape_np(
-                y_train[-n_val:], yh[train_local][-n_val:]
-            )
-            future_dates = [dd[i] for i in future_local]
-            base_future = robust_baseline_forecast(
-                y_train,
-                d_train,
-                future_dates,
-                method=method,
-                lookback_days=lookback,
-            )
-
-            target_idx = a + future_local
-            baseline_wins = (
-                np.isfinite(base_score)
-                and np.isfinite(model_score)
-                and base_score <= model_score * (1.0 - min_improvement)
-            )
-
-            # IMPORTANTE: nunca recortar un RLS que ganó la validación. La
-            # versión anterior hacía clipping incondicional y podía aumentar
-            # el WMAPE OOS. Solo el challenger ganador puede reemplazar.
-            if baseline_wins:
-                before = yhat[target_idx].copy()
-                replacement = np.maximum(0.0, np.round(base_future, 0))
-                yhat[target_idx] = replacement
-                clipped += int(np.count_nonzero(before != replacement))
-                model_labels[target_idx] = f"baseline:{method}"
-                replaced += 1
-
-        out = out.with_columns(
-            pl.Series("yhat", yhat).clip(lower_bound=0.0).round(0),
-            pl.Series("modelo_seleccionado", model_labels),
-        )
-        if replaced or clipped:
-            logger.info(
-                "Sección %s: guardrail adaptativo → %d series reemplazadas, %d puntos cambiados",
-                section_id,
-                replaced,
-                clipped,
-            )
-        return out
-
+    # ── SKU+tienda: nivel causal + forma RLS ──────────────────
     def fast_leaf_forecasts(
         self,
         train_leaves: pl.DataFrame,
@@ -1065,11 +799,10 @@ class RLSForecastRunner:
         horizons: dict,
         meta: dict | None = None,
         parent_forecasts: pl.DataFrame | None = None,
-        actual_extension_leaves: pl.DataFrame | None = None,
     ) -> pl.DataFrame:
         """Production leaf model: original-scale SES level + normalized RLS shape.
 
-        SES owns the level of each SKU+store. Parent RLS forecasts are converted
+        SES owns the baseline level of each SKU+store; fallback levels are conditioned on positive-sale days to match the official metric. Parent RLS forecasts are converted
         to bounded multiplicative factors with arithmetic mean exactly 1 per
         28-day block, so drivers can change shape but never the block mean level.
 
@@ -1084,7 +817,29 @@ class RLSForecastRunner:
         t_leaf_total = time.perf_counter()
         uid_col = "unique_id"
         block_days = int(getattr(settings, "RLS_BLOCK_DAYS", 28))
-        warmup_days = block_days
+        memory_safe = (
+            bool(getattr(settings, "MULTIBLOCK_MEMORY_SAFE", True))
+            and block_days < int(getattr(settings, "MULTIBLOCK_MEMORY_SAFE_THRESHOLD_DAYS", 28))
+        )
+        if memory_safe:
+            spill_root = Path(getattr(settings, "OUT_DIR", Path.cwd())) / "_spill"
+            spill_root.mkdir(parents=True, exist_ok=True)
+        else:
+            spill_root = None
+        spill_tmp = (
+            tempfile.TemporaryDirectory(
+                prefix=f"ti_leaf_{section_id}_{block_days}d_",
+                dir=str(spill_root),
+            )
+            if memory_safe else None
+        )
+        spill_path = Path(spill_tmp.name) if spill_tmp is not None else None
+        if memory_safe:
+            logger.info(
+                "Memory-safe leaf: sección %s bloque=%dd | estados intermedios -> disco",
+                section_id, block_days,
+            )
+        warmup_days = int(getattr(settings, "LEAF_INITIAL_LEVEL_DAYS", 28))
         default_alpha = float(getattr(settings, "LEAF_SES_ALPHA", 0.70))
         alpha_candidates = tuple(
             sorted(
@@ -1202,12 +957,33 @@ class RLSForecastRunner:
             .select(uid_col, "_level_y", "_level_v")
         )
 
-        # Parent RLS contributes SHAPE only. The parent forecast is normalized
-        # forecast to an arithmetic mean of 1 inside every 28-day block.
-        # Therefore drivers can change the daily shape but CANNOT change the
-        # average level of the SKU+store series.
+        # Parent RLS can contribute either SHAPE ONLY or LEVEL+SHAPE.
+        #
+        # v11.0-v11.4 forced every 28-day parent effect to arithmetic mean 1.
+        # That is safe against level explosions, but it also deletes genuine
+        # horizon-wide commercial uplifts (for example Christmas).  v11.5
+        # keeps the old mean-one shape as one candidate and adds a causal
+        # level+shape candidate:
+        #
+        #   level_factor(block b) = mean(parent RLS forecast in b)
+        #                           / mean(parent actual in b-1)
+        #
+        # The factor uses only information available at the forecast origin.
+        # The leaf then chooses shape_only vs level_shape from PRIOR block
+        # errors, together with store vs section parent.  Nothing is selected
+        # from the target block itself.
         parent = (
-            parent_forecasts.with_columns(pl.col("ds").cast(pl.Date), block_expr())
+            parent_forecasts.with_columns(
+                pl.col("ds").cast(pl.Date),
+                block_expr(),
+            )
+            .with_columns(
+                pl.when(pl.col("period_type") == "forecast_only")
+                .then(pl.lit(-1))
+                .otherwise(pl.col("_block"))
+                .cast(pl.Int32)
+                .alias("_shape_group")
+            )
             if parent_forecasts is not None and parent_forecasts.height
             else pl.DataFrame()
         )
@@ -1221,15 +997,62 @@ class RLSForecastRunner:
                     (0.50, 2.00),
                 )
             )
+            max_level_step = float(
+                getattr(settings, "LEAF_REGIME_TREND_MAX_STEP_RATIO", 2.0)
+            )
+            if max_level_step < 1.0:
+                raise ValueError("LEAF_REGIME_TREND_MAX_STEP_RATIO must be >= 1")
+
+            # Causal parent baseline for block b = actual mean of block b-1.
+            # Parent nodes are already dense, so this is a true calendar-day
+            # level and is directly compatible with the leaf's daily SES level.
+            prev_parent_level = (
+                parent.filter(pl.col("period_type") != "forecast_only")
+                .group_by(["unique_id", "_block"])
+                .agg(
+                    pl.col("y").fill_null(0.0).clip(lower_bound=0.0).mean().alias("_prev_y"),
+                    pl.col("value").fill_null(0.0).clip(lower_bound=0.0).mean().alias("_prev_v"),
+                )
+                .with_columns((pl.col("_block") + 1).cast(pl.Int32).alias("_block"))
+            )
+            parent_block_mean = (
+                parent.filter(pl.col("_block") >= 1)
+                .group_by(["unique_id", "_block"])
+                .agg(
+                    pl.col("yhat").fill_null(0.0).clip(lower_bound=0.0).mean().alias("_mean_py_block"),
+                    pl.col("valuehat").fill_null(0.0).clip(lower_bound=0.0).mean().alias("_mean_pv_block"),
+                )
+                .join(prev_parent_level, on=["unique_id", "_block"], how="left")
+                .with_columns(
+                    pl.when(pl.col("_prev_y") > 1e-12)
+                    .then(pl.col("_mean_py_block") / pl.col("_prev_y"))
+                    .otherwise(1.0)
+                    .clip(1.0 / max_level_step, max_level_step)
+                    .alias("_level_factor_y"),
+                    pl.when(pl.col("_prev_v") > 1e-12)
+                    .then(pl.col("_mean_pv_block") / pl.col("_prev_v"))
+                    .otherwise(1.0)
+                    .clip(1.0 / max_level_step, max_level_step)
+                    .alias("_level_factor_v"),
+                )
+                .select(
+                    "unique_id", "_block",
+                    "_level_factor_y", "_level_factor_v",
+                )
+            )
+
             parent_effects = (
                 parent.filter(pl.col("_block") >= 1)
+                .join(parent_block_mean, on=["unique_id", "_block"], how="left")
                 .with_columns(
+                    pl.col("_level_factor_y").fill_null(1.0),
+                    pl.col("_level_factor_v").fill_null(1.0),
                     pl.col("yhat").fill_null(0.0).clip(lower_bound=0.0).alias("_py"),
                     pl.col("valuehat").fill_null(0.0).clip(lower_bound=0.0).alias("_pv"),
                 )
                 .with_columns(
-                    pl.col("_py").mean().over(["unique_id", "_block"]).alias("_mean_py"),
-                    pl.col("_pv").mean().over(["unique_id", "_block"]).alias("_mean_pv"),
+                    pl.col("_py").mean().over(["unique_id", "_shape_group"]).alias("_mean_py"),
+                    pl.col("_pv").mean().over(["unique_id", "_shape_group"]).alias("_mean_pv"),
                 )
                 .with_columns(
                     pl.when(pl.col("_mean_py") > 1e-12)
@@ -1246,15 +1069,13 @@ class RLSForecastRunner:
                     (pl.col("_ratio_v") - 1.0).alias("_dev_v"),
                 )
                 .with_columns(
-                    pl.col("_dev_y").max().over(["unique_id", "_block"]).alias("_max_dy"),
-                    pl.col("_dev_y").min().over(["unique_id", "_block"]).alias("_min_dy"),
-                    pl.col("_dev_v").max().over(["unique_id", "_block"]).alias("_max_dv"),
-                    pl.col("_dev_v").min().over(["unique_id", "_block"]).alias("_min_dv"),
+                    pl.col("_dev_y").max().over(["unique_id", "_shape_group"]).alias("_max_dy"),
+                    pl.col("_dev_y").min().over(["unique_id", "_shape_group"]).alias("_min_dy"),
+                    pl.col("_dev_v").max().over(["unique_id", "_shape_group"]).alias("_max_dv"),
+                    pl.col("_dev_v").min().over(["unique_id", "_shape_group"]).alias("_min_dv"),
                 )
-                # Shrink deviations around 1 with ONE group-wise scalar. Since
-                # mean(ratio)=1, mean(deviation)=0 and mean(factor) stays EXACTLY 1.
-                # The scalar is the largest value that keeps every factor inside
-                # [factor_lo, factor_hi].
+                # Keep the old safe shape normalization exactly: one scalar
+                # shrinks all daily deviations, so shape mean remains 1.
                 .with_columns(
                     pl.min_horizontal(
                         pl.lit(1.0),
@@ -1276,33 +1097,36 @@ class RLSForecastRunner:
                     ).alias("_shape_scale_v"),
                 )
                 .with_columns(
-                    (1.0 + pl.col("_shape_scale_y") * pl.col("_dev_y"))
-                    .alias("_factor_y"),
-                    (1.0 + pl.col("_shape_scale_v") * pl.col("_dev_v"))
-                    .alias("_factor_v"),
+                    (1.0 + pl.col("_shape_scale_y") * pl.col("_dev_y")).alias("_shape_factor_y"),
+                    (1.0 + pl.col("_shape_scale_v") * pl.col("_dev_v")).alias("_shape_factor_v"),
                 )
                 .with_columns(
-                    pl.col("_factor_y").log().alias("_effect_y"),
-                    pl.col("_factor_v").log().alias("_effect_v"),
-                )
-                .select("unique_id", "ds", "_block", "_effect_y", "_effect_v")
-            )
-
-            # Forecast-only must preserve a driver shape. If a parent's future
-            # block collapses to a flat factor, reuse the immediately preceding
-            # 28-day OOS factor shifted forward. This uses no future actuals.
-            prev_shape = (
-                parent_effects.filter(
-                    (pl.col("ds") >= pl.lit(test_start))
-                    & (pl.col("ds") <= pl.lit(test_end))
-                )
-                .with_columns(
-                    (pl.col("ds") + pl.duration(days=block_days)).alias("ds")
+                    pl.col("_shape_factor_y").log().alias("_effect_y_shape"),
+                    pl.col("_shape_factor_v").log().alias("_effect_v_shape"),
                 )
                 .select(
+                    "unique_id", "ds", "_block",
+                    "_effect_y_shape", "_effect_v_shape",
+                    "_level_factor_y", "_level_factor_v",
+                )
+            )
+
+            # Forecast-only: if the future parent path is perfectly flat,
+            # reuse the prior OOS SHAPE but keep the CURRENT causal level
+            # factor from the parent RLS forecast.
+            shape_source_end = test_end
+            shape_source_start = shape_source_end - dt.timedelta(days=block_days - 1)
+            shape_shift_days = int((forecast_start - shape_source_start).days)
+            prev_shape = (
+                parent_effects.filter(
+                    (pl.col("ds") >= pl.lit(shape_source_start))
+                    & (pl.col("ds") <= pl.lit(shape_source_end))
+                )
+                .with_columns((pl.col("ds") + pl.duration(days=shape_shift_days)).alias("ds"))
+                .select(
                     "unique_id", "ds",
-                    pl.col("_effect_y").alias("_prev_effect_y"),
-                    pl.col("_effect_v").alias("_prev_effect_v"),
+                    pl.col("_effect_y_shape").alias("_prev_effect_y_shape"),
+                    pl.col("_effect_v_shape").alias("_prev_effect_v_shape"),
                 )
             )
             shape_stats = (
@@ -1312,8 +1136,8 @@ class RLSForecastRunner:
                 )
                 .group_by("unique_id")
                 .agg(
-                    pl.col("_effect_y").std().fill_null(0.0).alias("_fc_std_y"),
-                    pl.col("_effect_v").std().fill_null(0.0).alias("_fc_std_v"),
+                    pl.col("_effect_y_shape").std().fill_null(0.0).alias("_fc_std_y"),
+                    pl.col("_effect_v_shape").std().fill_null(0.0).alias("_fc_std_v"),
                 )
             )
             parent_effects = (
@@ -1324,23 +1148,98 @@ class RLSForecastRunner:
                         (pl.col("ds") >= pl.lit(forecast_start))
                         & (pl.col("ds") <= pl.lit(forecast_end))
                         & (pl.col("_fc_std_y").fill_null(0.0) < 1e-10)
-                        & pl.col("_prev_effect_y").is_not_null()
+                        & pl.col("_prev_effect_y_shape").is_not_null()
                     )
-                    .then(pl.col("_prev_effect_y"))
-                    .otherwise(pl.col("_effect_y"))
-                    .alias("_effect_y"),
+                    .then(pl.col("_prev_effect_y_shape"))
+                    .otherwise(pl.col("_effect_y_shape"))
+                    .alias("_effect_y_shape"),
                     pl.when(
                         (pl.col("ds") >= pl.lit(forecast_start))
                         & (pl.col("ds") <= pl.lit(forecast_end))
                         & (pl.col("_fc_std_v").fill_null(0.0) < 1e-10)
-                        & pl.col("_prev_effect_v").is_not_null()
+                        & pl.col("_prev_effect_v_shape").is_not_null()
                     )
-                    .then(pl.col("_prev_effect_v"))
-                    .otherwise(pl.col("_effect_v"))
-                    .alias("_effect_v"),
+                    .then(pl.col("_prev_effect_v_shape"))
+                    .otherwise(pl.col("_effect_v_shape"))
+                    .alias("_effect_v_shape"),
                 )
-                .select("unique_id", "ds", "_block", "_effect_y", "_effect_v")
+                .with_columns(
+                    (pl.col("_effect_y_shape") + pl.col("_level_factor_y").log()).alias("_effect_y_level"),
+                    (pl.col("_effect_v_shape") + pl.col("_level_factor_v").log()).alias("_effect_v_level"),
+                )
+                .select(
+                    "unique_id", "ds", "_block",
+                    "_effect_y_shape", "_effect_v_shape",
+                    "_effect_y_level", "_effect_v_level",
+                    "_level_factor_y", "_level_factor_v",
+                )
             )
+
+        # Explicit parent availability. A missing store RLS must not be
+        # represented as a silent factor=1 candidate.
+        require_parent = bool(
+            getattr(settings, "LEAF_REQUIRE_PARENT_DRIVERS", True)
+        )
+        parent_uid_set = (
+            parent.select("unique_id").unique()
+            if parent.height
+            else pl.DataFrame(schema={"unique_id": pl.Utf8})
+        )
+        section_parent_available = (
+            bool(
+                parent_uid_set.filter(
+                    pl.col("unique_id") == str(section_id)
+                ).height
+            )
+            if parent_uid_set.height
+            else False
+        )
+        store_parent_ids = (
+            parent_uid_set.filter(
+                pl.col("unique_id")
+                .str.count_matches(r"\|\|", literal=False)
+                == 1
+            )
+            .rename({"unique_id": "_store_uid"})
+            .with_columns(pl.lit(True).alias("_store_parent_available"))
+            if parent_uid_set.height
+            else pl.DataFrame(
+                schema={
+                    "_store_uid": pl.Utf8,
+                    "_store_parent_available": pl.Boolean,
+                }
+            )
+        )
+        leaf_parent_availability = (
+            ids.select(uid_col)
+            .with_columns(
+                pl.col(uid_col)
+                .str.replace(r"\|\|S:.*$", "")
+                .alias("_store_uid")
+            )
+            .join(store_parent_ids, on="_store_uid", how="left")
+            .with_columns(
+                pl.col("_store_parent_available")
+                .fill_null(False),
+                pl.lit(section_parent_available)
+                .alias("_section_parent_available"),
+            )
+            .select(
+                uid_col,
+                "_store_parent_available",
+                "_section_parent_available",
+            )
+        )
+        if require_parent:
+            missing_parent = leaf_parent_availability.filter(
+                ~pl.col("_store_parent_available")
+                & ~pl.col("_section_parent_available")
+            )
+            if missing_parent.height:
+                raise RuntimeError(
+                    "Leaf RLS parent invariant violated: leaves without store "
+                    f"or section parent; examples={missing_parent.head(5).to_dicts()}"
+                )
 
         # Observed leaf rows through OOS only.  No post-OOS leakage.
         actual_parts = [
@@ -1356,7 +1255,6 @@ class RLSForecastRunner:
             )
         actual_obs = (
             pl.concat(actual_parts, how="diagonal_relaxed")
-            .sort([uid_col, "ds"])
             .with_columns(block_expr())
         )
 
@@ -1380,6 +1278,7 @@ class RLSForecastRunner:
             (pl.col("value").fill_null(0.0) if "value" in oos_grid.columns else pl.lit(0.0).alias("value")),
             pl.lit("out_sample").alias("period_type"),
         )
+
 
         forecast_grid = pl.DataFrame(
             {
@@ -1405,40 +1304,63 @@ class RLSForecastRunner:
             .with_columns(pl.lit("in_sample").alias("period_type"))
         )
 
+        row_parts = [historical, oos_grid, forecast_grid]
         rows = pl.concat(
-            [historical, oos_grid, forecast_grid], how="diagonal_relaxed"
+            row_parts, how="diagonal_relaxed"
         ).with_columns(
             block_expr(),
             pl.col(uid_col).str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
         )
 
-        # Join store and section log-effects.
+        # Join store and section parent effects.  Keep both candidates:
+        # mean-one shape and causal level+shape.
         if parent_effects.height:
             store_eff = parent_effects.filter(
                 pl.col("unique_id").str.count_matches(r"\|\|", literal=False) == 1
             ).select(
                 pl.col("unique_id").alias("_store_uid"), "ds",
-                pl.col("_effect_y").alias("_store_ey"),
-                pl.col("_effect_v").alias("_store_ev"),
+                pl.col("_effect_y_shape").alias("_store_ey_shape"),
+                pl.col("_effect_v_shape").alias("_store_ev_shape"),
+                pl.col("_effect_y_level").alias("_store_ey_level"),
+                pl.col("_effect_v_level").alias("_store_ev_level"),
+                pl.col("_level_factor_y").alias("_store_level_factor_y"),
+                pl.col("_level_factor_v").alias("_store_level_factor_v"),
             )
             sec_eff = parent_effects.filter(
                 pl.col("unique_id") == str(section_id)
             ).select(
                 "ds",
-                pl.col("_effect_y").alias("_sec_ey"),
-                pl.col("_effect_v").alias("_sec_ev"),
+                pl.col("_effect_y_shape").alias("_sec_ey_shape"),
+                pl.col("_effect_v_shape").alias("_sec_ev_shape"),
+                pl.col("_effect_y_level").alias("_sec_ey_level"),
+                pl.col("_effect_v_level").alias("_sec_ev_level"),
+                pl.col("_level_factor_y").alias("_sec_level_factor_y"),
+                pl.col("_level_factor_v").alias("_sec_level_factor_v"),
             )
             rows = rows.join(store_eff, on=["_store_uid", "ds"], how="left")
             rows = rows.join(sec_eff, on="ds", how="left")
 
-        for c in ("_store_ey", "_store_ev", "_sec_ey", "_sec_ev"):
+        effect_cols = (
+            "_store_ey_shape", "_store_ev_shape", "_store_ey_level", "_store_ev_level",
+            "_sec_ey_shape", "_sec_ev_shape", "_sec_ey_level", "_sec_ev_level",
+        )
+        level_cols = (
+            "_store_level_factor_y", "_store_level_factor_v",
+            "_sec_level_factor_y", "_sec_level_factor_v",
+        )
+        for c in effect_cols:
             if c not in rows.columns:
                 rows = rows.with_columns(pl.lit(0.0).alias(c))
             else:
                 rows = rows.with_columns(pl.col(c).fill_nan(0.0).fill_null(0.0))
+        for c in level_cols:
+            if c not in rows.columns:
+                rows = rows.with_columns(pl.lit(1.0).alias(c))
+            else:
+                rows = rows.with_columns(pl.col(c).fill_nan(1.0).fill_null(1.0))
 
-        # Actual observations receive the same causal parent effects used by
-        # their forecast block; these residuals update SES only AFTER block close.
+        # Actual observations receive the same causal parent candidates used
+        # by their forecast block; candidate scoring happens only after close.
         actual_resid = (
             actual_obs.join(leaf_bounds, on=uid_col, how="left")
             .filter(pl.col("ds") > pl.col("_leaf_warmup_end"))
@@ -1450,17 +1372,24 @@ class RLSForecastRunner:
             actual_resid = actual_resid.join(
                 store_eff, on=["_store_uid", "ds"], how="left"
             ).join(sec_eff, on="ds", how="left")
-        for c in ("_store_ey", "_store_ev", "_sec_ey", "_sec_ev"):
+        for c in effect_cols:
             if c not in actual_resid.columns:
                 actual_resid = actual_resid.with_columns(pl.lit(0.0).alias(c))
             else:
                 actual_resid = actual_resid.with_columns(pl.col(c).fill_nan(0.0).fill_null(0.0))
+        for c in level_cols:
+            if c not in actual_resid.columns:
+                actual_resid = actual_resid.with_columns(pl.lit(1.0).alias(c))
+            else:
+                actual_resid = actual_resid.with_columns(pl.col(c).fill_nan(1.0).fill_null(1.0))
 
         max_block = int((forecast_end - train_start).days // block_days)
-        actual_last_block = int((test_end - train_start).days // block_days)
+        actual_last_block = int(
+            (test_end - train_start).days // block_days
+        )
 
-        # ── v8.9: TWO-STAGE + level-stability engine ────────────────────────────────────────
-        # Stage 1 (PURE SES): choose alpha using SES-only block forecasts.
+        # ── TWO-STAGE SKU+tienda engine ───────────────────────────────────
+        # Stage 1 (PURE SES): choose alpha using SES-only block forecasts scored on positive-sale days.
         # Stage 2 (DRIVERS): with the SES level already fixed, choose whether
         # store or section RLS shape gives the lower prior cumulative wMAPE.
         #
@@ -1471,22 +1400,64 @@ class RLSForecastRunner:
         alpha_params = pl.DataFrame(
             [{"_alpha": float(a)} for a in alpha_candidates]
         )
-        driver_strengths = tuple(
-            float(x)
+        parent_names = tuple(
+            str(x)
             for x in getattr(
                 settings,
-                "LEAF_DRIVER_STRENGTH_CANDIDATES",
-                (0.25, 0.50, 0.75, 1.00),
+                "LEAF_PARENT_CANDIDATES",
+                ("store", "section"),
             )
+            if str(x) in {"store", "section"}
         )
-        parent_candidates = [
-            {"_parent": "none", "_strength": 0.0}
-        ] + [
-            {"_parent": parent_name, "_strength": strength}
-            for parent_name in ("store", "section")
-            for strength in driver_strengths
-        ]
-        parent_params = pl.DataFrame(parent_candidates)
+        if set(parent_names) != {"store", "section"}:
+            raise ValueError(
+                "LEAF_PARENT_CANDIDATES must contain exactly store and section; "
+                f"got {parent_names}"
+            )
+        parent_strength = float(
+            getattr(settings, "LEAF_PARENT_DRIVER_STRENGTH", 1.0)
+        )
+        if abs(parent_strength - 1.0) > 1e-12:
+            raise ValueError(
+                "v11 requires LEAF_PARENT_DRIVER_STRENGTH=1.0; "
+                f"got {parent_strength}"
+            )
+        driver_modes = tuple(
+            str(x)
+            for x in getattr(
+                settings,
+                "LEAF_PARENT_DRIVER_MODES",
+                ("shape_only", "level_shape"),
+            )
+            if str(x) in {"shape_only", "level_shape"}
+        )
+        if not driver_modes:
+            raise ValueError(
+                "LEAF_PARENT_DRIVER_MODES must contain at least one valid mode; "
+                f"got {driver_modes}"
+            )
+        if not bool(getattr(settings, "LEAF_PARENT_LEVEL_SHAPE_SELECTABLE", True)):
+            driver_modes = tuple(m for m in driver_modes if m == "shape_only")
+            if not driver_modes:
+                driver_modes = ("shape_only",)
+        default_driver_mode = str(
+            getattr(settings, "LEAF_PARENT_DEFAULT_DRIVER_MODE", "shape_only")
+        )
+        if default_driver_mode not in driver_modes:
+            raise ValueError(
+                "LEAF_PARENT_DEFAULT_DRIVER_MODE must be in LEAF_PARENT_DRIVER_MODES"
+            )
+        parent_params = pl.DataFrame(
+            [
+                {
+                    "_parent": parent_name,
+                    "_driver_mode": driver_mode,
+                    "_strength": 1.0,
+                }
+                for parent_name in parent_names
+                for driver_mode in driver_modes
+            ]
+        )
 
         # Pure SES state: one level trajectory per leaf × alpha.
         alpha_state = (
@@ -1495,18 +1466,49 @@ class RLSForecastRunner:
             .join(alpha_params, how="cross")
             .join(state0, on=uid_col, how="left")
             .with_columns(
-                pl.lit(0.0).alias("_cae_ses_y"),
-                pl.lit(0.0).alias("_cden_ses_y"),
-                pl.lit(0.0).alias("_cae_ses_v"),
-                pl.lit(0.0).alias("_cden_ses_v"),
+                pl.lit(0.0).alias("_score_ae_b0_y"),
+                pl.lit(0.0).alias("_score_den_b0_y"),
+                pl.lit(0.0).alias("_score_se_b0_y"),
+                pl.lit(0.0).alias("_score_ae_b1_y"),
+                pl.lit(0.0).alias("_score_den_b1_y"),
+                pl.lit(0.0).alias("_score_se_b1_y"),
+                pl.lit(0.0).alias("_score_ae_b2_y"),
+                pl.lit(0.0).alias("_score_den_b2_y"),
+                pl.lit(0.0).alias("_score_se_b2_y"),
+                pl.lit(0.0).alias("_score_ae_b3_y"),
+                pl.lit(0.0).alias("_score_den_b3_y"),
+                pl.lit(0.0).alias("_score_se_b3_y"),
+                pl.lit(0.0).alias("_score_ae_b0_v"),
+                pl.lit(0.0).alias("_score_den_b0_v"),
+                pl.lit(0.0).alias("_score_se_b0_v"),
+                pl.lit(0.0).alias("_score_ae_b1_v"),
+                pl.lit(0.0).alias("_score_den_b1_v"),
+                pl.lit(0.0).alias("_score_se_b1_v"),
+                pl.lit(0.0).alias("_score_ae_b2_v"),
+                pl.lit(0.0).alias("_score_den_b2_v"),
+                pl.lit(0.0).alias("_score_se_b2_v"),
+                pl.lit(0.0).alias("_score_ae_b3_v"),
+                pl.lit(0.0).alias("_score_den_b3_v"),
+                pl.lit(0.0).alias("_score_se_b3_v"),
             )
         )
 
         # Parent scores contain NO SES state and NO alpha. They evaluate only
         # the shape added on top of the alpha/level selected by pure SES.
         parent_state = (
-            ids.select(uid_col)
+            leaf_parent_availability
             .join(parent_params, how="cross")
+            .filter(
+                (
+                    (pl.col("_parent") == "store")
+                    & pl.col("_store_parent_available")
+                )
+                | (
+                    (pl.col("_parent") == "section")
+                    & pl.col("_section_parent_available")
+                )
+            )
+            .select(uid_col, "_parent", "_driver_mode", "_strength")
             .with_columns(
                 pl.lit(0.0).alias("_cae_parent_y"),
                 pl.lit(0.0).alias("_cden_parent_y"),
@@ -1514,19 +1516,9 @@ class RLSForecastRunner:
                 pl.lit(0.0).alias("_cden_parent_v"),
             )
         )
-        driver_score_decay = float(
-            getattr(settings, "LEAF_DRIVER_SCORE_DECAY", 0.70)
-        )
-        driver_near_best_tol = float(
-            getattr(
-                settings,
-                "LEAF_DRIVER_NEAR_BEST_REL_TOLERANCE",
-                0.02,
-            )
-        )
-        default_driver_strength = float(
-            getattr(settings, "LEAF_DRIVER_DEFAULT_STRENGTH", 0.50)
-        )
+        # Parent selection is the simple expanding prior wMAPE requested by
+        # the client. No decay, no "none", no partial strengths.
+        driver_score_decay = 1.0
 
         # Partition actual rows once. Missing calendar dates are zeros and are
         # handled analytically below; the full history is never densified.
@@ -1537,27 +1529,21 @@ class RLSForecastRunner:
             ).items():
                 k = key[0] if isinstance(key, tuple) else key
                 obs_by_block[int(k)] = frame
+        if memory_safe:
+            del actual_resid
 
-        # Precompute the causal stability reference without rescanning the
-        # full leaf history inside every block. 112 days = four 28-day blocks.
-        stability_enabled = bool(
-            getattr(settings, "LEAF_SES_STABILITY_ENABLED", True)
+        # Robust reference window is the same finite history used by regime
+        # detection. No separate "stability" subsystem exists in v11.
+        regime_history_blocks = int(
+            getattr(settings, "LEAF_REGIME_HISTORY_BLOCKS", 8)
         )
-        stability_days = int(
-            getattr(settings, "LEAF_SES_STABILITY_WINDOW_DAYS", 112)
-        )
-        stability_ratio = float(
-            getattr(settings, "LEAF_SES_LEVEL_MAX_RECENT_RATIO", 1.5)
-        )
+        if regime_history_blocks < 1:
+            raise ValueError("LEAF_REGIME_HISTORY_BLOCKS must be >= 1")
+        stability_days = regime_history_blocks * block_days
         stability_eps = float(
-            getattr(settings, "LEAF_SES_STABILITY_EPS", 1e-9)
+            getattr(settings, "LEAF_REGIME_EPS", 1e-9)
         )
-        if stability_days <= 0 or stability_days % block_days != 0:
-            raise ValueError(
-                "LEAF_SES_STABILITY_WINDOW_DAYS must be a positive multiple "
-                f"of RLS_BLOCK_DAYS={block_days}; got {stability_days}"
-            )
-        stability_blocks = stability_days // block_days
+        stability_blocks = regime_history_blocks
 
         stability_block_sums = (
             actual_obs.with_columns(
@@ -1613,117 +1599,279 @@ class RLSForecastRunner:
                 .alias("_last14_sum_v"),
             )
         )
-        recent_block_stats = stability_block_sums.with_columns(
-            (pl.col("_block") + 1).cast(pl.Int32).alias("_block")
-        ).select(
-            uid_col,
-            "_block",
-            pl.col("_ref_sum_y").alias("_recent28_sum_y"),
-            pl.col("_ref_sum_v").alias("_recent28_sum_v"),
-            pl.col("_ref_nz_y").alias("_recent28_nz_y"),
-            pl.col("_ref_nz_v").alias("_recent28_nz_v"),
-            pl.col("_last14_sum_y").alias("_recent14_sum_y"),
-            pl.col("_last14_sum_v").alias("_recent14_sum_v"),
-        )
-        stability_shifted: list[pl.DataFrame] = []
-        for lag_block in range(1, stability_blocks + 1):
-            stability_shifted.append(
-                stability_block_sums.with_columns(
-                    (pl.col("_block") + lag_block)
-                    .cast(pl.Int32)
-                    .alias("_block")
-                )
-            )
-        stability_ref_sums = (
-            pl.concat(stability_shifted, how="vertical_relaxed")
-            .group_by([uid_col, "_block"])
-            .agg(
-                pl.col("_ref_sum_y").sum().alias("_ref_sum_y"),
-                pl.col("_ref_sum_v").sum().alias("_ref_sum_v"),
-            )
-            if stability_shifted
-            else pl.DataFrame()
+        regime_min_history_blocks = int(
+            getattr(settings, "LEAF_REGIME_MIN_HISTORY_BLOCKS", 4)
         )
 
-        # v9.1 robust sparse reference: use the median of the previous four
-        # 28-day DAILY means. A single spike-heavy block can inflate the
-        # 112-day mean, but cannot dominate this median. This reference is
-        # diagnostic/selection-only: the forecast level remains a PURE SES
-        # state from alpha_state.
-        robust_block_shifted: list[pl.DataFrame] = []
-        for lag_block in range(1, stability_blocks + 1):
-            robust_block_shifted.append(
-                stability_block_sums.select(
+        if memory_safe:
+            # 1d creates roughly 28x more origin rows than 28d. The historical
+            # implementation materialized 5 shifted copies twice (structural
+            # history + reference sums), which can exceed RAM before the model
+            # reaches OOS. Keep one compact block-stat partition and assemble
+            # the six exact prior blocks only for the current origin.
+            stability_by_block: dict[int, pl.DataFrame] = {}
+            if stability_block_sums.height:
+                for key, frame in stability_block_sums.partition_by(
+                    "_block", as_dict=True, maintain_order=True
+                ).items():
+                    k = key[0] if isinstance(key, tuple) else key
+                    stability_by_block[int(k)] = frame.drop("_block")
+            del stability_block_sums
+            del actual_obs
+
+            def _recent_ref_base_memory_safe(origin_block: int) -> pl.DataFrame:
+                base = ids.select(uid_col).join(leaf_bounds, on=uid_col, how="left")
+                # B0 = immediately closed block. B1..B5 are exact calendar
+                # update blocks before B0; an absent block stays null/zero,
+                # matching the previous shifted exact-block joins.
+                b0 = stability_by_block.get(origin_block - 1)
+                if b0 is not None:
+                    base = base.join(
+                        b0.select(
+                            uid_col,
+                            pl.col("_ref_sum_y").alias("_recent28_sum_y"),
+                            pl.col("_ref_sum_v").alias("_recent28_sum_v"),
+                            pl.col("_ref_nz_y").alias("_recent28_nz_y"),
+                            pl.col("_ref_nz_v").alias("_recent28_nz_v"),
+                            pl.col("_last14_sum_y").alias("_recent14_sum_y"),
+                            pl.col("_last14_sum_v").alias("_recent14_sum_v"),
+                        ),
+                        on=uid_col,
+                        how="left",
+                    )
+                else:
+                    base = base.with_columns(
+                        pl.lit(None, dtype=pl.Float64).alias("_recent28_sum_y"),
+                        pl.lit(None, dtype=pl.Float64).alias("_recent28_sum_v"),
+                        pl.lit(None, dtype=pl.Int32).alias("_recent28_nz_y"),
+                        pl.lit(None, dtype=pl.Int32).alias("_recent28_nz_v"),
+                        pl.lit(None, dtype=pl.Float64).alias("_recent14_sum_y"),
+                        pl.lit(None, dtype=pl.Float64).alias("_recent14_sum_v"),
+                    )
+
+                for hist_i in range(1, regime_history_blocks + 1):
+                    src = stability_by_block.get(origin_block - 1 - hist_i)
+                    cy, cv = f"_hist_b{hist_i}_y", f"_hist_b{hist_i}_v"
+                    if src is not None:
+                        base = base.join(
+                            src.select(
+                                uid_col,
+                                (pl.col("_ref_sum_y") / pl.lit(float(block_days))).alias(cy),
+                                (pl.col("_ref_sum_v") / pl.lit(float(block_days))).alias(cv),
+                            ),
+                            on=uid_col,
+                            how="left",
+                        )
+                    else:
+                        base = base.with_columns(
+                            pl.lit(None, dtype=pl.Float64).alias(cy),
+                            pl.lit(None, dtype=pl.Float64).alias(cv),
+                        )
+
+                hist_y = [pl.col(f"_hist_b{i}_y") for i in range(1, regime_history_blocks + 1)]
+                hist_v = [pl.col(f"_hist_b{i}_v") for i in range(1, regime_history_blocks + 1)]
+                ref_hist_n = max(0, min(stability_blocks - 1, regime_history_blocks))
+                ref_y_terms = [pl.col("_recent28_sum_y").fill_null(0.0)] + [
+                    pl.col(f"_hist_b{i}_y").fill_null(0.0) * pl.lit(float(block_days))
+                    for i in range(1, ref_hist_n + 1)
+                ]
+                ref_v_terms = [pl.col("_recent28_sum_v").fill_null(0.0)] + [
+                    pl.col(f"_hist_b{i}_v").fill_null(0.0) * pl.lit(float(block_days))
+                    for i in range(1, ref_hist_n + 1)
+                ]
+                base = base.with_columns(
+                    (pl.col("_recent28_sum_y") / pl.lit(float(block_days))).alias("_b0_y"),
+                    (pl.col("_recent28_sum_v") / pl.lit(float(block_days))).alias("_b0_v"),
+                    *[
+                        pl.col(f"_hist_b{i}_y").alias(f"_b{i}_y")
+                        for i in range(1, min(3, regime_history_blocks) + 1)
+                    ],
+                    *[
+                        pl.col(f"_hist_b{i}_v").alias(f"_b{i}_v")
+                        for i in range(1, min(3, regime_history_blocks) + 1)
+                    ],
+                    pl.concat_list(hist_y).list.median().alias("_structural_y"),
+                    pl.concat_list(hist_v).list.median().alias("_structural_v"),
+                    pl.sum_horizontal(*[x.is_not_null().cast(pl.Int32) for x in hist_y])
+                    .alias("_structural_history_blocks_y"),
+                    pl.sum_horizontal(*[x.is_not_null().cast(pl.Int32) for x in hist_v])
+                    .alias("_structural_history_blocks_v"),
+                    pl.sum_horizontal(*ref_y_terms).alias("_ref_sum_y"),
+                    pl.sum_horizontal(*ref_v_terms).alias("_ref_sum_v"),
+                )
+                # The downstream regime code expects B1/B2/B3 even when the
+                # configured history is shorter (production is >=4 today).
+                missing = []
+                for i in (1, 2, 3):
+                    for suffix in ("y", "v"):
+                        c = f"_b{i}_{suffix}"
+                        if c not in base.columns:
+                            missing.append(pl.lit(None, dtype=pl.Float64).alias(c))
+                if missing:
+                    base = base.with_columns(*missing)
+                return base
+
+            # Global shifted frames are deliberately absent in memory-safe mode.
+            recent_block_stats = pl.DataFrame()
+            regime_block_stats = pl.DataFrame()
+            structural_history_stats = pl.DataFrame()
+            stability_ref_sums = pl.DataFrame()
+        else:
+            recent_block_stats = stability_block_sums.with_columns(
+                (pl.col("_block") + 1).cast(pl.Int32).alias("_block")
+            ).select(
+                uid_col,
+                "_block",
+                pl.col("_ref_sum_y").alias("_recent28_sum_y"),
+                pl.col("_ref_sum_v").alias("_recent28_sum_v"),
+                pl.col("_ref_nz_y").alias("_recent28_nz_y"),
+                pl.col("_ref_nz_v").alias("_recent28_nz_v"),
+                pl.col("_last14_sum_y").alias("_recent14_sum_y"),
+                pl.col("_last14_sum_v").alias("_recent14_sum_v"),
+            )
+            # Regime blocks at each forecast origin:
+            # B0 = immediately closed block, B1/B2/B3 = previous blocks.
+            regime_block_stats = recent_block_stats.with_columns(
+                (pl.col("_recent28_sum_y") / pl.lit(float(block_days))).alias("_b0_y"),
+                (pl.col("_recent28_sum_v") / pl.lit(float(block_days))).alias("_b0_v"),
+            )
+            for _lag, _name in ((2, "b1"), (3, "b2"), (4, "b3")):
+                _lag_stats = stability_block_sums.with_columns(
+                    (pl.col("_block") + _lag).cast(pl.Int32).alias("_block")
+                ).select(
                     uid_col,
-                    (pl.col("_block") + lag_block)
-                    .cast(pl.Int32)
-                    .alias("_block"),
-                    (
-                        pl.col("_ref_sum_y") / pl.lit(float(block_days))
-                    ).alias("_block_mean_y"),
-                    (
-                        pl.col("_ref_sum_v") / pl.lit(float(block_days))
-                    ).alias("_block_mean_v"),
+                    "_block",
+                    (pl.col("_ref_sum_y") / pl.lit(float(block_days))).alias(f"_{_name}_y"),
+                    (pl.col("_ref_sum_v") / pl.lit(float(block_days))).alias(f"_{_name}_v"),
                 )
+                regime_block_stats = regime_block_stats.join(
+                    _lag_stats, on=[uid_col, "_block"], how="left"
+                )
+            structural_shifted: list[pl.DataFrame] = []
+            # lag=2 is B1 at the next forecast origin; B0 (lag=1) is excluded.
+            for _lag in range(2, 2 + regime_history_blocks):
+                structural_shifted.append(
+                    stability_block_sums.with_columns(
+                        (pl.col("_block") + _lag).cast(pl.Int32).alias("_block")
+                    ).select(
+                        uid_col,
+                        "_block",
+                        (pl.col("_ref_sum_y") / pl.lit(float(block_days))).alias("_hist_y"),
+                        (pl.col("_ref_sum_v") / pl.lit(float(block_days))).alias("_hist_v"),
+                    )
+                )
+            structural_history_stats = (
+                pl.concat(structural_shifted, how="vertical_relaxed")
+                .group_by([uid_col, "_block"])
+                .agg(
+                    pl.col("_hist_y").median().alias("_structural_y"),
+                    pl.col("_hist_v").median().alias("_structural_v"),
+                    pl.col("_hist_y").count().cast(pl.Int32).alias("_structural_history_blocks_y"),
+                    pl.col("_hist_v").count().cast(pl.Int32).alias("_structural_history_blocks_v"),
+                )
+                if structural_shifted else pl.DataFrame()
             )
-        robust_block_refs = (
-            pl.concat(robust_block_shifted, how="vertical_relaxed")
-            .group_by([uid_col, "_block"])
-            .agg(
-                pl.col("_block_mean_y")
-                .median()
-                .alias("_robust_block_median_y"),
-                pl.col("_block_mean_v")
-                .median()
-                .alias("_robust_block_median_v"),
-                pl.col("_block_mean_y")
-                .mean()
-                .alias("_robust_block_mean_y"),
-                pl.col("_block_mean_v")
-                .mean()
-                .alias("_robust_block_mean_v"),
-                pl.col("_block_mean_y")
-                .max()
-                .alias("_robust_block_max_y"),
-                pl.col("_block_mean_v")
-                .max()
-                .alias("_robust_block_max_v"),
-                pl.len().cast(pl.Int32).alias("_robust_block_n"),
+            stability_shifted: list[pl.DataFrame] = []
+            for lag_block in range(1, stability_blocks + 1):
+                stability_shifted.append(
+                    stability_block_sums.with_columns(
+                        (pl.col("_block") + lag_block).cast(pl.Int32).alias("_block")
+                    )
+                )
+            stability_ref_sums = (
+                pl.concat(stability_shifted, how="vertical_relaxed")
+                .group_by([uid_col, "_block"])
+                .agg(
+                    pl.col("_ref_sum_y").sum().alias("_ref_sum_y"),
+                    pl.col("_ref_sum_v").sum().alias("_ref_sum_v"),
+                )
+                if stability_shifted else pl.DataFrame()
             )
-            if robust_block_shifted
-            else pl.DataFrame()
+
+        alpha_score_weights = tuple(
+            float(x)
+            for x in getattr(
+                settings,
+                "LEAF_ALPHA_SCORE_WEIGHTS",
+                (0.60, 0.30, 0.10, 0.00),
+            )
+        )
+        if (
+            len(alpha_score_weights) != 4
+            or any(x < 0 for x in alpha_score_weights)
+            or sum(alpha_score_weights) <= 0
+        ):
+            raise ValueError(
+                "LEAF_ALPHA_SCORE_WEIGHTS must contain four non-negative "
+                f"weights with positive sum; got {alpha_score_weights}"
+            )
+        _w_sum = float(sum(alpha_score_weights))
+        alpha_score_weights = tuple(x / _w_sum for x in alpha_score_weights)
+        score_min_den = float(
+            getattr(settings, "LEAF_ALPHA_SCORE_MIN_DEN", 1e-9)
+        )
+        alpha_bias_weight = float(
+            getattr(settings, "LEAF_ALPHA_BIAS_WEIGHT", 0.20)
         )
 
-        alpha_score_decay = float(
-            getattr(settings, "LEAF_SES_SCORE_DECAY", 0.85)
-        )
-        regime_dense_coverage = float(
-            getattr(settings, "LEAF_REGIME_DENSE_COVERAGE", 0.85)
-        )
-        regime_shock_ratio = float(
-            getattr(settings, "LEAF_REGIME_SHOCK_RATIO", 1.50)
-        )
-        regime_decline_ratio = float(
-            getattr(settings, "LEAF_REGIME_DECLINE_RATIO", 0.60)
-        )
-        regime_recent14_weight = float(
-            getattr(settings, "LEAF_REGIME_RECENT14_WEIGHT", 0.65)
-        )
-        regime_score_tolerance = float(
-            getattr(settings, "LEAF_REGIME_SCORE_TOLERANCE", 0.20)
-        )
-        regime_growth_ratio = float(
-            getattr(settings, "LEAF_REGIME_GROWTH_RATIO", 1.15)
-        )
-        sparse_shock_ratio = float(
-            getattr(settings, "LEAF_REGIME_SPARSE_SHOCK_RATIO", 1.35)
-        )
-        sparse_stability_ratio = float(
-            getattr(settings, "LEAF_REGIME_SPARSE_STABILITY_RATIO", 1.25)
-        )
+        def _weighted_score_component(
+            component: str,
+            suffix: str,
+        ) -> pl.Expr:
+            expr = pl.lit(0.0)
+            for _i, _weight in enumerate(alpha_score_weights):
+                expr = expr + (
+                    pl.col(f"_score_{component}_b{_i}_{suffix}")
+                    * pl.lit(float(_weight))
+                )
+            return expr
 
+        def _score_history_block_count(suffix: str) -> pl.Expr:
+            expr = pl.lit(0).cast(pl.Int32)
+            for _i, _weight in enumerate(alpha_score_weights):
+                if _weight <= 0:
+                    continue
+                expr = expr + (
+                    pl.col(f"_score_den_b{_i}_{suffix}") > score_min_den
+                ).cast(pl.Int32)
+            return expr
+        regime_trend_up_ratio = float(
+            getattr(settings, "LEAF_REGIME_TREND_UP_RATIO", 1.05)
+        )
+        regime_trend_down_ratio = float(
+            getattr(settings, "LEAF_REGIME_TREND_DOWN_RATIO", 0.95)
+        )
+        regime_trend_max_step_ratio = float(
+            getattr(settings, "LEAF_REGIME_TREND_MAX_STEP_RATIO", 2.0)
+        )
+        regime_transient_ratio = float(
+            getattr(settings, "LEAF_REGIME_TRANSIENT_RATIO", 1.75)
+        )
+        reset_transient = bool(
+            getattr(settings, "LEAF_RESET_TRANSIENT", True)
+        )
+        transient_down_alpha = float(
+            getattr(settings, "LEAF_TRANSIENT_DOWN_ALPHA", 0.20)
+        )
+        if transient_down_alpha not in alpha_candidates:
+            raise ValueError(
+                "LEAF_TRANSIENT_DOWN_ALPHA must be present in "
+                f"LEAF_SES_ALPHA_CANDIDATES; got {transient_down_alpha}"
+            )
+
+        # With 1d/7d/14d there can be hundreds of model origins. Keeping one
+        # wide chosen-state frame per origin in RAM is the main source of the
+        # multi-cadence memory explosion. Spill each state to parquet and join
+        # it back lazily after the sequential state update loop.
         chosen_frames: list[pl.DataFrame] = []
-        default_parent = "store"
+        chosen_cols: list[str] | None = None
+        default_parent = str(
+            getattr(settings, "LEAF_PARENT_DEFAULT", "store")
+        )
+        if default_parent not in {"store", "section"}:
+            raise ValueError(
+                "LEAF_PARENT_DEFAULT must be 'store' or 'section'"
+            )
 
         for block_i in range(1, max_block + 1):
             block_start = train_start + dt.timedelta(days=block_i * block_days)
@@ -1751,34 +1899,49 @@ class RLSForecastRunner:
                 )
             )
 
-            # Causal regime references for THIS forecast origin.
-            # 14/28-day statistics come only from the immediately closed block;
-            # 112-day statistics come from the four closed blocks before origin.
+            # Causal regime references for THIS model origin.
+            # If calendar time advances through a PARTIAL observed tail, no
+            # 28-day model update occurs. In that case keep using the most
+            # recent complete actual block instead of treating the incomplete
+            # calendar block as 28 zeros.
+            regime_ref_block = min(block_i, actual_last_block + 1)
+            recent_ref_base = (
+                _recent_ref_base_memory_safe(regime_ref_block)
+                if memory_safe
+                else (
+                    ids.select(uid_col)
+                    .join(leaf_bounds, on=uid_col, how="left")
+                    .join(
+                        stability_ref_sums.filter(
+                            pl.col("_block") == regime_ref_block
+                        ).select(uid_col, "_ref_sum_y", "_ref_sum_v"),
+                        on=uid_col,
+                        how="left",
+                    )
+                    .join(
+                        regime_block_stats.filter(
+                            pl.col("_block") == regime_ref_block
+                        ).drop("_block"),
+                        on=uid_col,
+                        how="left",
+                    )
+                    .join(
+                        structural_history_stats.filter(
+                            pl.col("_block") == regime_ref_block
+                        ).drop("_block"),
+                        on=uid_col,
+                        how="left",
+                    )
+                )
+            )
             recent_ref = (
-                ids.select(uid_col)
-                .join(leaf_bounds, on=uid_col, how="left")
-                .join(
-                    stability_ref_sums.filter(
-                        pl.col("_block") == block_i
-                    ).select(
-                        uid_col, "_ref_sum_y", "_ref_sum_v"
-                    ),
-                    on=uid_col,
-                    how="left",
-                )
-                .join(
-                    recent_block_stats.filter(
-                        pl.col("_block") == block_i
-                    ).drop("_block"),
-                    on=uid_col,
-                    how="left",
-                )
-                .join(
-                    robust_block_refs.filter(
-                        pl.col("_block") == block_i
-                    ).drop("_block"),
-                    on=uid_col,
-                    how="left",
+                recent_ref_base.with_columns(
+                    pl.col("_b1_y").is_not_null().alias("_b1_available_y"),
+                    pl.col("_b2_y").is_not_null().alias("_b2_available_y"),
+                    pl.col("_b3_y").is_not_null().alias("_b3_available_y"),
+                    pl.col("_b1_v").is_not_null().alias("_b1_available_v"),
+                    pl.col("_b2_v").is_not_null().alias("_b2_available_v"),
+                    pl.col("_b3_v").is_not_null().alias("_b3_available_v"),
                 )
                 .with_columns(
                     (
@@ -1795,13 +1958,14 @@ class RLSForecastRunner:
                     pl.col("_recent28_nz_v").fill_null(0),
                     pl.col("_recent14_sum_y").fill_null(0.0),
                     pl.col("_recent14_sum_v").fill_null(0.0),
-                    pl.col("_robust_block_median_y").fill_null(0.0),
-                    pl.col("_robust_block_median_v").fill_null(0.0),
-                    pl.col("_robust_block_mean_y").fill_null(0.0),
-                    pl.col("_robust_block_mean_v").fill_null(0.0),
-                    pl.col("_robust_block_max_y").fill_null(0.0),
-                    pl.col("_robust_block_max_v").fill_null(0.0),
-                    pl.col("_robust_block_n").fill_null(0),
+                    pl.col("_b0_y").fill_null(0.0),
+                    pl.col("_b0_v").fill_null(0.0),
+                    pl.col("_b1_y").fill_null(0.0),
+                    pl.col("_b1_v").fill_null(0.0),
+                    pl.col("_b2_y").fill_null(0.0),
+                    pl.col("_b2_v").fill_null(0.0),
+                    pl.col("_b3_y").fill_null(0.0),
+                    pl.col("_b3_v").fill_null(0.0),
                 )
                 .with_columns(
                     pl.when(pl.col("_leaf_age_days") <= 0)
@@ -1843,105 +2007,156 @@ class RLSForecastRunner:
                     ).alias("_coverage_v"),
                 )
                 .with_columns(
-                    # For sparse/intermittent leaves, the median of the four
-                    # closed 28-day means is a more robust structural anchor
-                    # than their arithmetic mean. Fallback to the 112-day mean
-                    # only when the median is unavailable/zero.
-                    pl.when(
-                        pl.col("_robust_block_median_y") > stability_eps
-                    )
-                    .then(pl.col("_robust_block_median_y"))
-                    .otherwise(pl.col("_reference_y"))
-                    .alias("_sparse_robust_y"),
-                    pl.when(
-                        pl.col("_robust_block_median_v") > stability_eps
-                    )
-                    .then(pl.col("_robust_block_median_v"))
-                    .otherwise(pl.col("_reference_v"))
-                    .alias("_sparse_robust_v"),
+                    pl.col("_structural_y")
+                    .fill_null(pl.col("_reference_y"))
+                    .alias("_structural_y"),
+                    pl.col("_structural_v")
+                    .fill_null(pl.col("_reference_v"))
+                    .alias("_structural_v"),
+                    pl.col("_structural_history_blocks_y")
+                    .fill_null(0)
+                    .cast(pl.Int32),
+                    pl.col("_structural_history_blocks_v")
+                    .fill_null(0)
+                    .cast(pl.Int32),
                 )
                 .with_columns(
                     (
-                        (pl.col("_coverage_y") < regime_dense_coverage)
-                        & (pl.col("_sparse_robust_y") > stability_eps)
+                        pl.col("_b1_available_y")
+                        & pl.col("_b2_available_y")
+                        & pl.col("_b3_available_y")
+                        & (pl.col("_b3_y") > stability_eps)
+                        & (pl.col("_b2_y") > pl.col("_b3_y") * regime_trend_up_ratio)
+                        & (pl.col("_b1_y") > pl.col("_b2_y") * regime_trend_up_ratio)
+                        & (pl.col("_b0_y") > pl.col("_b1_y") * regime_trend_up_ratio)
                         & (
-                            pl.col("_recent28_y")
-                            > pl.col("_sparse_robust_y") * sparse_shock_ratio
+                            pl.col("_b2_y") / pl.col("_b3_y").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
                         )
-                    ).alias("_sparse_shock_y"),
+                        & (
+                            pl.col("_b1_y") / pl.col("_b2_y").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                        & (
+                            pl.col("_b0_y") / pl.col("_b1_y").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                    ).alias("_trend_up_y"),
                     (
-                        (pl.col("_coverage_v") < regime_dense_coverage)
-                        & (pl.col("_sparse_robust_v") > stability_eps)
+                        pl.col("_b1_available_y")
+                        & pl.col("_b2_available_y")
+                        & pl.col("_b3_available_y")
+                        & (pl.col("_b1_y") > stability_eps)
+                        & (pl.col("_b2_y") < pl.col("_b3_y") * regime_trend_down_ratio)
+                        & (pl.col("_b1_y") < pl.col("_b2_y") * regime_trend_down_ratio)
+                        & (pl.col("_b0_y") < pl.col("_b1_y") * regime_trend_down_ratio)
                         & (
-                            pl.col("_recent28_v")
-                            > pl.col("_sparse_robust_v") * sparse_shock_ratio
+                            pl.col("_b3_y") / pl.col("_b2_y").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
                         )
-                    ).alias("_sparse_shock_v"),
+                        & (
+                            pl.col("_b2_y") / pl.col("_b1_y").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                        & (
+                            pl.col("_b1_y") / pl.col("_b0_y").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                    ).alias("_trend_down_y"),
+                    (
+                        pl.col("_b1_available_v")
+                        & pl.col("_b2_available_v")
+                        & pl.col("_b3_available_v")
+                        & (pl.col("_b3_v") > stability_eps)
+                        & (pl.col("_b2_v") > pl.col("_b3_v") * regime_trend_up_ratio)
+                        & (pl.col("_b1_v") > pl.col("_b2_v") * regime_trend_up_ratio)
+                        & (pl.col("_b0_v") > pl.col("_b1_v") * regime_trend_up_ratio)
+                        & (
+                            pl.col("_b2_v") / pl.col("_b3_v").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                        & (
+                            pl.col("_b1_v") / pl.col("_b2_v").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                        & (
+                            pl.col("_b0_v") / pl.col("_b1_v").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                    ).alias("_trend_up_v"),
+                    (
+                        pl.col("_b1_available_v")
+                        & pl.col("_b2_available_v")
+                        & pl.col("_b3_available_v")
+                        & (pl.col("_b1_v") > stability_eps)
+                        & (pl.col("_b2_v") < pl.col("_b3_v") * regime_trend_down_ratio)
+                        & (pl.col("_b1_v") < pl.col("_b2_v") * regime_trend_down_ratio)
+                        & (pl.col("_b0_v") < pl.col("_b1_v") * regime_trend_down_ratio)
+                        & (
+                            pl.col("_b3_v") / pl.col("_b2_v").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                        & (
+                            pl.col("_b2_v") / pl.col("_b1_v").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                        & (
+                            pl.col("_b1_v") / pl.col("_b0_v").clip(lower_bound=stability_eps)
+                            <= regime_trend_max_step_ratio
+                        )
+                    ).alias("_trend_down_v"),
                 )
                 .with_columns(
-                    # Dense series may follow a persistent recent trend.
-                    # Sparse series use the long reference unless a genuine
-                    # decline is already visible in the whole last 28-day block.
-                    pl.when(
-                        (pl.col("_reference_y") > stability_eps)
-                        & (
-                            pl.col("_recent28_y")
-                            < pl.col("_reference_y") * regime_decline_ratio
-                        )
-                    )
-                    .then(
-                        regime_recent14_weight * pl.col("_recent14_y")
-                        + (1.0 - regime_recent14_weight)
-                        * pl.col("_recent28_y")
-                    )
-                    .when(pl.col("_coverage_y") >= regime_dense_coverage)
-                    .then(
-                        pl.when(
-                            (pl.col("_recent28_y") > stability_eps)
-                            & (
-                                pl.col("_recent14_y")
-                                > pl.col("_recent28_y") * regime_shock_ratio
-                            )
-                        )
-                        .then(pl.col("_recent28_y"))
-                        .otherwise(
-                            regime_recent14_weight * pl.col("_recent14_y")
-                            + (1.0 - regime_recent14_weight)
-                            * pl.col("_recent28_y")
-                        )
-                    )
-                    .otherwise(pl.col("_sparse_robust_y"))
-                    .alias("_regime_anchor_y"),
-                    pl.when(
-                        (pl.col("_reference_v") > stability_eps)
-                        & (
-                            pl.col("_recent28_v")
-                            < pl.col("_reference_v") * regime_decline_ratio
-                        )
-                    )
-                    .then(
-                        regime_recent14_weight * pl.col("_recent14_v")
-                        + (1.0 - regime_recent14_weight)
-                        * pl.col("_recent28_v")
-                    )
-                    .when(pl.col("_coverage_v") >= regime_dense_coverage)
-                    .then(
-                        pl.when(
-                            (pl.col("_recent28_v") > stability_eps)
-                            & (
-                                pl.col("_recent14_v")
-                                > pl.col("_recent28_v") * regime_shock_ratio
-                            )
-                        )
-                        .then(pl.col("_recent28_v"))
-                        .otherwise(
-                            regime_recent14_weight * pl.col("_recent14_v")
-                            + (1.0 - regime_recent14_weight)
-                            * pl.col("_recent28_v")
-                        )
-                    )
-                    .otherwise(pl.col("_sparse_robust_v"))
-                    .alias("_regime_anchor_v"),
+                    (
+                        (pl.col("_structural_history_blocks_y") >= regime_min_history_blocks)
+                        & (pl.col("_structural_y") > stability_eps)
+                        & (pl.col("_b0_y") > pl.col("_structural_y") * regime_transient_ratio)
+                        & ~pl.col("_trend_up_y")
+                    ).alias("_transient_up_y"),
+                    (
+                        (pl.col("_structural_history_blocks_y") >= regime_min_history_blocks)
+                        & (pl.col("_structural_y") > stability_eps)
+                        & (pl.col("_b0_y") < pl.col("_structural_y") / regime_transient_ratio)
+                        & ~pl.col("_trend_down_y")
+                    ).alias("_transient_down_y"),
+                    (
+                        (pl.col("_structural_history_blocks_v") >= regime_min_history_blocks)
+                        & (pl.col("_structural_v") > stability_eps)
+                        & (pl.col("_b0_v") > pl.col("_structural_v") * regime_transient_ratio)
+                        & ~pl.col("_trend_up_v")
+                    ).alias("_transient_up_v"),
+                    (
+                        (pl.col("_structural_history_blocks_v") >= regime_min_history_blocks)
+                        & (pl.col("_structural_v") > stability_eps)
+                        & (pl.col("_b0_v") < pl.col("_structural_v") / regime_transient_ratio)
+                        & ~pl.col("_trend_down_v")
+                    ).alias("_transient_down_v"),
+                )
+                .with_columns(
+                    pl.when(pl.col("_transient_up_y"))
+                    .then(pl.lit("transient_up"))
+                    .when(pl.col("_transient_down_y"))
+                    .then(pl.lit("transient_down"))
+                    .when(pl.col("_trend_up_y"))
+                    .then(pl.lit("trend_up"))
+                    .when(pl.col("_trend_down_y"))
+                    .then(pl.lit("trend_down"))
+                    .otherwise(pl.lit("stable"))
+                    .alias("_regime_class_y"),
+                    pl.when(pl.col("_transient_up_v"))
+                    .then(pl.lit("transient_up"))
+                    .when(pl.col("_transient_down_v"))
+                    .then(pl.lit("transient_down"))
+                    .when(pl.col("_trend_up_v"))
+                    .then(pl.lit("trend_up"))
+                    .when(pl.col("_trend_down_v"))
+                    .then(pl.lit("trend_down"))
+                    .otherwise(pl.lit("stable"))
+                    .alias("_regime_class_v"),
+                )
+                .with_columns(
+                    pl.col("_structural_y").alias("_regime_anchor_y"),
+                    pl.col("_structural_v").alias("_regime_anchor_v"),
                 )
                 .with_columns(
                     pl.when(pl.col("_regime_anchor_y") > stability_eps)
@@ -1953,8 +2168,14 @@ class RLSForecastRunner:
                     .otherwise(pl.col("_reference_v"))
                     .alias("_regime_anchor_v"),
                 )
+                .with_columns(
+                    pl.lit(regime_ref_block)
+                    .cast(pl.Int32)
+                    .alias("_regime_ref_block")
+                )
                 .select(
                     uid_col,
+                    "_regime_ref_block",
                     "_reference_y",
                     "_reference_v",
                     "_recent28_y",
@@ -1963,20 +2184,72 @@ class RLSForecastRunner:
                     "_recent14_v",
                     "_coverage_y",
                     "_coverage_v",
-                    "_sparse_robust_y",
-                    "_sparse_robust_v",
-                    "_sparse_shock_y",
-                    "_sparse_shock_v",
-                    "_robust_block_median_y",
-                    "_robust_block_median_v",
-                    "_robust_block_mean_y",
-                    "_robust_block_mean_v",
+                    "_b0_y", "_b0_v",
+                    "_b1_y", "_b1_v",
+                    "_b2_y", "_b2_v",
+                    "_b3_y", "_b3_v",
+                    "_structural_y", "_structural_v",
+                    "_structural_history_blocks_y",
+                    "_structural_history_blocks_v",
+                    "_regime_class_y", "_regime_class_v",
                     "_regime_anchor_y",
                     "_regime_anchor_v",
                 )
             )
 
-            # ── STAGE 1: select alpha from PURE SES history only ───────────
+            # ── STAGE 1: PURE SES level ────────────────────────────────
+            # A transient is handled explicitly as a state reinitialization.
+            # This is the only regime intervention on level. Trend/stable
+            # origins leave the SES recurrence untouched.
+            reset_ref = recent_ref.select(
+                uid_col,
+                "_regime_class_y",
+                "_regime_class_v",
+                "_structural_y",
+                "_structural_v",
+                "_structural_history_blocks_y",
+                "_structural_history_blocks_v",
+            )
+            alpha_state = (
+                alpha_state.join(reset_ref, on=uid_col, how="left")
+                .with_columns(
+                    (
+                        pl.lit(reset_transient)
+                        & (pl.col("_regime_class_y") == "transient_up")
+                        & (
+                            pl.col("_structural_history_blocks_y")
+                            >= regime_min_history_blocks
+                        )
+                    ).alias("_reset_y"),
+                    (
+                        pl.lit(reset_transient)
+                        & (pl.col("_regime_class_v") == "transient_up")
+                        & (
+                            pl.col("_structural_history_blocks_v")
+                            >= regime_min_history_blocks
+                        )
+                    ).alias("_reset_v"),
+                )
+                .with_columns(
+                    pl.when(pl.col("_reset_y"))
+                    .then(pl.col("_structural_y").clip(lower_bound=0.0))
+                    .otherwise(pl.col("_level_y"))
+                    .alias("_level_y"),
+                    pl.when(pl.col("_reset_v"))
+                    .then(pl.col("_structural_v").clip(lower_bound=0.0))
+                    .otherwise(pl.col("_level_v"))
+                    .alias("_level_v"),
+                )
+                .drop(
+                    "_regime_class_y",
+                    "_regime_class_v",
+                    "_structural_y",
+                    "_structural_v",
+                    "_structural_history_blocks_y",
+                    "_structural_history_blocks_v",
+                )
+            )
+
             if block_i == 1:
                 alpha_choices = (
                     ids.select(uid_col)
@@ -1984,260 +2257,99 @@ class RLSForecastRunner:
                     .with_columns(
                         pl.lit(default_alpha).alias("_alpha_y"),
                         pl.lit(default_alpha).alias("_alpha_v"),
+                        pl.lit(default_alpha).alias("_alpha_y_unconstrained"),
+                        pl.lit(default_alpha).alias("_alpha_v_unconstrained"),
                         pl.lit(False).alias("_ses_guard_y"),
                         pl.lit(False).alias("_ses_guard_v"),
+                        pl.lit("WARMUP_DEFAULT").alias("_ses_guard_status_y"),
+                        pl.lit("WARMUP_DEFAULT").alias("_ses_guard_status_v"),
                         pl.lit(True).alias("_stable_pool_y"),
                         pl.lit(True).alias("_stable_pool_v"),
+                        pl.lit(0).cast(pl.Int32).alias("_score_history_blocks_y"),
+                        pl.lit(0).cast(pl.Int32).alias("_score_history_blocks_v"),
+                    )
+                )
+                alpha_selection_source = (
+                    alpha_state.join(alpha_choices, on=uid_col, how="inner")
+                    .with_columns(
+                        pl.lit(None).cast(pl.Float64).alias("_wmape_ses_y"),
+                        pl.lit(None).cast(pl.Float64).alias("_bias_ses_y"),
+                        pl.lit(None).cast(pl.Float64).alias("_score_ses_y"),
+                        pl.lit(None).cast(pl.Float64).alias("_wmape_ses_v"),
+                        pl.lit(None).cast(pl.Float64).alias("_bias_ses_v"),
+                        pl.lit(None).cast(pl.Float64).alias("_score_ses_v"),
                     )
                 )
             else:
-                alpha_rel_tol = float(
-                    getattr(
-                        settings,
-                        "LEAF_SES_NEAR_BEST_REL_TOLERANCE",
-                        0.02,
-                    )
-                )
-                alpha_abs_tol = float(
-                    getattr(
-                        settings,
-                        "LEAF_SES_NEAR_BEST_ABS_TOLERANCE",
-                        1e-6,
-                    )
-                )
                 ranked_alpha = (
-                    alpha_state.with_columns(
-                        pl.when(pl.col("_cden_ses_y") > 0)
-                        .then(pl.col("_cae_ses_y") / pl.col("_cden_ses_y"))
+                    alpha_state.join(recent_ref, on=uid_col, how="left")
+                    .with_columns(
+                        _weighted_score_component("ae", "y")
+                        .alias("_finite_ae_y"),
+                        _weighted_score_component("den", "y")
+                        .alias("_finite_den_y"),
+                        _weighted_score_component("se", "y")
+                        .alias("_finite_se_y"),
+                        _weighted_score_component("ae", "v")
+                        .alias("_finite_ae_v"),
+                        _weighted_score_component("den", "v")
+                        .alias("_finite_den_v"),
+                        _weighted_score_component("se", "v")
+                        .alias("_finite_se_v"),
+                        _score_history_block_count("y")
+                        .alias("_score_history_blocks_y"),
+                        _score_history_block_count("v")
+                        .alias("_score_history_blocks_v"),
+                    )
+                    .with_columns(
+                        pl.when(pl.col("_finite_den_y") > score_min_den)
+                        .then(pl.col("_finite_ae_y") / pl.col("_finite_den_y"))
                         .otherwise(float("inf"))
                         .alias("_wmape_ses_y"),
-                        pl.when(pl.col("_cden_ses_v") > 0)
-                        .then(pl.col("_cae_ses_v") / pl.col("_cden_ses_v"))
+                        pl.when(pl.col("_finite_den_y") > score_min_den)
+                        .then(pl.col("_finite_se_y") / pl.col("_finite_den_y"))
+                        .otherwise(0.0)
+                        .alias("_bias_ses_y"),
+                        pl.when(pl.col("_finite_den_v") > score_min_den)
+                        .then(pl.col("_finite_ae_v") / pl.col("_finite_den_v"))
                         .otherwise(float("inf"))
                         .alias("_wmape_ses_v"),
-                    )
-                    .join(recent_ref, on=uid_col, how="left")
-                    .with_columns(
-                        pl.col("_wmape_ses_y")
-                        .min()
-                        .over(uid_col)
-                        .alias("_best_ses_y"),
-                        pl.col("_wmape_ses_v")
-                        .min()
-                        .over(uid_col)
-                        .alias("_best_ses_v"),
+                        pl.when(pl.col("_finite_den_v") > score_min_den)
+                        .then(pl.col("_finite_se_v") / pl.col("_finite_den_v"))
+                        .otherwise(0.0)
+                        .alias("_bias_ses_v"),
                     )
                     .with_columns(
-                        # Dense growth is allowed a higher ceiling by using the
-                        # regime anchor; sparse shocks retain the 112-day ceiling.
-                        pl.when(
-                            pl.col("_coverage_y") >= regime_dense_coverage
-                        )
-                        .then(
-                            pl.max_horizontal(
-                                pl.col("_reference_y"),
-                                pl.col("_regime_anchor_y"),
-                            )
-                        )
-                        .otherwise(pl.col("_sparse_robust_y"))
-                        .alias("_stability_anchor_y"),
-                        pl.when(
-                            pl.col("_coverage_v") >= regime_dense_coverage
-                        )
-                        .then(
-                            pl.max_horizontal(
-                                pl.col("_reference_v"),
-                                pl.col("_regime_anchor_v"),
-                            )
-                        )
-                        .otherwise(pl.col("_sparse_robust_v"))
-                        .alias("_stability_anchor_v"),
-                        pl.when(
-                            pl.col("_coverage_y") < regime_dense_coverage
-                        )
-                        .then(sparse_stability_ratio)
-                        .otherwise(stability_ratio)
-                        .alias("_stability_ratio_y"),
-                        pl.when(
-                            pl.col("_coverage_v") < regime_dense_coverage
-                        )
-                        .then(sparse_stability_ratio)
-                        .otherwise(stability_ratio)
-                        .alias("_stability_ratio_v"),
-                    )
-                    .with_columns(
-                        pl.when(
-                            pl.lit(stability_enabled)
-                            & (pl.col("_stability_anchor_y") > stability_eps)
-                        )
-                        .then(
-                            pl.col("_level_y")
-                            <= pl.col("_stability_anchor_y")
-                            * pl.col("_stability_ratio_y")
-                        )
-                        .otherwise(True)
-                        .alias("_stable_y"),
-                        pl.when(
-                            pl.lit(stability_enabled)
-                            & (pl.col("_stability_anchor_v") > stability_eps)
-                        )
-                        .then(
-                            pl.col("_level_v")
-                            <= pl.col("_stability_anchor_v")
-                            * pl.col("_stability_ratio_v")
-                        )
-                        .otherwise(True)
-                        .alias("_stable_v"),
-                    )
-                    .with_columns(
-                        pl.when(pl.col("_stable_y"))
-                        .then(pl.col("_wmape_ses_y"))
-                        .otherwise(float("inf"))
-                        .min()
-                        .over(uid_col)
-                        .alias("_best_stable_ses_y"),
-                        pl.when(pl.col("_stable_v"))
-                        .then(pl.col("_wmape_ses_v"))
-                        .otherwise(float("inf"))
-                        .min()
-                        .over(uid_col)
-                        .alias("_best_stable_ses_v"),
-                    )
-                    .with_columns(
-                        pl.when(
-                            (
-                                (pl.col("_reference_y") > stability_eps)
-                                & (
-                                    pl.col("_recent28_y")
-                                    < pl.col("_reference_y")
-                                    * regime_decline_ratio
-                                )
-                            )
-                            | (
-                                (pl.col("_coverage_y") >= regime_dense_coverage)
-                                & (pl.col("_reference_y") > stability_eps)
-                                & (
-                                    pl.col("_recent28_y")
-                                    > pl.col("_reference_y")
-                                    * regime_growth_ratio
-                                )
-                            )
-                        )
-                        .then(regime_score_tolerance)
-                        .otherwise(alpha_rel_tol)
-                        .alias("_regime_score_tol_y"),
-                        pl.when(
-                            (
-                                (pl.col("_reference_v") > stability_eps)
-                                & (
-                                    pl.col("_recent28_v")
-                                    < pl.col("_reference_v")
-                                    * regime_decline_ratio
-                                )
-                            )
-                            | (
-                                (pl.col("_coverage_v") >= regime_dense_coverage)
-                                & (pl.col("_reference_v") > stability_eps)
-                                & (
-                                    pl.col("_recent28_v")
-                                    > pl.col("_reference_v")
-                                    * regime_growth_ratio
-                                )
-                            )
-                        )
-                        .then(regime_score_tolerance)
-                        .otherwise(alpha_rel_tol)
-                        .alias("_regime_score_tol_v"),
-                    )
-                    .with_columns(
-                        pl.when(
-                            pl.col("_stable_y")
-                            & (
-                                pl.col("_wmape_ses_y")
-                                <= (
-                                    pl.col("_best_stable_ses_y")
-                                    * (1.0 + pl.col("_regime_score_tol_y"))
-                                    + alpha_abs_tol
-                                )
-                            )
-                            & (pl.col("_regime_anchor_y") > stability_eps)
-                        )
-                        .then(
-                            (
-                                pl.col("_level_y") - pl.col("_regime_anchor_y")
-                            ).abs()
-                            / pl.col("_regime_anchor_y")
-                        )
-                        .otherwise(float("inf"))
-                        .alias("_regime_dist_y"),
-                        pl.when(
-                            pl.col("_stable_v")
-                            & (
-                                pl.col("_wmape_ses_v")
-                                <= (
-                                    pl.col("_best_stable_ses_v")
-                                    * (1.0 + pl.col("_regime_score_tol_v"))
-                                    + alpha_abs_tol
-                                )
-                            )
-                            & (pl.col("_regime_anchor_v") > stability_eps)
-                        )
-                        .then(
-                            (
-                                pl.col("_level_v") - pl.col("_regime_anchor_v")
-                            ).abs()
-                            / pl.col("_regime_anchor_v")
-                        )
-                        .otherwise(float("inf"))
-                        .alias("_regime_dist_v"),
+                        (
+                            pl.col("_wmape_ses_y")
+                            + pl.lit(alpha_bias_weight)
+                            * pl.col("_bias_ses_y").abs()
+                        ).alias("_score_ses_y"),
+                        (
+                            pl.col("_wmape_ses_v")
+                            + pl.lit(alpha_bias_weight)
+                            * pl.col("_bias_ses_v").abs()
+                        ).alias("_score_ses_v"),
                     )
                 )
 
                 alpha_choices = (
                     ranked_alpha.group_by(uid_col)
                     .agg(
-                        pl.when(
-                            pl.col("_wmape_ses_y")
-                            <= (
-                                pl.col("_best_ses_y")
-                                * (1.0 + alpha_rel_tol)
-                                + alpha_abs_tol
-                            )
-                        )
-                        .then(pl.col("_alpha"))
-                        .otherwise(None)
-                        .min()
-                        .alias("_alpha_y_unconstrained"),
-                        pl.when(
-                            pl.col("_wmape_ses_v")
-                            <= (
-                                pl.col("_best_ses_v")
-                                * (1.0 + alpha_rel_tol)
-                                + alpha_abs_tol
-                            )
-                        )
-                        .then(pl.col("_alpha"))
-                        .otherwise(None)
-                        .min()
-                        .alias("_alpha_v_unconstrained"),
                         pl.col("_alpha")
-                        .sort_by("_regime_dist_y", "_alpha")
+                        .sort_by("_score_ses_y", "_alpha")
                         .first()
-                        .alias("_alpha_y_regime"),
+                        .alias("_alpha_y"),
                         pl.col("_alpha")
-                        .sort_by("_regime_dist_v", "_alpha")
+                        .sort_by("_score_ses_v", "_alpha")
                         .first()
-                        .alias("_alpha_v_regime"),
-                        pl.col("_alpha")
-                        .sort_by("_level_y", "_alpha")
-                        .first()
-                        .alias("_alpha_y_lowlevel"),
-                        pl.col("_alpha")
-                        .sort_by("_level_v", "_alpha")
-                        .first()
-                        .alias("_alpha_v_lowlevel"),
-                        pl.col("_stable_y").any().alias("_stable_pool_y"),
-                        pl.col("_stable_v").any().alias("_stable_pool_v"),
+                        .alias("_alpha_v"),
+                        pl.col("_score_history_blocks_y").max()
+                        .alias("_score_history_blocks_y"),
+                        pl.col("_score_history_blocks_v").max()
+                        .alias("_score_history_blocks_v"),
+                        pl.col("_regime_ref_block").first()
+                        .alias("_regime_ref_block"),
                         pl.col("_reference_y").first().alias("_reference_y"),
                         pl.col("_reference_v").first().alias("_reference_v"),
                         pl.col("_recent28_y").first().alias("_recent28_y"),
@@ -2246,104 +2358,170 @@ class RLSForecastRunner:
                         pl.col("_recent14_v").first().alias("_recent14_v"),
                         pl.col("_coverage_y").first().alias("_coverage_y"),
                         pl.col("_coverage_v").first().alias("_coverage_v"),
-                        pl.col("_sparse_robust_y").first().alias("_sparse_robust_y"),
-                        pl.col("_sparse_robust_v").first().alias("_sparse_robust_v"),
-                        pl.col("_sparse_shock_y").first().alias("_sparse_shock_y"),
-                        pl.col("_sparse_shock_v").first().alias("_sparse_shock_v"),
-                        pl.col("_robust_block_median_y")
-                        .first()
-                        .alias("_robust_block_median_y"),
-                        pl.col("_robust_block_median_v")
-                        .first()
-                        .alias("_robust_block_median_v"),
                         pl.col("_regime_anchor_y").first().alias("_regime_anchor_y"),
                         pl.col("_regime_anchor_v").first().alias("_regime_anchor_v"),
+                        pl.col("_regime_class_y").first().alias("_regime_class_y"),
+                        pl.col("_regime_class_v").first().alias("_regime_class_v"),
+                        pl.col("_structural_y").first().alias("_structural_y"),
+                        pl.col("_structural_v").first().alias("_structural_v"),
+                        pl.col("_structural_history_blocks_y").first()
+                        .alias("_structural_history_blocks_y"),
+                        pl.col("_structural_history_blocks_v").first()
+                        .alias("_structural_history_blocks_v"),
+                        pl.col("_b0_y").first().alias("_b0_y"),
+                        pl.col("_b0_v").first().alias("_b0_v"),
+                        pl.col("_b1_y").first().alias("_b1_y"),
+                        pl.col("_b1_v").first().alias("_b1_v"),
+                        pl.col("_b2_y").first().alias("_b2_y"),
+                        pl.col("_b2_v").first().alias("_b2_v"),
+                        pl.col("_b3_y").first().alias("_b3_y"),
+                        pl.col("_b3_v").first().alias("_b3_v"),
+                        pl.col("_reset_y").any().alias("_reset_y"),
+                        pl.col("_reset_v").any().alias("_reset_v"),
                     )
                     .with_columns(
-                        pl.when(pl.col("_stable_pool_y"))
-                        .then(pl.col("_alpha_y_regime"))
-                        .otherwise(pl.col("_alpha_y_lowlevel"))
+                        pl.col("_alpha_y").alias("_alpha_y_unconstrained"),
+                        pl.col("_alpha_v").alias("_alpha_v_unconstrained"),
+                    )
+                    .with_columns(
+                        pl.when(pl.col("_regime_class_y") == "transient_down")
+                        .then(pl.lit(transient_down_alpha))
+                        .otherwise(pl.col("_alpha_y"))
                         .alias("_alpha_y"),
-                        pl.when(pl.col("_stable_pool_v"))
-                        .then(pl.col("_alpha_v_regime"))
-                        .otherwise(pl.col("_alpha_v_lowlevel"))
+                        pl.when(pl.col("_regime_class_v") == "transient_down")
+                        .then(pl.lit(transient_down_alpha))
+                        .otherwise(pl.col("_alpha_v"))
                         .alias("_alpha_v"),
+                        pl.lit(True).alias("_stable_pool_y"),
+                        pl.lit(True).alias("_stable_pool_v"),
+                        pl.when(pl.col("_reset_y"))
+                        .then(pl.lit("SES_RESET_TRANSIENT_UP"))
+                        .when(pl.col("_regime_class_y") == "transient_down")
+                        .then(pl.lit("SES_REACTIVE_TRANSIENT_DOWN"))
+                        .when(pl.col("_score_history_blocks_y") == 0)
+                        .then(pl.lit("NO_SCORE_HISTORY"))
+                        .otherwise(pl.lit("OK"))
+                        .alias("_ses_guard_status_y"),
+                        pl.when(pl.col("_reset_v"))
+                        .then(pl.lit("SES_RESET_TRANSIENT_UP"))
+                        .when(pl.col("_regime_class_v") == "transient_down")
+                        .then(pl.lit("SES_REACTIVE_TRANSIENT_DOWN"))
+                        .when(pl.col("_score_history_blocks_v") == 0)
+                        .then(pl.lit("NO_SCORE_HISTORY"))
+                        .otherwise(pl.lit("OK"))
+                        .alias("_ses_guard_status_v"),
                     )
                     .with_columns(
-                        (
-                            pl.col("_alpha_y")
-                            != pl.col("_alpha_y_unconstrained")
-                        ).alias("_ses_guard_y"),
-                        (
-                            pl.col("_alpha_v")
-                            != pl.col("_alpha_v_unconstrained")
-                        ).alias("_ses_guard_v"),
-                    )
-                    .drop(
-                        "_alpha_y_regime",
-                        "_alpha_v_regime",
-                        "_alpha_y_lowlevel",
-                        "_alpha_v_lowlevel",
+                        (pl.col("_ses_guard_status_y") != "OK")
+                        .alias("_ses_guard_y"),
+                        (pl.col("_ses_guard_status_v") != "OK")
+                        .alias("_ses_guard_v"),
                     )
                 )
 
+                alpha_selection_source = ranked_alpha.join(
+                    alpha_choices.select(
+                        uid_col,
+                        "_alpha_y",
+                        "_alpha_v",
+                        "_alpha_y_unconstrained",
+                        "_alpha_v_unconstrained",
+                        "_ses_guard_y",
+                        "_ses_guard_v",
+                        "_ses_guard_status_y",
+                        "_ses_guard_status_v",
+                        "_stable_pool_y",
+                        "_stable_pool_v",
+                        "_score_history_blocks_y",
+                        "_score_history_blocks_v",
+                    ),
+                    on=uid_col,
+                    how="inner",
+                )
+
             selected_y = (
-                alpha_state.join(alpha_choices, on=uid_col, how="inner")
+                alpha_selection_source
                 .filter(pl.col("_alpha") == pl.col("_alpha_y"))
                 .select(
                     uid_col,
                     "_alpha_y",
+                    "_alpha_y_unconstrained",
                     "_ses_guard_y",
+                    "_ses_guard_status_y",
                     "_stable_pool_y",
+                    "_score_history_blocks_y",
+                    "_regime_ref_block",
                     "_reference_y",
                     "_recent28_y",
                     "_recent14_y",
                     "_coverage_y",
-                    "_sparse_robust_y",
-                    "_sparse_shock_y",
-                    "_robust_block_median_y",
                     "_regime_anchor_y",
+                    "_regime_class_y",
+                    "_structural_y",
+                    "_structural_history_blocks_y",
+                    "_b0_y", "_b1_y", "_b2_y", "_b3_y",
                     pl.col("_level_y"),
-                    pl.when(pl.col("_cden_ses_y") > 0)
-                    .then(pl.col("_cae_ses_y") / pl.col("_cden_ses_y"))
-                    .otherwise(None)
-                    .alias("_pure_ses_wmape_y"),
+                    pl.col("_wmape_ses_y").alias("_pure_ses_wmape_y"),
+                    pl.col("_bias_ses_y").alias("_pure_ses_bias_y"),
+                    pl.col("_score_ses_y").alias("_pure_ses_score_y"),
                 )
             )
             selected_v = (
-                alpha_state.join(alpha_choices, on=uid_col, how="inner")
+                alpha_selection_source
                 .filter(pl.col("_alpha") == pl.col("_alpha_v"))
                 .select(
                     uid_col,
                     "_alpha_v",
+                    "_alpha_v_unconstrained",
                     "_ses_guard_v",
+                    "_ses_guard_status_v",
                     "_stable_pool_v",
+                    "_score_history_blocks_v",
                     "_reference_v",
                     "_recent28_v",
                     "_recent14_v",
                     "_coverage_v",
-                    "_sparse_robust_v",
-                    "_sparse_shock_v",
-                    "_robust_block_median_v",
                     "_regime_anchor_v",
+                    "_regime_class_v",
+                    "_structural_v",
+                    "_structural_history_blocks_v",
+                    "_b0_v", "_b1_v", "_b2_v", "_b3_v",
                     pl.col("_level_v"),
-                    pl.when(pl.col("_cden_ses_v") > 0)
-                    .then(pl.col("_cae_ses_v") / pl.col("_cden_ses_v"))
-                    .otherwise(None)
-                    .alias("_pure_ses_wmape_v"),
+                    pl.col("_wmape_ses_v").alias("_pure_ses_wmape_v"),
+                    pl.col("_bias_ses_v").alias("_pure_ses_bias_v"),
+                    pl.col("_score_ses_v").alias("_pure_ses_score_v"),
                 )
             )
             selected_level = selected_y.join(
                 selected_v, on=uid_col, how="inner"
             )
 
-            # ── STAGE 2: select parent shape with SES level already fixed ──
+            # ── STAGE 2: select parent + driver mode with SES fixed ─────
+            # Candidates: store/section × shape_only/level_shape.  The first
+            # scored block starts conservatively with shape_only; later blocks
+            # choose only from cumulative PRIOR-block errors.
             if block_i == 1:
-                parent_choices = ids.select(uid_col).with_columns(
-                    pl.lit(default_parent).alias("_parent_y"),
-                    pl.lit(default_parent).alias("_parent_v"),
-                    pl.lit(default_driver_strength).alias("_strength_y"),
-                    pl.lit(default_driver_strength).alias("_strength_v"),
+                parent_choices = (
+                    leaf_parent_availability.with_columns(
+                        pl.when(pl.col("_store_parent_available"))
+                        .then(pl.lit("store"))
+                        .otherwise(pl.lit("section"))
+                        .alias("_parent_y"),
+                        pl.when(pl.col("_store_parent_available"))
+                        .then(pl.lit("store"))
+                        .otherwise(pl.lit("section"))
+                        .alias("_parent_v"),
+                        pl.lit(default_driver_mode).alias("_driver_mode_y"),
+                        pl.lit(default_driver_mode).alias("_driver_mode_v"),
+                        pl.lit(1.0).alias("_strength_y"),
+                        pl.lit(1.0).alias("_strength_v"),
+                    )
+                    .select(
+                        uid_col,
+                        "_parent_y", "_parent_v",
+                        "_driver_mode_y", "_driver_mode_v",
+                        "_strength_y", "_strength_v",
+                    )
                 )
             else:
                 ranked_parent = (
@@ -2356,65 +2534,29 @@ class RLSForecastRunner:
                         .then(pl.col("_cae_parent_v") / pl.col("_cden_parent_v"))
                         .otherwise(float("inf"))
                         .alias("_wmape_parent_v"),
-                    )
-                    .with_columns(
-                        pl.col("_wmape_parent_y")
-                        .min()
-                        .over(uid_col)
-                        .alias("_best_parent_y"),
-                        pl.col("_wmape_parent_v")
-                        .min()
-                        .over(uid_col)
-                        .alias("_best_parent_v"),
+                        pl.when(pl.col("_parent") == default_parent)
+                        .then(0).otherwise(1).cast(pl.Int8).alias("_parent_priority"),
+                        pl.when(pl.col("_driver_mode") == default_driver_mode)
+                        .then(0).otherwise(1).cast(pl.Int8).alias("_mode_priority"),
                     )
                 )
-                ranked_parent = ranked_parent.with_columns(
-                    pl.when(
-                        pl.col("_wmape_parent_y")
-                        <= pl.col("_best_parent_y")
-                        * (1.0 + driver_near_best_tol)
-                    )
-                    .then(pl.col("_strength"))
-                    .otherwise(float("inf"))
-                    .alias("_driver_sort_y"),
-                    pl.when(
-                        pl.col("_wmape_parent_v")
-                        <= pl.col("_best_parent_v")
-                        * (1.0 + driver_near_best_tol)
-                    )
-                    .then(pl.col("_strength"))
-                    .otherwise(float("inf"))
-                    .alias("_driver_sort_v"),
-                )
+                sort_y = ["_wmape_parent_y", "_mode_priority", "_parent_priority"]
+                sort_v = ["_wmape_parent_v", "_mode_priority", "_parent_priority"]
                 parent_choices = ranked_parent.group_by(uid_col).agg(
-                    pl.col("_parent")
-                    .sort_by("_driver_sort_y", "_parent")
-                    .first()
-                    .alias("_parent_y"),
-                    pl.col("_strength")
-                    .sort_by("_driver_sort_y", "_parent")
-                    .first()
-                    .alias("_strength_y"),
-                    pl.col("_parent")
-                    .sort_by("_driver_sort_v", "_parent")
-                    .first()
-                    .alias("_parent_v"),
-                    pl.col("_strength")
-                    .sort_by("_driver_sort_v", "_parent")
-                    .first()
-                    .alias("_strength_v"),
+                    pl.col("_parent").sort_by(*sort_y).first().alias("_parent_y"),
+                    pl.col("_driver_mode").sort_by(*sort_y).first().alias("_driver_mode_y"),
+                    pl.col("_parent").sort_by(*sort_v).first().alias("_parent_v"),
+                    pl.col("_driver_mode").sort_by(*sort_v).first().alias("_driver_mode_v"),
+                ).with_columns(
+                    pl.lit(1.0).alias("_strength_y"),
+                    pl.lit(1.0).alias("_strength_v"),
                 )
 
-            # v9.0.1: group_by().agg() does not guarantee the same column
-            # order as the literal first-block DataFrame. vertical_relaxed
-            # relaxes dtypes, not schema-name position, so normalize the
-            # parent schema explicitly before building every chosen frame.
             parent_choices = parent_choices.select(
                 uid_col,
-                "_parent_y",
-                "_parent_v",
-                "_strength_y",
-                "_strength_v",
+                "_parent_y", "_parent_v",
+                "_driver_mode_y", "_driver_mode_v",
+                "_strength_y", "_strength_v",
             )
             chosen_frame = (
                 selected_level.join(
@@ -2424,21 +2566,27 @@ class RLSForecastRunner:
                 )
             )
 
-            # Defensive release invariant: every frame entering pl.concat must
-            # have exactly the same names in exactly the same order. Reorder
-            # when the set is identical; fail early if a future change adds or
-            # removes a column in only some blocks.
-            if chosen_frames:
-                expected_cols = chosen_frames[0].columns
-                if set(chosen_frame.columns) != set(expected_cols):
+            # Defensive schema invariant for both RAM and disk-spill paths.
+            if chosen_cols is None:
+                chosen_cols = list(chosen_frame.columns)
+            else:
+                if set(chosen_frame.columns) != set(chosen_cols):
                     raise RuntimeError(
-                        "Leaf chosen-frame schema mismatch before concat: "
-                        f"block={block_i}, expected={expected_cols}, "
+                        "Leaf chosen-frame schema mismatch before consolidation: "
+                        f"block={block_i}, expected={chosen_cols}, "
                         f"got={chosen_frame.columns}"
                     )
-                chosen_frame = chosen_frame.select(expected_cols)
+                chosen_frame = chosen_frame.select(chosen_cols)
 
-            chosen_frames.append(chosen_frame)
+            if memory_safe:
+                assert spill_path is not None
+                chosen_frame.write_parquet(
+                    spill_path / f"chosen_state_{block_i:05d}.parquet",
+                    compression=str(getattr(settings, "MULTIBLOCK_SPILL_COMPRESSION", "zstd")),
+                    statistics=True,
+                )
+            else:
+                chosen_frames.append(chosen_frame)
 
             # Forecast-only has no actuals and is never allowed to affect
             # alpha/parent selection or SES state.
@@ -2476,16 +2624,38 @@ class RLSForecastRunner:
                     )
                     .group_by([uid_col, "_alpha"])
                     .agg(
-                        (
-                            (pl.col("y") - pl.col("_level_y")).abs()
-                            - pl.col("_level_y")
-                        ).sum().alias("_ses_ae_adjust_y"),
-                        pl.col("y").abs().sum().alias("_ses_den_y"),
-                        (
-                            (pl.col("value") - pl.col("_level_v")).abs()
-                            - pl.col("_level_v")
-                        ).sum().alias("_ses_ae_adjust_v"),
-                        pl.col("value").abs().sum().alias("_ses_den_v"),
+                        # Official client objective: score ONLY dates with
+                        # positive actual demand. Missing/zero sale dates still
+                        # participate in the SES state decay below, but they do
+                        # not enter wMAPE/BIAS model selection.
+                        pl.when(pl.col("y") > 0)
+                        .then((pl.col("y") - pl.col("_level_y")).abs())
+                        .otherwise(0.0)
+                        .sum().alias("_ses_ae_pos_y"),
+                        pl.when(pl.col("y") > 0)
+                        .then(pl.col("y").abs())
+                        .otherwise(0.0)
+                        .sum().alias("_ses_den_y"),
+                        pl.when(pl.col("y") > 0)
+                        .then(pl.col("_level_y") - pl.col("y"))
+                        .otherwise(0.0)
+                        .sum().alias("_ses_signed_pos_y"),
+                        pl.col("y").sum().alias("_ses_sum_y"),
+                        (pl.col("y") > 0).sum().alias("_ses_nz_y"),
+                        pl.when(pl.col("value") > 0)
+                        .then((pl.col("value") - pl.col("_level_v")).abs())
+                        .otherwise(0.0)
+                        .sum().alias("_ses_ae_pos_v"),
+                        pl.when(pl.col("value") > 0)
+                        .then(pl.col("value").abs())
+                        .otherwise(0.0)
+                        .sum().alias("_ses_den_v"),
+                        pl.when(pl.col("value") > 0)
+                        .then(pl.col("_level_v") - pl.col("value"))
+                        .otherwise(0.0)
+                        .sum().alias("_ses_signed_pos_v"),
+                        pl.col("value").sum().alias("_ses_sum_v"),
+                        (pl.col("value") > 0).sum().alias("_ses_nz_v"),
                         (pl.col("y").clip(lower_bound=0.0) * pl.col("_w"))
                         .sum().alias("_wzy"),
                         (pl.col("value").clip(lower_bound=0.0) * pl.col("_w"))
@@ -2497,22 +2667,28 @@ class RLSForecastRunner:
                 )
             else:
                 alpha_state = alpha_state.with_columns(
-                    pl.lit(None).cast(pl.Float64).alias("_ses_ae_adjust_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_ae_pos_y"),
                     pl.lit(None).cast(pl.Float64).alias("_ses_den_y"),
-                    pl.lit(None).cast(pl.Float64).alias("_ses_ae_adjust_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_signed_pos_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_sum_y"),
+                    pl.lit(None).cast(pl.Int64).alias("_ses_nz_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_ae_pos_v"),
                     pl.lit(None).cast(pl.Float64).alias("_ses_den_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_signed_pos_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_ses_sum_v"),
+                    pl.lit(None).cast(pl.Int64).alias("_ses_nz_v"),
                     pl.lit(None).cast(pl.Float64).alias("_wzy"),
                     pl.lit(None).cast(pl.Float64).alias("_wzv"),
                 )
 
+            # PURE SES recurrence over daily actuals. Missing calendar days
+            # are zeros; finite scoring only changes alpha selection, never the
+            # SES state equation itself.
             full_block = pl.col("_n_calendar") == block_days
             alpha_state = (
                 alpha_state.with_columns(
                     pl.when(full_block)
-                    .then(
-                        pl.col("_level_y") * pl.lit(float(block_days))
-                        + pl.col("_ses_ae_adjust_y").fill_null(0.0)
-                    )
+                    .then(pl.col("_ses_ae_pos_y").fill_null(0.0))
                     .otherwise(0.0)
                     .alias("_block_ses_ae_y"),
                     pl.when(full_block)
@@ -2520,62 +2696,164 @@ class RLSForecastRunner:
                     .otherwise(0.0)
                     .alias("_block_ses_den_y"),
                     pl.when(full_block)
-                    .then(
-                        pl.col("_level_v") * pl.lit(float(block_days))
-                        + pl.col("_ses_ae_adjust_v").fill_null(0.0)
-                    )
+                    .then(pl.col("_ses_ae_pos_v").fill_null(0.0))
                     .otherwise(0.0)
                     .alias("_block_ses_ae_v"),
                     pl.when(full_block)
                     .then(pl.col("_ses_den_v").fill_null(0.0))
                     .otherwise(0.0)
                     .alias("_block_ses_den_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_ses_signed_pos_y").fill_null(0.0))
+                    .otherwise(0.0)
+                    .alias("_block_ses_signed_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_ses_signed_pos_v").fill_null(0.0))
+                    .otherwise(0.0)
+                    .alias("_block_ses_signed_v"),
                 )
                 .with_columns(
                     (
-                        pl.lit(alpha_score_decay) * pl.col("_cae_ses_y")
-                        + pl.col("_block_ses_ae_y")
-                    ).alias("_cae_ses_y"),
+                        (pl.lit(1.0) - pl.col("_alpha")).pow(
+                            pl.col("_n_calendar")
+                        ) * pl.col("_level_y")
+                        + pl.col("_wzy").fill_null(0.0)
+                    ).alias("_level_y_next"),
                     (
-                        pl.lit(alpha_score_decay) * pl.col("_cden_ses_y")
-                        + pl.col("_block_ses_den_y")
-                    ).alias("_cden_ses_y"),
-                    (
-                        pl.lit(alpha_score_decay) * pl.col("_cae_ses_v")
-                        + pl.col("_block_ses_ae_v")
-                    ).alias("_cae_ses_v"),
-                    (
-                        pl.lit(alpha_score_decay) * pl.col("_cden_ses_v")
-                        + pl.col("_block_ses_den_v")
-                    ).alias("_cden_ses_v"),
+                        (pl.lit(1.0) - pl.col("_alpha")).pow(
+                            pl.col("_n_calendar")
+                        ) * pl.col("_level_v")
+                        + pl.col("_wzv").fill_null(0.0)
+                    ).alias("_level_v_next"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_ae_b2_y"))
+                    .otherwise(pl.col("_score_ae_b3_y"))
+                    .alias("_next_score_ae_b3_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_ae_b1_y"))
+                    .otherwise(pl.col("_score_ae_b2_y"))
+                    .alias("_next_score_ae_b2_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_ae_b0_y"))
+                    .otherwise(pl.col("_score_ae_b1_y"))
+                    .alias("_next_score_ae_b1_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_block_ses_ae_y"))
+                    .otherwise(pl.col("_score_ae_b0_y"))
+                    .alias("_next_score_ae_b0_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_den_b2_y"))
+                    .otherwise(pl.col("_score_den_b3_y"))
+                    .alias("_next_score_den_b3_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_den_b1_y"))
+                    .otherwise(pl.col("_score_den_b2_y"))
+                    .alias("_next_score_den_b2_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_den_b0_y"))
+                    .otherwise(pl.col("_score_den_b1_y"))
+                    .alias("_next_score_den_b1_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_block_ses_den_y"))
+                    .otherwise(pl.col("_score_den_b0_y"))
+                    .alias("_next_score_den_b0_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_se_b2_y"))
+                    .otherwise(pl.col("_score_se_b3_y"))
+                    .alias("_next_score_se_b3_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_se_b1_y"))
+                    .otherwise(pl.col("_score_se_b2_y"))
+                    .alias("_next_score_se_b2_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_se_b0_y"))
+                    .otherwise(pl.col("_score_se_b1_y"))
+                    .alias("_next_score_se_b1_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_block_ses_signed_y"))
+                    .otherwise(pl.col("_score_se_b0_y"))
+                    .alias("_next_score_se_b0_y"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_ae_b2_v"))
+                    .otherwise(pl.col("_score_ae_b3_v"))
+                    .alias("_next_score_ae_b3_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_ae_b1_v"))
+                    .otherwise(pl.col("_score_ae_b2_v"))
+                    .alias("_next_score_ae_b2_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_ae_b0_v"))
+                    .otherwise(pl.col("_score_ae_b1_v"))
+                    .alias("_next_score_ae_b1_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_block_ses_ae_v"))
+                    .otherwise(pl.col("_score_ae_b0_v"))
+                    .alias("_next_score_ae_b0_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_den_b2_v"))
+                    .otherwise(pl.col("_score_den_b3_v"))
+                    .alias("_next_score_den_b3_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_den_b1_v"))
+                    .otherwise(pl.col("_score_den_b2_v"))
+                    .alias("_next_score_den_b2_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_den_b0_v"))
+                    .otherwise(pl.col("_score_den_b1_v"))
+                    .alias("_next_score_den_b1_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_block_ses_den_v"))
+                    .otherwise(pl.col("_score_den_b0_v"))
+                    .alias("_next_score_den_b0_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_se_b2_v"))
+                    .otherwise(pl.col("_score_se_b3_v"))
+                    .alias("_next_score_se_b3_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_se_b1_v"))
+                    .otherwise(pl.col("_score_se_b2_v"))
+                    .alias("_next_score_se_b2_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_score_se_b0_v"))
+                    .otherwise(pl.col("_score_se_b1_v"))
+                    .alias("_next_score_se_b1_v"),
+                    pl.when(full_block)
+                    .then(pl.col("_block_ses_signed_v"))
+                    .otherwise(pl.col("_score_se_b0_v"))
+                    .alias("_next_score_se_b0_v"),
                 )
-            )
-            # PURE SES recurrence over daily actuals. Parent/RLS never enters
-            # these equations.
-            alpha_state = alpha_state.with_columns(
-                (
-                    (pl.lit(1.0) - pl.col("_alpha")).pow(
-                        pl.col("_n_calendar")
-                    ) * pl.col("_level_y")
-                    + pl.col("_wzy").fill_null(0.0)
-                ).alias("_level_y_next"),
-                (
-                    (pl.lit(1.0) - pl.col("_alpha")).pow(
-                        pl.col("_n_calendar")
-                    ) * pl.col("_level_v")
-                    + pl.col("_wzv").fill_null(0.0)
-                ).alias("_level_v_next"),
-            ).select(
-                uid_col,
-                "_leaf_start",
-                "_leaf_warmup_end",
-                "_alpha",
-                pl.col("_level_y_next").alias("_level_y"),
-                pl.col("_level_v_next").alias("_level_v"),
-                "_cae_ses_y",
-                "_cden_ses_y",
-                "_cae_ses_v",
-                "_cden_ses_v",
+                .select(
+                    uid_col,
+                    "_leaf_start",
+                    "_leaf_warmup_end",
+                    "_alpha",
+                    pl.col("_level_y_next").alias("_level_y"),
+                    pl.col("_level_v_next").alias("_level_v"),
+                pl.col("_next_score_ae_b0_y").alias("_score_ae_b0_y"),
+                pl.col("_next_score_den_b0_y").alias("_score_den_b0_y"),
+                pl.col("_next_score_se_b0_y").alias("_score_se_b0_y"),
+                pl.col("_next_score_ae_b1_y").alias("_score_ae_b1_y"),
+                pl.col("_next_score_den_b1_y").alias("_score_den_b1_y"),
+                pl.col("_next_score_se_b1_y").alias("_score_se_b1_y"),
+                pl.col("_next_score_ae_b2_y").alias("_score_ae_b2_y"),
+                pl.col("_next_score_den_b2_y").alias("_score_den_b2_y"),
+                pl.col("_next_score_se_b2_y").alias("_score_se_b2_y"),
+                pl.col("_next_score_ae_b3_y").alias("_score_ae_b3_y"),
+                pl.col("_next_score_den_b3_y").alias("_score_den_b3_y"),
+                pl.col("_next_score_se_b3_y").alias("_score_se_b3_y"),
+                pl.col("_next_score_ae_b0_v").alias("_score_ae_b0_v"),
+                pl.col("_next_score_den_b0_v").alias("_score_den_b0_v"),
+                pl.col("_next_score_se_b0_v").alias("_score_se_b0_v"),
+                pl.col("_next_score_ae_b1_v").alias("_score_ae_b1_v"),
+                pl.col("_next_score_den_b1_v").alias("_score_den_b1_v"),
+                pl.col("_next_score_se_b1_v").alias("_score_se_b1_v"),
+                pl.col("_next_score_ae_b2_v").alias("_score_ae_b2_v"),
+                pl.col("_next_score_den_b2_v").alias("_score_den_b2_v"),
+                pl.col("_next_score_se_b2_v").alias("_score_se_b2_v"),
+                pl.col("_next_score_ae_b3_v").alias("_score_ae_b3_v"),
+                pl.col("_next_score_den_b3_v").alias("_score_den_b3_v"),
+                pl.col("_next_score_se_b3_v").alias("_score_se_b3_v"),
+                )
             )
 
             # ── Score parent shapes using ONLY the already-selected SES level ──
@@ -2613,75 +2891,60 @@ class RLSForecastRunner:
                     obs_block.join(
                         parent_eval_state.select(
                             uid_col,
-                            "_parent",
-                            "_strength",
-                            "_level_y",
-                            "_level_v",
-                            "_n_calendar",
+                            "_parent", "_driver_mode", "_strength",
+                            "_level_y", "_level_v", "_n_calendar",
                         ),
                         on=uid_col,
                         how="inner",
                     )
                     .with_columns(
-                        pl.when(pl.col("_parent") == "store")
-                        .then(pl.col("_store_ey").exp())
+                        pl.when((pl.col("_parent") == "store") & (pl.col("_driver_mode") == "level_shape"))
+                        .then(pl.col("_store_ey_level").exp())
+                        .when(pl.col("_parent") == "store")
+                        .then(pl.col("_store_ey_shape").exp())
+                        .when((pl.col("_parent") == "section") & (pl.col("_driver_mode") == "level_shape"))
+                        .then(pl.col("_sec_ey_level").exp())
                         .when(pl.col("_parent") == "section")
-                        .then(pl.col("_sec_ey").exp())
+                        .then(pl.col("_sec_ey_shape").exp())
                         .otherwise(1.0)
                         .alias("_raw_factor_y"),
-                        pl.when(pl.col("_parent") == "store")
-                        .then(pl.col("_store_ev").exp())
+                        pl.when((pl.col("_parent") == "store") & (pl.col("_driver_mode") == "level_shape"))
+                        .then(pl.col("_store_ev_level").exp())
+                        .when(pl.col("_parent") == "store")
+                        .then(pl.col("_store_ev_shape").exp())
+                        .when((pl.col("_parent") == "section") & (pl.col("_driver_mode") == "level_shape"))
+                        .then(pl.col("_sec_ev_level").exp())
                         .when(pl.col("_parent") == "section")
-                        .then(pl.col("_sec_ev").exp())
+                        .then(pl.col("_sec_ev_shape").exp())
                         .otherwise(1.0)
                         .alias("_raw_factor_v"),
                     )
                     .with_columns(
-                        (
-                            1.0
-                            + pl.col("_strength")
-                            * (pl.col("_raw_factor_y") - 1.0)
-                        ).alias("_factor_candidate_y"),
-                        (
-                            1.0
-                            + pl.col("_strength")
-                            * (pl.col("_raw_factor_v") - 1.0)
-                        ).alias("_factor_candidate_v"),
+                        (1.0 + pl.col("_strength") * (pl.col("_raw_factor_y") - 1.0)).alias("_factor_candidate_y"),
+                        (1.0 + pl.col("_strength") * (pl.col("_raw_factor_v") - 1.0)).alias("_factor_candidate_v"),
                     )
                     .with_columns(
-                        (
-                            pl.col("_level_y")
-                            * pl.col("_factor_candidate_y")
-                        ).clip(lower_bound=0.0).alias("_pred_y"),
-                        (
-                            pl.col("_level_v")
-                            * pl.col("_factor_candidate_v")
-                        ).clip(lower_bound=0.0).alias("_pred_v"),
+                        (pl.col("_level_y") * pl.col("_factor_candidate_y")).clip(lower_bound=0.0).alias("_pred_y"),
+                        (pl.col("_level_v") * pl.col("_factor_candidate_v")).clip(lower_bound=0.0).alias("_pred_v"),
                     )
-                    .group_by([uid_col, "_parent", "_strength"])
+                    .group_by([uid_col, "_parent", "_driver_mode", "_strength"])
                     .agg(
-                        (
-                            (pl.col("y") - pl.col("_pred_y")).abs()
-                            - pl.col("_pred_y")
-                        ).sum().alias("_parent_ae_adjust_y"),
-                        pl.col("y").abs().sum().alias("_parent_den_y"),
-                        (
-                            (pl.col("value") - pl.col("_pred_v")).abs()
-                            - pl.col("_pred_v")
-                        ).sum().alias("_parent_ae_adjust_v"),
-                        pl.col("value").abs().sum().alias("_parent_den_v"),
+                        pl.when(pl.col("y") > 0).then((pl.col("y") - pl.col("_pred_y")).abs()).otherwise(0.0).sum().alias("_parent_ae_pos_y"),
+                        pl.when(pl.col("y") > 0).then(pl.col("y").abs()).otherwise(0.0).sum().alias("_parent_den_y"),
+                        pl.when(pl.col("value") > 0).then((pl.col("value") - pl.col("_pred_v")).abs()).otherwise(0.0).sum().alias("_parent_ae_pos_v"),
+                        pl.when(pl.col("value") > 0).then(pl.col("value").abs()).otherwise(0.0).sum().alias("_parent_den_v"),
                     )
                 )
                 parent_state = parent_state.join(
                     parent_eval,
-                    on=[uid_col, "_parent", "_strength"],
+                    on=[uid_col, "_parent", "_driver_mode", "_strength"],
                     how="left",
                 )
             else:
                 parent_state = parent_state.with_columns(
-                    pl.lit(None).cast(pl.Float64).alias("_parent_ae_adjust_y"),
+                    pl.lit(None).cast(pl.Float64).alias("_parent_ae_pos_y"),
                     pl.lit(None).cast(pl.Float64).alias("_parent_den_y"),
-                    pl.lit(None).cast(pl.Float64).alias("_parent_ae_adjust_v"),
+                    pl.lit(None).cast(pl.Float64).alias("_parent_ae_pos_v"),
                     pl.lit(None).cast(pl.Float64).alias("_parent_den_v"),
                 )
 
@@ -2696,10 +2959,7 @@ class RLSForecastRunner:
                 .join(calendar_by_uid, on=uid_col, how="left")
                 .with_columns(
                     pl.when(pl.col("_n_calendar") == block_days)
-                    .then(
-                        pl.col("_level_y") * pl.lit(float(block_days))
-                        + pl.col("_parent_ae_adjust_y").fill_null(0.0)
-                    )
+                    .then(pl.col("_parent_ae_pos_y").fill_null(0.0))
                     .otherwise(0.0)
                     .alias("_block_parent_ae_y"),
                     pl.when(pl.col("_n_calendar") == block_days)
@@ -2707,10 +2967,7 @@ class RLSForecastRunner:
                     .otherwise(0.0)
                     .alias("_block_parent_den_y"),
                     pl.when(pl.col("_n_calendar") == block_days)
-                    .then(
-                        pl.col("_level_v") * pl.lit(float(block_days))
-                        + pl.col("_parent_ae_adjust_v").fill_null(0.0)
-                    )
+                    .then(pl.col("_parent_ae_pos_v").fill_null(0.0))
                     .otherwise(0.0)
                     .alias("_block_parent_ae_v"),
                     pl.when(pl.col("_n_calendar") == block_days)
@@ -2742,242 +2999,116 @@ class RLSForecastRunner:
                 )
                 .select(
                     uid_col,
-                    "_parent",
-                    "_strength",
-                    "_cae_parent_y",
-                    "_cden_parent_y",
-                    "_cae_parent_v",
-                    "_cden_parent_v",
+                    "_parent", "_driver_mode", "_strength",
+                    "_cae_parent_y", "_cden_parent_y",
+                    "_cae_parent_v", "_cden_parent_v",
                 )
             )
 
-        chosen_states = pl.concat(
-            chosen_frames, how="vertical_relaxed"
+        chosen_states = (
+            pl.concat(chosen_frames, how="vertical_relaxed")
+            if not memory_safe
+            else None
         )
 
         logger.info(
-            "⏱ Sección %s: selección leaf 2-etapas (SES puro %d alphas + 2 padres): %.1fs",
+            "⏱ Sección %s: selección leaf 2-etapas (SES puro %d alphas + %d parent-modes): %.1fs",
             section_id,
             len(alpha_candidates),
+            parent_params.height,
             time.perf_counter() - t_candidates,
         )
 
-        # Reference level for audit: arithmetic mean of the immediately
-        # preceding 28 CALENDAR days, with missing sale dates treated as zero.
-        # This is not used to make the forecast; it is a diagnostic that makes
-        # any SES-level explosion visible in forecast.parquet.
-        reference_frames: list[pl.DataFrame] = []
-        for ref_block in range(1, max_block + 1):
-            ref_start = train_start + dt.timedelta(
-                days=(ref_block - 1) * block_days
-            )
-            ref_end = ref_start + dt.timedelta(days=block_days - 1)
-            ref = (
-                actual_obs.filter(
-                    (pl.col("ds") >= pl.lit(ref_start))
-                    & (pl.col("ds") <= pl.lit(ref_end))
-                )
-                .group_by(uid_col)
-                .agg(
-                    (
-                        pl.col("y").sum() / pl.lit(float(block_days))
-                    ).alias("_recent28_mean_y"),
-                    (
-                        pl.col("value").sum() / pl.lit(float(block_days))
-                    ).alias("_recent28_mean_v"),
-                )
-                .with_columns(
-                    pl.lit(ref_block).cast(pl.Int32).alias("_block")
-                )
-            )
-            reference_frames.append(ref)
+        # Reference level for audit: reuse the block statistics already built
+        # above. v11.0.1 rescanned actual_obs once per block; that duplicated a
+        # costly group_by/filter loop without changing the result.
         recent_refs = (
-            pl.concat(reference_frames, how="vertical_relaxed")
-            if reference_frames
-            else pl.DataFrame()
+            recent_block_stats.select(
+                uid_col,
+                "_block",
+                (pl.col("_recent28_sum_y") / pl.lit(float(block_days))).alias("_recent28_mean_y"),
+                (pl.col("_recent28_sum_v") / pl.lit(float(block_days))).alias("_recent28_mean_v"),
+            )
+            if not memory_safe else pl.DataFrame()
         )
 
+        if memory_safe:
+            assert spill_path is not None
+            chosen_lf = pl.scan_parquet(str(spill_path / "chosen_state_*.parquet"))
+            # Streaming join avoids materializing the whole chosen-state table
+            # beside the already-large daily leaf frame. The final daily frame
+            # still exists (it must be saved), but the extra N-origins copy does not.
+            rows = (
+                rows.lazy()
+                .join(chosen_lf, on=[uid_col, "_block"], how="left")
+                .collect(engine="streaming")
+                .with_columns(
+                    pl.col("_recent28_y").alias("_recent28_mean_y"),
+                    pl.col("_recent28_v").alias("_recent28_mean_v"),
+                )
+            )
+            # Windows may retain file handles until collection completes; only
+            # clean after the streaming join has fully materialized.
+            if spill_tmp is not None:
+                spill_tmp.cleanup()
+                spill_tmp = None
+        else:
+            assert chosen_states is not None
+            rows = (
+                rows.join(chosen_states, on=[uid_col, "_block"], how="left")
+                .join(recent_refs, on=[uid_col, "_block"], how="left")
+            )
+
         rows = (
-            rows.join(
-                chosen_states, on=[uid_col, "_block"], how="left"
-            )
-            .join(
-                recent_refs, on=[uid_col, "_block"], how="left"
-            )
-            .with_columns(
+            rows.with_columns(
                 (
                     (pl.col("ds") - pl.lit(train_start)).dt.total_days()
                     % block_days
                 )
                 .cast(pl.Int32)
                 .alias("_day_in_block"),
-                pl.when(pl.col("_parent_y") == "store")
-                .then(pl.col("_store_ey").exp())
+                pl.when((pl.col("_parent_y") == "store") & (pl.col("_driver_mode_y") == "level_shape"))
+                .then(pl.col("_store_ey_level").exp())
+                .when(pl.col("_parent_y") == "store")
+                .then(pl.col("_store_ey_shape").exp())
+                .when((pl.col("_parent_y") == "section") & (pl.col("_driver_mode_y") == "level_shape"))
+                .then(pl.col("_sec_ey_level").exp())
                 .when(pl.col("_parent_y") == "section")
-                .then(pl.col("_sec_ey").exp())
+                .then(pl.col("_sec_ey_shape").exp())
                 .otherwise(1.0)
                 .alias("_raw_factor_y"),
-                pl.when(pl.col("_parent_v") == "store")
-                .then(pl.col("_store_ev").exp())
+                pl.when((pl.col("_parent_v") == "store") & (pl.col("_driver_mode_v") == "level_shape"))
+                .then(pl.col("_store_ev_level").exp())
+                .when(pl.col("_parent_v") == "store")
+                .then(pl.col("_store_ev_shape").exp())
+                .when((pl.col("_parent_v") == "section") & (pl.col("_driver_mode_v") == "level_shape"))
+                .then(pl.col("_sec_ev_level").exp())
                 .when(pl.col("_parent_v") == "section")
-                .then(pl.col("_sec_ev").exp())
+                .then(pl.col("_sec_ev_shape").exp())
                 .otherwise(1.0)
                 .alias("_raw_factor_v"),
+                pl.when((pl.col("_parent_y") == "store") & (pl.col("_driver_mode_y") == "level_shape"))
+                .then(pl.col("_store_level_factor_y"))
+                .when((pl.col("_parent_y") == "section") & (pl.col("_driver_mode_y") == "level_shape"))
+                .then(pl.col("_sec_level_factor_y"))
+                .otherwise(1.0)
+                .alias("_selected_level_factor_y"),
+                pl.when((pl.col("_parent_v") == "store") & (pl.col("_driver_mode_v") == "level_shape"))
+                .then(pl.col("_store_level_factor_v"))
+                .when((pl.col("_parent_v") == "section") & (pl.col("_driver_mode_v") == "level_shape"))
+                .then(pl.col("_sec_level_factor_v"))
+                .otherwise(1.0)
+                .alias("_selected_level_factor_v"),
             )
         )
 
-        # Direction guard is evaluated only for dense target blocks where the
-        # complete 28-day driver shape exists (OOS / forecast-only).
-        direction_ratio = float(
-            getattr(settings, "LEAF_DRIVER_DIRECTION_CONFLICT_RATIO", 0.85)
-        )
-        direction_recent_floor = float(
-            getattr(settings, "LEAF_DRIVER_RECENT_TREND_FLOOR", 0.95)
-        )
-        direction_recent_ceiling = float(
-            getattr(settings, "LEAF_DRIVER_RECENT_TREND_CEILING", 1.05)
-        )
-        direction_max_strength = float(
-            getattr(
-                settings,
-                "LEAF_DRIVER_DIRECTION_GUARD_MAX_STRENGTH",
-                0.25,
-            )
-        )
-        shape_guard_stats = (
-            rows.filter(
-                pl.col("period_type").is_in(
-                    ["out_sample", "forecast_only"]
-                )
-            )
-            .group_by([uid_col, "_block"])
-            .agg(
-                pl.col("_raw_factor_y")
-                .filter(pl.col("_day_in_block") < 7)
-                .mean()
-                .alias("_factor_first7_y"),
-                pl.col("_raw_factor_y")
-                .filter(pl.col("_day_in_block") >= block_days - 7)
-                .mean()
-                .alias("_factor_last7_y"),
-                pl.col("_raw_factor_v")
-                .filter(pl.col("_day_in_block") < 7)
-                .mean()
-                .alias("_factor_first7_v"),
-                pl.col("_raw_factor_v")
-                .filter(pl.col("_day_in_block") >= block_days - 7)
-                .mean()
-                .alias("_factor_last7_v"),
-            )
-            .with_columns(
-                pl.when(pl.col("_factor_first7_y") > 1e-12)
-                .then(
-                    pl.col("_factor_last7_y")
-                    / pl.col("_factor_first7_y")
-                )
-                .otherwise(1.0)
-                .alias("_driver_trend_y"),
-                pl.when(pl.col("_factor_first7_v") > 1e-12)
-                .then(
-                    pl.col("_factor_last7_v")
-                    / pl.col("_factor_first7_v")
-                )
-                .otherwise(1.0)
-                .alias("_driver_trend_v"),
-            )
-        )
-
+        # Parent RLS is mandatory and applied at 100% strength.  shape_only
+        # keeps the v11.4 mean-one contract; level_shape also carries the
+        # causal parent block uplift selected from prior historical errors.
         rows = (
-            rows.join(
-                shape_guard_stats,
-                on=[uid_col, "_block"],
-                how="left",
-            )
-            .with_columns(
-                (
-                    2.0 * pl.col("_recent28_y") - pl.col("_recent14_y")
-                )
-                .clip(lower_bound=0.0)
-                .alias("_previous14_y"),
-                (
-                    2.0 * pl.col("_recent28_v") - pl.col("_recent14_v")
-                )
-                .clip(lower_bound=0.0)
-                .alias("_previous14_v"),
-            )
-            .with_columns(
-                pl.when(pl.col("_previous14_y") > 1e-12)
-                .then(pl.col("_recent14_y") / pl.col("_previous14_y"))
-                .otherwise(1.0)
-                .alias("_recent_trend_y"),
-                pl.when(pl.col("_previous14_v") > 1e-12)
-                .then(pl.col("_recent14_v") / pl.col("_previous14_v"))
-                .otherwise(1.0)
-                .alias("_recent_trend_v"),
-            )
-            .with_columns(
-                (
-                    (pl.col("_coverage_y") >= regime_dense_coverage)
-                    & (
-                        (
-                            pl.col("_driver_trend_y").fill_null(1.0)
-                            < direction_ratio
-                        )
-                        & (
-                            pl.col("_recent_trend_y")
-                            >= direction_recent_floor
-                        )
-                        | (
-                            pl.col("_driver_trend_y").fill_null(1.0)
-                            > (1.0 / direction_ratio)
-                        )
-                        & (
-                            pl.col("_recent_trend_y")
-                            <= direction_recent_ceiling
-                        )
-                    )
-                ).alias("_direction_guard_y"),
-                (
-                    (pl.col("_coverage_v") >= regime_dense_coverage)
-                    & (
-                        (
-                            pl.col("_driver_trend_v").fill_null(1.0)
-                            < direction_ratio
-                        )
-                        & (
-                            pl.col("_recent_trend_v")
-                            >= direction_recent_floor
-                        )
-                        | (
-                            pl.col("_driver_trend_v").fill_null(1.0)
-                            > (1.0 / direction_ratio)
-                        )
-                        & (
-                            pl.col("_recent_trend_v")
-                            <= direction_recent_ceiling
-                        )
-                    )
-                ).alias("_direction_guard_v"),
-            )
-            .with_columns(
-                pl.when(pl.col("_direction_guard_y"))
-                .then(
-                    pl.min_horizontal(
-                        pl.col("_strength_y"),
-                        pl.lit(direction_max_strength),
-                    )
-                )
-                .otherwise(pl.col("_strength_y"))
-                .alias("_effective_strength_y"),
-                pl.when(pl.col("_direction_guard_v"))
-                .then(
-                    pl.min_horizontal(
-                        pl.col("_strength_v"),
-                        pl.lit(direction_max_strength),
-                    )
-                )
-                .otherwise(pl.col("_strength_v"))
-                .alias("_effective_strength_v"),
+            rows.with_columns(
+                pl.lit(1.0).alias("_effective_strength_y"),
+                pl.lit(1.0).alias("_effective_strength_v"),
             )
             .with_columns(
                 (
@@ -3017,29 +3148,33 @@ class RLSForecastRunner:
                 pl.concat_str(
                     [
                         pl.lit("leaf_ses_level_driver:"),
-                        pl.col("_parent_y"),
-                        pl.lit("@"),
-                        pl.col("_effective_strength_y").round(2).cast(pl.Utf8),
+                        pl.col("_parent_y"), pl.lit(":"), pl.col("_driver_mode_y"),
+                        pl.lit("@"), pl.col("_effective_strength_y").round(2).cast(pl.Utf8),
                         pl.lit("/"),
-                        pl.col("_parent_v"),
-                        pl.lit("@"),
-                        pl.col("_effective_strength_v").round(2).cast(pl.Utf8),
+                        pl.col("_parent_v"), pl.lit(":"), pl.col("_driver_mode_v"),
+                        pl.lit("@"), pl.col("_effective_strength_v").round(2).cast(pl.Utf8),
                     ]
                 ).alias("modelo_seleccionado"),
                 pl.col("_alpha_y").alias("ses_alpha_y"),
                 pl.col("_alpha_v").alias("ses_alpha_value"),
+                pl.col("_alpha_y_unconstrained").alias("ses_alpha_unconstrained_y"),
+                pl.col("_alpha_v_unconstrained").alias("ses_alpha_unconstrained_value"),
                 pl.col("_parent_y").alias("parent_model_y"),
                 pl.col("_parent_v").alias("parent_model_value"),
-                pl.col("_strength_y").alias("driver_strength_selected_y"),
-                pl.col("_strength_v").alias("driver_strength_selected_value"),
+                pl.col("_driver_mode_y").alias("parent_driver_mode_y"),
+                pl.col("_driver_mode_v").alias("parent_driver_mode_value"),
+                pl.col("_selected_level_factor_y").alias("driver_level_factor_y"),
+                pl.col("_selected_level_factor_v").alias("driver_level_factor_value"),
                 pl.col("_effective_strength_y").alias("driver_strength_y"),
                 pl.col("_effective_strength_v").alias("driver_strength_value"),
-                pl.col("_direction_guard_y").alias("driver_direction_guard_y"),
-                pl.col("_direction_guard_v").alias("driver_direction_guard_value"),
                 pl.col("_level_y").alias("ses_level_y"),
                 pl.col("_level_v").alias("ses_level_value"),
                 pl.col("_pure_ses_wmape_y").alias("pure_ses_wmape_y"),
                 pl.col("_pure_ses_wmape_v").alias("pure_ses_wmape_value"),
+                pl.col("_pure_ses_bias_y").alias("pure_ses_bias_y"),
+                pl.col("_pure_ses_bias_v").alias("pure_ses_bias_value"),
+                pl.col("_pure_ses_score_y").alias("pure_ses_score_y"),
+                pl.col("_pure_ses_score_v").alias("pure_ses_score_value"),
                 pl.col("_reference_y").alias("ses_stability_reference_y"),
                 pl.col("_reference_v").alias("ses_stability_reference_value"),
                 pl.col("_recent28_y").alias("ses_recent28_y"),
@@ -3050,16 +3185,31 @@ class RLSForecastRunner:
                 pl.col("_coverage_v").alias("ses_recent28_coverage_value"),
                 pl.col("_regime_anchor_y").alias("ses_regime_anchor_y"),
                 pl.col("_regime_anchor_v").alias("ses_regime_anchor_value"),
-                pl.col("_sparse_robust_y").alias("ses_sparse_robust_y"),
-                pl.col("_sparse_robust_v").alias("ses_sparse_robust_value"),
-                pl.col("_sparse_shock_y").alias("ses_sparse_shock_y"),
-                pl.col("_sparse_shock_v").alias("ses_sparse_shock_value"),
-                pl.col("_robust_block_median_y")
-                .alias("ses_robust_block_median_y"),
-                pl.col("_robust_block_median_v")
-                .alias("ses_robust_block_median_value"),
+                pl.col("_regime_class_y").alias("ses_regime_class_y"),
+                pl.col("_regime_class_v").alias("ses_regime_class_value"),
+                pl.col("_regime_ref_block").alias("ses_model_reference_block"),
+                pl.col("_structural_y").alias("ses_structural_level_y"),
+                pl.col("_structural_v").alias("ses_structural_level_value"),
+                pl.col("_structural_history_blocks_y")
+                .alias("ses_structural_history_blocks_y"),
+                pl.col("_structural_history_blocks_v")
+                .alias("ses_structural_history_blocks_value"),
+                pl.col("_b0_y").alias("ses_block_b0_y"),
+                pl.col("_b0_v").alias("ses_block_b0_value"),
+                pl.col("_b1_y").alias("ses_block_b1_y"),
+                pl.col("_b1_v").alias("ses_block_b1_value"),
+                pl.col("_b2_y").alias("ses_block_b2_y"),
+                pl.col("_b2_v").alias("ses_block_b2_value"),
+                pl.col("_b3_y").alias("ses_block_b3_y"),
+                pl.col("_b3_v").alias("ses_block_b3_value"),
                 pl.col("_ses_guard_y").alias("ses_stability_guard_y"),
                 pl.col("_ses_guard_v").alias("ses_stability_guard_value"),
+                pl.col("_ses_guard_status_y").alias("ses_guard_status_y"),
+                pl.col("_ses_guard_status_v").alias("ses_guard_status_value"),
+                pl.col("_score_history_blocks_y").alias("ses_score_history_blocks_y"),
+                pl.col("_score_history_blocks_v").alias("ses_score_history_blocks_value"),
+                pl.lit("B0+B1+B2").alias("ses_score_window_y"),
+                pl.lit("B0+B1+B2").alias("ses_score_window_value"),
                 pl.col("_stable_pool_y").alias("ses_stable_pool_found_y"),
                 pl.col("_stable_pool_v").alias("ses_stable_pool_found_value"),
                 pl.col("_recent28_mean_y")
@@ -3088,55 +3238,154 @@ class RLSForecastRunner:
             )
         )
 
-        # Production invariant: OOS and forecast-only are dense 28-day
-        # blocks, so driver factors MUST average 1 and mean forecast must track
-        # the selected SES level (rounding aside).
-        audit_blocks = (
-            rows.filter(
-                pl.col("period_type").is_in(["out_sample", "forecast_only"])
+        # v11.2: only high-risk leaves are reconsidered. Selection for OOS is
+        # causal and uses the immediately preceding 28-day validation block.
+        # The RLS factor itself is never changed; only the level source may
+        # switch to deseasonalized SES or a robust deseasonalized mean.
+        _t_fallback = time.perf_counter()
+        rows = apply_robust_leaf_fallbacks(rows, horizons)
+        logger.info(
+            "⏱ Sección %s: fallbacks leaf robustos: %.1fs",
+            section_id,
+            time.perf_counter() - _t_fallback,
+        )
+
+        # v12 challenger: independent SKU-total + occurrence/store-share path.
+        # The incumbent v11 forecast is retained. v12.3 uses shared true-hurdle
+        # allocation plus robust closed-block selection with a recent-win guard.
+        _t_v12 = time.perf_counter()
+        rows = apply_v12_occurrence_share_challenger(
+            rows=rows,
+            train_obs=train_obs,
+            oos_obs=oos_obs,
+            horizons=horizons,
+            section_id=str(section_id),
+            n_jobs=self._workers(),
+        )
+        logger.info(
+            "⏱ Sección %s: challenger v12.6 LGBM-shape+occurrence+share: %.1fs",
+            section_id,
+            time.perf_counter() - _t_v12,
+        )
+
+        # These temporary leaf columns were always excluded from the final
+        # artifact. Drop them before audits so their buffers do not overlap
+        # with the audit frames at peak RAM. Output schema is unchanged.
+        drop_tmp = [
+            c for c in (
+                "_block", "_store_uid", "_v12_sku", "_v12_store_uid",
+                "_store_ey_shape", "_store_ev_shape", "_store_ey_level", "_store_ev_level",
+                "_sec_ey_shape", "_sec_ev_shape", "_sec_ey_level", "_sec_ev_level",
+                "_store_level_factor_y", "_store_level_factor_v",
+                "_sec_level_factor_y", "_sec_level_factor_v",
+                "_candidate_y", "_candidate_v", "_level_y", "_level_v",
+                "_parent_y", "_parent_v", "_driver_mode_y", "_driver_mode_v",
+                "_selected_level_factor_y", "_selected_level_factor_v",
+                "_alpha_y", "_alpha_v", "_ey", "_ev",
+                "_recent28_mean_y", "_recent28_mean_v",
+                "_yhat_raw", "_valuehat_raw",
+                "_reference_y", "_reference_v", "_ses_guard_y", "_ses_guard_v",
+                "_stable_pool_y", "_stable_pool_v",
+            ) if c in rows.columns
+        ]
+        rows = rows.drop(drop_tmp)
+        # Production invariant: every leaf forecast must use a real RLS
+        # parent and full normalized driver strength. There is no "none" model.
+        #
+        # MEMORY-SAFE AUDIT (v12.9.12): never filter the full wide post-v12
+        # frame. For section 1, 23,445 leaves × 56 target days = 1,312,920
+        # rows, so one Float64 column alone requires exactly 10,503,360 bytes
+        # (the failed allocation observed after the challenger). Projection
+        # pushdown keeps each audit frame intentionally narrow.
+        def _target_audit_rows(*cols: str) -> pl.DataFrame:
+            keep = [c for c in cols if c in rows.columns]
+            lf = (
+                rows.lazy()
+                .filter(pl.col("period_type").is_in(["out_sample", "forecast_only"]))
+                .select(keep)
             )
-            .group_by([uid_col, "period_type", "rls_block"])
+            try:
+                return lf.collect(engine="streaming")
+            except TypeError:  # Polars compatibility
+                return lf.collect(streaming=True)
+
+        parent_audit_rows = _target_audit_rows(
+            uid_col, "period_type",
+            "parent_model_y", "parent_model_value",
+            "parent_driver_mode_y", "parent_driver_mode_value",
+            "driver_strength_y", "driver_strength_value",
+        )
+        bad_parent = parent_audit_rows.filter(
+            ~pl.col("parent_model_y").is_in(["store", "section"])
+            | ~pl.col("parent_model_value").is_in(["store", "section"])
+            | ~pl.col("parent_driver_mode_y").is_in(["shape_only", "level_shape"])
+            | ~pl.col("parent_driver_mode_value").is_in(["shape_only", "level_shape"])
+            | ((pl.col("driver_strength_y") - 1.0).abs() > 1e-12)
+            | ((pl.col("driver_strength_value") - 1.0).abs() > 1e-12)
+        )
+        if bad_parent.height:
+            raise RuntimeError(
+                "Leaf parent invariant violated: store/section RLS at 100% "
+                f"is mandatory; examples={bad_parent.head(5).select(
+                    uid_col,
+                    'period_type',
+                    'parent_model_y',
+                    'parent_model_value',
+                    'parent_driver_mode_y',
+                    'parent_driver_mode_value',
+                    'driver_strength_y',
+                    'driver_strength_value',
+                ).to_dicts()}"
+            )
+        del bad_parent, parent_audit_rows
+
+        # Lightweight production invariants. Detailed descriptive diagnostics
+        # were removed from the hot path in v11.2; diagnose_leaf/validate_v11
+        # provide them on demand.
+        block_audit_rows = _target_audit_rows(
+            uid_col, "period_type", "ds",
+            "driver_factor_y", "driver_factor_value",
+            "driver_level_factor_y", "driver_level_factor_value",
+            "sku_seasonal_multiplier_y", "sku_seasonal_multiplier_value",
+            "parent_driver_mode_y", "parent_driver_mode_value",
+            "leaf_model_family_y", "leaf_model_family_value",
+            "v12_candidate_yhat_raw", "v12_candidate_valuehat_raw",
+            "v12_sku_forecast_y", "v12_sku_forecast_value",
+            "v12_store_share_y", "v12_store_share_value",
+            "ses_level_y", "ses_level_value", "yhat_raw", "valuehat_raw",
+        )
+        audit_blocks = (
+            block_audit_rows.group_by([uid_col, "period_type"])
             .agg(
                 pl.col("ds").min().alias("_block_start"),
                 pl.col("ds").max().alias("_block_end"),
-                pl.col("y").mean().alias("_actual_mean_y"),
-                pl.col("value").mean().alias("_actual_mean_v"),
-                pl.col("driver_factor_y").min().alias("_min_factor_y"),
+                pl.col("ds").n_unique().alias("_n_dates"),
                 pl.col("driver_factor_y").mean().alias("_mean_factor_y"),
-                pl.col("driver_factor_y").max().alias("_max_factor_y"),
-                pl.col("driver_factor_value").min().alias("_min_factor_v"),
                 pl.col("driver_factor_value").mean().alias("_mean_factor_v"),
-                pl.col("driver_factor_value").max().alias("_max_factor_v"),
+                pl.col("driver_level_factor_y").first().alias("_expected_factor_y"),
+                pl.col("driver_level_factor_value").first().alias("_expected_factor_v"),
+                pl.col("sku_seasonal_multiplier_y").first().fill_null(1.0).alias("_seasonal_multiplier_y"),
+                pl.col("sku_seasonal_multiplier_value").first().fill_null(1.0).alias("_seasonal_multiplier_v"),
+                pl.col("sku_seasonal_multiplier_y").n_unique().alias("_n_seasonal_multiplier_y"),
+                pl.col("sku_seasonal_multiplier_value").n_unique().alias("_n_seasonal_multiplier_v"),
+                pl.col("parent_driver_mode_y").first().alias("_driver_mode_y"),
+                pl.col("parent_driver_mode_value").first().alias("_driver_mode_v"),
+                pl.col("leaf_model_family_y").first().fill_null("v11_ses_rls").alias("_family_y"),
+                pl.col("leaf_model_family_value").first().fill_null("v11_ses_rls").alias("_family_v"),
+                pl.col("v12_candidate_yhat_raw").mean().alias("_v12_mean_yhat"),
+                pl.col("v12_candidate_valuehat_raw").mean().alias("_v12_mean_vhat"),
+                pl.col("v12_sku_forecast_y").mean().alias("_v12_mean_sku_y"),
+                pl.col("v12_sku_forecast_value").mean().alias("_v12_mean_sku_v"),
+                pl.col("v12_store_share_y").mean().alias("_v12_mean_share_y"),
+                pl.col("v12_store_share_value").mean().alias("_v12_mean_share_v"),
                 pl.col("ses_level_y").first().alias("_ses_y"),
                 pl.col("ses_level_value").first().alias("_ses_v"),
-                pl.col("yhat_raw").min().alias("_min_yhat_raw"),
                 pl.col("yhat_raw").mean().alias("_mean_yhat_raw"),
-                pl.col("yhat_raw").max().alias("_max_yhat_raw"),
-                pl.col("valuehat_raw").min().alias("_min_vhat_raw"),
                 pl.col("valuehat_raw").mean().alias("_mean_vhat_raw"),
-                pl.col("valuehat_raw").max().alias("_max_vhat_raw"),
-                pl.col("yhat").min().alias("_min_yhat"),
-                pl.col("yhat").mean().alias("_mean_yhat"),
-                pl.col("yhat").max().alias("_max_yhat"),
-                pl.col("valuehat").min().alias("_min_vhat"),
-                pl.col("valuehat").mean().alias("_mean_vhat"),
-                pl.col("valuehat").max().alias("_max_vhat"),
-                pl.col("recent28_mean_y").first().alias("_recent_y"),
-                pl.col("recent28_mean_value").first().alias("_recent_v"),
-                pl.col("parent_model_y").first().alias("_parent_y"),
-                pl.col("parent_model_value").first().alias("_parent_v"),
-                pl.col("ses_alpha_y").first().alias("_alpha_y"),
-                pl.col("ses_alpha_value").first().alias("_alpha_v"),
             )
             .with_columns(
-                pl.when(pl.col("_recent_y") > 1e-12)
-                .then(pl.col("_ses_y") / pl.col("_recent_y"))
-                .otherwise(None)
-                .alias("_ses_recent_ratio_y"),
-                pl.when(pl.col("_recent_v") > 1e-12)
-                .then(pl.col("_ses_v") / pl.col("_recent_v"))
-                .otherwise(None)
-                .alias("_ses_recent_ratio_v"),
+                (pl.col("_expected_factor_y") * pl.col("_seasonal_multiplier_y")).alias("_expected_forecast_factor_y"),
+                (pl.col("_expected_factor_v") * pl.col("_seasonal_multiplier_v")).alias("_expected_forecast_factor_v"),
                 pl.when(pl.col("_ses_y") > 1e-12)
                 .then(pl.col("_mean_yhat_raw") / pl.col("_ses_y"))
                 .otherwise(None)
@@ -3147,170 +3396,277 @@ class RLSForecastRunner:
                 .alias("_forecast_ses_ratio_v"),
             )
         )
-        factor_tol = float(
-            getattr(settings, "LEAF_DRIVER_MEAN_TOLERANCE", 1e-6)
-        )
+        metric_horizon_days = int(getattr(settings, "METRIC_HORIZON_DAYS", 28))
+        bad_horizon_days = audit_blocks.filter(pl.col("_n_dates") != metric_horizon_days)
+        if bad_horizon_days.height:
+            examples = bad_horizon_days.head(5).select(
+                uid_col, "period_type", "_block_start", "_block_end", "_n_dates"
+            ).to_dicts()
+            raise RuntimeError(
+                "Leaf horizon invariant violated: OOS/forecast_only must contain "
+                f"exactly {metric_horizon_days} dates. Examples={examples}"
+            )
+
+        factor_tol = float(getattr(settings, "LEAF_DRIVER_MEAN_TOLERANCE", 1e-6))
         bad_factor = audit_blocks.filter(
-            ((pl.col("_mean_factor_y") - 1.0).abs() > factor_tol)
-            | ((pl.col("_mean_factor_v") - 1.0).abs() > factor_tol)
+            ((pl.col("_mean_factor_y") - pl.col("_expected_factor_y")).abs() > factor_tol)
+            | ((pl.col("_mean_factor_v") - pl.col("_expected_factor_v")).abs() > factor_tol)
         )
         if bad_factor.height:
             examples = bad_factor.head(5).select(
-                uid_col, "period_type", "_mean_factor_y", "_mean_factor_v"
+                uid_col, "period_type", "_driver_mode_y", "_mean_factor_y",
+                "_expected_factor_y", "_driver_mode_v", "_mean_factor_v",
+                "_expected_factor_v",
             ).to_dicts()
             raise RuntimeError(
-                "Leaf driver invariant violated: block mean factor must be 1. "
-                f"Examples={examples}"
+                "Leaf driver invariant violated: horizon mean factor must match "
+                f"the selected causal parent level factor. Examples={examples}"
             )
 
-        # Second invariant: after applying a mean-one driver, the mean forecast
-        # must remain at the SES level (apart from rounding). This detects any
-        # later transformation/overwrite of yhat or valuehat.
-        level_mean_tol = float(
-            getattr(settings, "LEAF_FORECAST_LEVEL_MEAN_TOLERANCE", 0.02)
+        bad_seasonal_multiplier = audit_blocks.filter(
+            (pl.col("_n_seasonal_multiplier_y") != 1)
+            | (pl.col("_n_seasonal_multiplier_v") != 1)
+            | ~pl.col("_seasonal_multiplier_y").is_finite()
+            | ~pl.col("_seasonal_multiplier_v").is_finite()
+            | (pl.col("_seasonal_multiplier_y") <= 0.0)
+            | (pl.col("_seasonal_multiplier_v") <= 0.0)
         )
-        bad_forecast_level = audit_blocks.filter(
+        if bad_seasonal_multiplier.height:
+            examples = bad_seasonal_multiplier.head(5).select(
+                uid_col, "period_type", "_seasonal_multiplier_y",
+                "_seasonal_multiplier_v", "_n_seasonal_multiplier_y",
+                "_n_seasonal_multiplier_v",
+            ).to_dicts()
+            raise RuntimeError(
+                "Leaf seasonal invariant violated: SKU seasonal multiplier must "
+                f"be one finite positive constant per horizon. Examples={examples}"
+            )
+
+        # Multi-cadence-safe v11 identity.  With update cadences shorter than
+        # the fixed 28-day OOS horizon, the effective SES state (and therefore
+        # the forecast level) can legitimately vary inside that horizon.  The
+        # old 28d-only audit compared a 28-day mean forecast against the first
+        # SES state and produced false failures for 1d/7d/14d scenarios.
+        # Validate the actual production equation row by row instead:
+        #   yhat_raw = ses_level * driver_factor * seasonal_multiplier
+        # This is exact for every supported update cadence and still detects
+        # real corruption of the v11 leaf forecast path.
+        level_identity_tol = float(
+            getattr(settings, "LEAF_FORECAST_LEVEL_IDENTITY_TOLERANCE", 1e-7)
+        )
+        # v12.9.10 may apply a productive sparse Value uplift *after* the
+        # selected v11/v12 baseline forecast has been built.  Therefore the
+        # legacy family identity must audit the pre-rescue baseline, while a
+        # separate invariant below audits the sparse write-back itself.
+        value_identity_col = (
+            "v12910_valuehat_raw_before_sparse"
+            if "v12910_valuehat_raw_before_sparse" in rows.columns
+            else "valuehat_raw"
+        )
+        v11_identity_rows = _target_audit_rows(
+            uid_col, "period_type",
+            "leaf_model_family_y", "leaf_model_family_value",
+            "ses_level_y", "ses_level_value",
+            "driver_factor_y", "driver_factor_value",
+            "sku_seasonal_multiplier_y", "sku_seasonal_multiplier_value",
+            "yhat_raw", "valuehat_raw", "v12910_valuehat_raw_before_sparse",
+        ).filter(
+            (pl.col("leaf_model_family_y") == "v11_ses_rls")
+            | (pl.col("leaf_model_family_value") == "v11_ses_rls")
+        ).with_columns(
             (
-                pl.col("_forecast_ses_ratio_y").is_not_null()
+                pl.col("ses_level_y")
+                * pl.col("driver_factor_y")
+                * pl.col("sku_seasonal_multiplier_y").fill_null(1.0)
+            ).clip(lower_bound=0.0).alias("_expected_v11_yhat_raw"),
+            (
+                pl.col("ses_level_value")
+                * pl.col("driver_factor_value")
+                * pl.col("sku_seasonal_multiplier_value").fill_null(1.0)
+            ).clip(lower_bound=0.0).alias("_expected_v11_valuehat_raw"),
+        )
+        bad_forecast_level = v11_identity_rows.filter(
+            (
+                (pl.col("leaf_model_family_y") == "v11_ses_rls")
                 & (
-                    (pl.col("_forecast_ses_ratio_y") - 1.0).abs()
-                    > level_mean_tol
+                    (pl.col("yhat_raw") - pl.col("_expected_v11_yhat_raw")).abs()
+                    > level_identity_tol
+                    * pl.max_horizontal(pl.col("_expected_v11_yhat_raw").abs(), pl.lit(1.0))
                 )
-                & (pl.col("_ses_y") > 1.0)
             )
             | (
-                pl.col("_forecast_ses_ratio_v").is_not_null()
+                (pl.col("leaf_model_family_value") == "v11_ses_rls")
                 & (
-                    (pl.col("_forecast_ses_ratio_v") - 1.0).abs()
-                    > level_mean_tol
+                    (pl.col(value_identity_col) - pl.col("_expected_v11_valuehat_raw")).abs()
+                    > level_identity_tol
+                    * pl.max_horizontal(pl.col("_expected_v11_valuehat_raw").abs(), pl.lit(1.0))
                 )
-                & (pl.col("_ses_v") > 1.0)
             )
         )
         if bad_forecast_level.height:
             examples = bad_forecast_level.head(5).select(
-                uid_col,
-                "period_type",
-                "_ses_y",
-                "_mean_yhat_raw",
-                "_mean_yhat",
-                "_forecast_ses_ratio_y",
-                "_ses_v",
-                "_mean_vhat_raw",
-                "_mean_vhat",
-                "_forecast_ses_ratio_v",
+                uid_col, "period_type", "leaf_model_family_y",
+                "ses_level_y", "driver_factor_y", "sku_seasonal_multiplier_y",
+                "yhat_raw", "_expected_v11_yhat_raw",
+                "leaf_model_family_value", "ses_level_value",
+                "driver_factor_value", "sku_seasonal_multiplier_value",
+                value_identity_col, "valuehat_raw", "_expected_v11_valuehat_raw",
             ).to_dicts()
             raise RuntimeError(
-                "Leaf level invariant violated: mean forecast must match SES "
-                f"level after mean-one drivers. Examples={examples}"
+                "Leaf level invariant violated: v11 raw forecast must equal "
+                "effective SES level × driver factor × selected SKU seasonal "
+                f"multiplier row by row. Examples={examples}"
             )
 
-        level_warn_ratio = float(
-            getattr(settings, "LEAF_LEVEL_REFERENCE_WARN_RATIO", 4.0)
-        )
-        suspicious_level = audit_blocks.filter(
-            (
-                (pl.col("_recent_y") > 0)
-                & (
-                    (pl.col("_ses_y") / pl.col("_recent_y"))
-                    > level_warn_ratio
+        del bad_forecast_level, v11_identity_rows
+
+        # v12.9.10 sparse-rescue identity.  The final Value raw forecast is
+        # allowed to differ from its v11/v12 family baseline only through the
+        # explicitly gated causal multiplier.  This keeps both invariants
+        # simultaneously true: family baseline identity and final write-back.
+        sparse10_required = {
+            "v12910_valuehat_raw_before_sparse",
+            "v12910_value_sparse_promoted",
+            "v12910_value_sparse_applied",
+            "v1299_value_sparse_candidate",
+            "v1299_value_sparse_factor",
+        }
+        if sparse10_required.issubset(set(rows.columns)):
+            expected_sparse_apply = (
+                pl.col("v12910_value_sparse_promoted").fill_null(False)
+                & pl.col("v1299_value_sparse_candidate").fill_null(False)
+                & (pl.col("v1299_value_sparse_factor").fill_null(1.0) > 1.0)
+            )
+            expected_sparse_raw = pl.when(expected_sparse_apply).then(
+                pl.col("v12910_valuehat_raw_before_sparse")
+                * pl.col("v1299_value_sparse_factor").fill_null(1.0)
+            ).otherwise(pl.col("v12910_valuehat_raw_before_sparse"))
+            sparse_audit_rows = _target_audit_rows(
+                uid_col, "period_type", "leaf_model_family_value",
+                "v12910_value_sparse_promoted", "v1299_value_sparse_candidate",
+                "v1299_value_sparse_factor", "v12910_value_sparse_applied",
+                "v12910_valuehat_raw_before_sparse", "valuehat_raw",
+            )
+            bad_sparse_writeback = sparse_audit_rows.filter(
+                (pl.col("v12910_value_sparse_applied").fill_null(False) != expected_sparse_apply)
+                | (
+                    (pl.col("valuehat_raw") - expected_sparse_raw).abs()
+                    > level_identity_tol
+                    * pl.max_horizontal(expected_sparse_raw.abs(), pl.lit(1.0))
                 )
             )
-            | (
-                (pl.col("_recent_v") > 0)
-                & (
-                    (pl.col("_ses_v") / pl.col("_recent_v"))
-                    > level_warn_ratio
+            if bad_sparse_writeback.height:
+                examples = bad_sparse_writeback.head(5).select(
+                    uid_col, "period_type", "leaf_model_family_value",
+                    "v12910_value_sparse_promoted", "v1299_value_sparse_candidate",
+                    "v1299_value_sparse_factor", "v12910_value_sparse_applied",
+                    "v12910_valuehat_raw_before_sparse", "valuehat_raw",
+                ).to_dicts()
+                raise RuntimeError(
+                    "v12.9.10 sparse Value invariant violated: final raw forecast "
+                    f"must equal pre-rescue baseline × gated factor. Examples={examples}"
+                )
+            del bad_sparse_writeback, sparse_audit_rows
+
+        # Historical audit wording: parent level factor × selected SKU seasonal multiplier.
+        # In multi-cadence mode the production check above is deliberately row-wise.
+
+        # v12 candidate identity is independent from the v11 SES identity.
+        # For every target row candidate = SKU total × normalized store share;
+        # if v12 wins the causal A/B, the final raw forecast must equal it.
+        v12_rows = _target_audit_rows(
+            uid_col, "period_type", "ds",
+            "v12_candidate_yhat_raw", "v12_candidate_valuehat_raw",
+            "v12_sku_forecast_y", "v12_sku_forecast_value",
+            "v12_store_share_y", "v12_store_share_value",
+            "v12_selected_y", "v12_selected_value",
+            "yhat_raw", "valuehat_raw", "v12910_valuehat_raw_before_sparse",
+            "v12_occurrence_gate_open_y", "v12_occurrence_gate_open_value",
+            "v12_occurrence_gate_open_joint",
+        ).filter(
+            pl.col("v12_candidate_yhat_raw").is_not_null()
+            | pl.col("v12_candidate_valuehat_raw").is_not_null()
+        )
+        if v12_rows.height:
+            v12_tol = 1e-7
+            bad_v12_identity = v12_rows.filter(
+                (
+                    (pl.col("v12_candidate_yhat_raw") - pl.col("v12_sku_forecast_y") * pl.col("v12_store_share_y")).abs()
+                    > v12_tol * pl.max_horizontal(pl.col("v12_candidate_yhat_raw").abs(), pl.lit(1.0))
+                )
+                | (
+                    (pl.col("v12_candidate_valuehat_raw") - pl.col("v12_sku_forecast_value") * pl.col("v12_store_share_value")).abs()
+                    > v12_tol * pl.max_horizontal(pl.col("v12_candidate_valuehat_raw").abs(), pl.lit(1.0))
+                )
+                | (
+                    pl.col("v12_selected_y")
+                    & ((pl.col("yhat_raw") - pl.col("v12_candidate_yhat_raw")).abs()
+                       > v12_tol * pl.max_horizontal(pl.col("yhat_raw").abs(), pl.lit(1.0)))
+                )
+                | (
+                    pl.col("v12_selected_value")
+                    & ((pl.col(value_identity_col) - pl.col("v12_candidate_valuehat_raw")).abs()
+                       > v12_tol * pl.max_horizontal(pl.col(value_identity_col).abs(), pl.lit(1.0)))
                 )
             )
-        )
-        diagnostic_ratio = float(
-            getattr(settings, "LEAF_DIAGNOSTIC_LEVEL_RATIO", 3.0)
-        )
-        diagnostic_forecast_ratio = float(
-            getattr(settings, "LEAF_DIAGNOSTIC_FORECAST_RATIO", 3.0)
-        )
-        diagnostic_top_n = int(
-            getattr(settings, "LEAF_DIAGNOSTIC_TOP_N", 10)
-        )
-        diagnostic_blocks = audit_blocks.filter(
-            (
-                pl.col("_ses_recent_ratio_y").is_not_null()
-                & (pl.col("_ses_recent_ratio_y") > diagnostic_ratio)
+            if bad_v12_identity.height:
+                raise RuntimeError(
+                    "v12 occurrence/share invariant violated; "
+                    f"examples={bad_v12_identity.head(5).select(uid_col, 'period_type', 'v12_selected_y', 'v12_selected_value').to_dicts()}"
+                )
+
+            # v12.3 production invariants: one occurrence event and, by
+            # default, one structural family decision for quantity + value.
+            bad_shared_gate = v12_rows.filter(
+                (pl.col("v12_occurrence_gate_open_y").fill_null(False)
+                 != pl.col("v12_occurrence_gate_open_value").fill_null(False))
+                | (pl.col("v12_occurrence_gate_open_y").fill_null(False)
+                   != pl.col("v12_occurrence_gate_open_joint").fill_null(False))
             )
-            | (
-                pl.col("_ses_recent_ratio_v").is_not_null()
-                & (pl.col("_ses_recent_ratio_v") > diagnostic_ratio)
-            )
-            | (
-                (pl.col("_recent_y") > 1e-12)
-                & (
-                    (pl.col("_mean_yhat") / pl.col("_recent_y"))
-                    > diagnostic_forecast_ratio
+            if bad_shared_gate.height:
+                raise RuntimeError(
+                    "v12 shared occurrence gate invariant violated; "
+                    f"examples={bad_shared_gate.head(5).select(uid_col, 'period_type').to_dicts()}"
+                )
+            if bool(getattr(settings, "V12_REQUIRE_JOINT_TARGET_WIN", True)):
+                bad_joint_selection = v12_rows.filter(
+                    pl.col("v12_selected_y").fill_null(False)
+                    != pl.col("v12_selected_value").fill_null(False)
+                )
+                if bad_joint_selection.height:
+                    raise RuntimeError(
+                        "v12 joint target selection invariant violated; "
+                        f"examples={bad_joint_selection.head(5).select(uid_col, 'period_type', 'v12_selected_y', 'v12_selected_value').to_dicts()}"
+                    )
+
+            share_sums = (
+                v12_rows.with_columns(
+                    pl.col(uid_col).str.extract(r"\|\|S:(.+)$", 1).alias("_v12_sku_audit")
+                )
+                .group_by(["_v12_sku_audit", "ds", "period_type"])
+                .agg(
+                    pl.col("v12_store_share_y").sum().alias("_sum_share_y"),
+                    pl.col("v12_store_share_value").sum().alias("_sum_share_v"),
                 )
             )
-            | (
-                (pl.col("_recent_v") > 1e-12)
-                & (
-                    (pl.col("_mean_vhat") / pl.col("_recent_v"))
-                    > diagnostic_forecast_ratio
+            bad_shares = share_sums.filter(
+                ((pl.col("_sum_share_y") - 1.0).abs() > 1e-6)
+                | ((pl.col("_sum_share_v") - 1.0).abs() > 1e-6)
+            )
+            if bad_shares.height:
+                raise RuntimeError(
+                    "v12 store-share invariant violated: shares must sum to 1 "
+                    f"per SKU/date; examples={bad_shares.head(5).to_dicts()}"
                 )
-            )
-        )
-        if suspicious_level.height or diagnostic_blocks.height:
-            diag = (
-                diagnostic_blocks
-                if diagnostic_blocks.height
-                else suspicious_level
-            )
-            logger.warning(
-                "DIAGNÓSTICO LEAF Sección %s: %d bloques OOS/forecast-only "
-                "con salto de nivel. Cada fila muestra actual_mean, recent28, "
-                "SES, drivers[min/mean/max] y forecast[min/mean/max]. %s",
-                section_id,
-                diag.height,
-                diag.head(diagnostic_top_n).select(
-                    uid_col,
-                    "period_type",
-                    "_block_start",
-                    "_block_end",
-                    "_actual_mean_y",
-                    "_recent_y",
-                    "_ses_y",
-                    "_ses_recent_ratio_y",
-                    "_min_factor_y",
-                    "_mean_factor_y",
-                    "_max_factor_y",
-                    "_min_yhat_raw",
-                    "_mean_yhat_raw",
-                    "_max_yhat_raw",
-                    "_min_yhat",
-                    "_mean_yhat",
-                    "_max_yhat",
-                    "_actual_mean_v",
-                    "_recent_v",
-                    "_ses_v",
-                    "_ses_recent_ratio_v",
-                    "_min_factor_v",
-                    "_mean_factor_v",
-                    "_max_factor_v",
-                    "_min_vhat_raw",
-                    "_mean_vhat_raw",
-                    "_max_vhat_raw",
-                    "_min_vhat",
-                    "_mean_vhat",
-                    "_max_vhat",
-                    "_parent_y",
-                    "_parent_v",
-                    "_alpha_y",
-                    "_alpha_v",
-                ).to_dicts(),
-            )
+
+        del v12_rows, block_audit_rows, audit_blocks
+        gc.collect()
 
         logger.info(
-            "⏱ Sección %s: leaf 2-etapas SES puro (%d alphas) + padres (2): %.1fs",
+            "⏱ Sección %s: leaf 2-etapas SES puro (%d alphas) + parent-modes (%d): %.1fs",
             section_id,
             len(alpha_candidates),
+            parent_params.height,
             time.perf_counter() - t_candidates,
         )
 
@@ -3328,6 +3684,10 @@ class RLSForecastRunner:
                 pl.lit(default_alpha).alias("ses_alpha_value"),
                 pl.lit("warmup").alias("parent_model_y"),
                 pl.lit("warmup").alias("parent_model_value"),
+                pl.lit("warmup").alias("parent_driver_mode_y"),
+                pl.lit("warmup").alias("parent_driver_mode_value"),
+                pl.lit(1.0).alias("driver_level_factor_y"),
+                pl.lit(1.0).alias("driver_level_factor_value"),
                 pl.col("_level_y").alias("ses_level_y"),
                 pl.col("_level_v").alias("ses_level_value"),
                 pl.lit(0.0).alias("driver_effect"),
@@ -3340,18 +3700,6 @@ class RLSForecastRunner:
             )
         )
 
-        drop_tmp = [
-            c for c in (
-                "_block", "_store_uid", "_store_ey", "_store_ev", "_sec_ey", "_sec_ev",
-                "_candidate_y", "_candidate_v", "_level_y", "_level_v",
-                "_parent_y", "_parent_v", "_alpha_y", "_alpha_v", "_ey", "_ev",
-                "_recent28_mean_y", "_recent28_mean_v",
-                "_yhat_raw", "_valuehat_raw",
-                "_reference_y", "_reference_v", "_ses_guard_y", "_ses_guard_v",
-                "_stable_pool_y", "_stable_pool_v",
-            ) if c in rows.columns
-        ]
-        rows = rows.drop(drop_tmp)
         warm = warm.drop(
             [c for c in ("_level_y", "_level_v", "_leaf_start", "_leaf_warmup_end")
              if c in warm.columns]
@@ -3362,8 +3710,8 @@ class RLSForecastRunner:
             rows = rows.with_columns([pl.lit(v).alias(k) for k, v in meta.items()])
 
         logger.info(
-            "Sección %s: leaf SES original-scale level + normalized RLS driver | %d hojas | alphas=%s | "
-            "candidato tienda/sección por wMAPE acumulado previo; drivers obligatorios",
+            "Sección %s: leaf SES + RLS parent | %d hojas | alphas=%s | "
+            "candidatos tienda/sección × modo(s) habilitados por wMAPE previo",
             section_id, ids.height, alpha_candidates,
         )
         logger.info(
@@ -3371,348 +3719,7 @@ class RLSForecastRunner:
             section_id,
             time.perf_counter() - t_leaf_total,
         )
-        return pl.concat([warm, rows], how="diagonal_relaxed").sort([uid_col, "ds"])
-
-    def derive_sku_store_forecasts(
-        self,
-        panel: pl.DataFrame,
-        section_id: str,
-        section_coefs: dict,
-        store_coefs: dict,
-        alpha: float | None = None,
-    ) -> pl.DataFrame:
-        """
-        Derivación SKU+tienda **tienda a tienda** (bajo uso de memoria).
-
-        El modelo RLS se ajusta sobre log1p(y) (ver `_fit_models`), por lo que
-        la reconstrucción del pronóstico ocurre EN LOG-SPACE:
-
-          - Todos los períodos (in_sample / out_sample / forecast_only):
-              yhat = expm1(intercept + efecto + SES_causal(log-residuo))
-
-        donde `residuo_log = log1p(y) − (intercept + efecto)`, e `intercept` +
-        `efecto` provienen del modelo (sección o tienda) elegido por
-        `_select_model_wmape`. `_apply_ses` calcula el SES **causal** (shift 1)
-        sobre TODO el período con actuals (in_sample + out_sample) como una
-        única serie continua: s(t) solo usa residuales hasta t-1. Así el
-        pronóstico queda alineado en fecha con y(t) (sin adelanto de 1 día).
-
-        `_yhat_rls`/`_valuehat_rls` se conservan solo como entrada de
-        `_select_model_wmape` (comparación sección vs. tienda), no como
-        salida final.
-
-        Nota histórica: antes se restaba `efecto` (log-space) de `y`
-        (lineal), produciendo un residuo incoherente y pronósticos 0/negativos
-        en OOS/forecast_only (causa del ranking SKU+tienda vacío). ya
-        corregido junto con el punto anterior.
-
-        No materializa el panel completo con columnas intermedias duplicadas.
-        """
-        import gc
-
-        if panel.height == 0:
-            return pl.DataFrame()
-
-        coef_section = section_coefs.get(section_id)
-        if coef_section is None:
-            return pl.DataFrame()
-
-        if alpha is None:
-            alpha = float(getattr(settings, "SES_ALPHA", 0.3))
-
-        driver_cols = self._driver_cols
-        driver_cols_price = self._driver_cols_price
-        missing = [c for c in driver_cols + driver_cols_price if c not in panel.columns]
-        if missing:
-            logger.warning("derive_sku_store_forecasts: faltan drivers %s", missing[:8])
-            return pl.DataFrame()
-
-        idx_y = [i for i, c in enumerate(driver_cols) if c != "intercept"]
-        cols_y = [driver_cols[i] for i in idx_y]
-        idx_p = [i for i, c in enumerate(driver_cols_price) if c != "intercept"]
-        cols_p = [driver_cols_price[i] for i in idx_p]
-        # Índice del término constante (columna "intercept") dentro del vector
-        # de coeficientes. El modelo RLS se ajusta sobre log1p(y), así que
-        # log(y) = intercept + efecto(drivers). El intercept depende de dónde
-        # aparezca "intercept" en driver_cols (no se asume posición 0).
-        intercept_idx_y = driver_cols.index("intercept")
-        intercept_idx_p = driver_cols_price.index("intercept")
-
-        # Solo columnas necesarias (reduce pico de RAM)
-        meta_keep = [
-            c
-            for c in (
-                "unique_id",
-                "ds",
-                "y",
-                "value",
-                "period_type",
-                "sku_desc",
-                "store_name",
-                "seccion",
-                "train_start",
-                "train_end",
-                "test_start",
-                "test_end",
-                "forecast_start",
-                "forecast_end",
-            )
-            if c in panel.columns
-        ]
-        keep_cols = list(dict.fromkeys(meta_keep + driver_cols + driver_cols_price))
-        panel = panel.select(keep_cols).with_columns(
-            pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid")
-        )
-
-        coef_y_sec = np.ascontiguousarray(coef_section[0], dtype=np.float32).ravel()
-        coef_p_sec = np.ascontiguousarray(coef_section[1], dtype=np.float32).ravel()
-
-        coef_y_sec_fx = coef_y_sec[idx_y]
-        coef_p_sec_fx = coef_p_sec[idx_p]
-
-        store_uids = panel.get_column("_store_uid").unique().to_list()
-        frames: list[pl.DataFrame] = []
-        has_period = "period_type" in panel.columns
-        # ~150k × 76 × float32 ≈ 45 MiB por matriz; configurable
-        max_rows = int(getattr(settings, "DERIVE_MAX_ROWS_PER_CHUNK", 150_000))
-
-        def _process_sub(sub: pl.DataFrame, coef_store) -> pl.DataFrame | None:
-            """Procesa un bloque (tienda completa o lote de SKUs)."""
-            if sub.height == 0:
-                return None
-
-            X_y = np.ascontiguousarray(
-                sub.select(driver_cols).to_numpy(), dtype=np.float32
-            )
-            X_p = np.ascontiguousarray(
-                sub.select(driver_cols_price).to_numpy(), dtype=np.float32
-            )
-            y = sub["y"].to_numpy().astype(np.float64, copy=False)
-            value = (
-                sub["value"].to_numpy().astype(np.float64, copy=False)
-                if "value" in sub.columns
-                else np.zeros(len(y), dtype=np.float64)
-            )
-            uids = sub["unique_id"].to_numpy()
-            if has_period:
-                periods = sub["period_type"].to_numpy()
-                is_train = periods == "in_sample"
-            else:
-                is_train = np.ones(len(y), dtype=bool)
-
-            coef_y_sto = np.ascontiguousarray(coef_store[0], dtype=np.float32).ravel()
-            coef_p_sto = np.ascontiguousarray(coef_store[1], dtype=np.float32).ravel()
-
-            yhat_sec = np.round(np.expm1(X_y @ coef_y_sec)).ravel()
-            yhat_sto = np.round(np.expm1(X_y @ coef_y_sto)).ravel()
-            valuehat_sec = np.round(np.expm1(X_p @ coef_p_sec), 2).ravel()
-            valuehat_sto = np.round(np.expm1(X_p @ coef_p_sto), 2).ravel()
-
-            selection = self._select_model_wmape(y, yhat_sec, yhat_sto, uids, is_train)
-            use_sto = np.fromiter(
-                (selection.get(str(u), "seccion") == "tienda" for u in uids),
-                dtype=bool,
-                count=len(uids),
-            )
-            yhat_rls = np.where(use_sto, yhat_sto, yhat_sec)
-            valuehat_rls = np.where(use_sto, valuehat_sto, valuehat_sec)
-
-            effect_y = np.where(
-                use_sto,
-                X_y[:, idx_y] @ coef_y_sto[idx_y],
-                X_y[:, idx_y] @ coef_y_sec_fx,
-            )
-            effect_v = np.where(
-                use_sto,
-                X_p[:, idx_p] @ coef_p_sto[idx_p],
-                X_p[:, idx_p] @ coef_p_sec_fx,
-            )
-            intercept_y = np.where(
-                use_sto,
-                coef_y_sto[intercept_idx_y],
-                coef_y_sec[intercept_idx_y],
-            )
-            intercept_v = np.where(
-                use_sto,
-                coef_p_sto[intercept_idx_p],
-                coef_p_sec[intercept_idx_p],
-            )
-            del X_y, X_p
-
-            with np.errstate(divide="ignore", invalid="ignore"):
-                log_y = np.log1p(np.clip(y, 0.0, None))
-                log_v = np.log1p(np.clip(value, 0.0, None))
-            log_resid_y = np.where(
-                np.isfinite(log_y), log_y - (intercept_y + effect_y), np.nan
-            )
-            log_resid_v = np.where(
-                np.isfinite(log_v), log_v - (intercept_v + effect_v), np.nan
-            )
-            modelo = np.where(use_sto, "tienda", "seccion")
-
-            block = sub.select([c for c in meta_keep if c in sub.columns]).with_columns(
-                pl.Series("yhat_seccion", yhat_sec),
-                pl.Series("valuehat_seccion", valuehat_sec),
-                pl.Series("yhat_tienda", yhat_sto),
-                pl.Series("valuehat_tienda", valuehat_sto),
-                pl.Series("modelo_seleccionado", modelo),
-                pl.Series("driver_effect", effect_y),
-                pl.Series("driver_effect_value", effect_v),
-                pl.Series("_intercept_y", intercept_y),
-                pl.Series("_intercept_v", intercept_v),
-                pl.Series("_y_neto", log_resid_y),
-                pl.Series("_v_neto", log_resid_v),
-                pl.Series("_yhat_rls", yhat_rls),
-                pl.Series("_valuehat_rls", valuehat_rls),
-            )
-            del yhat_sec, yhat_sto, valuehat_sec, valuehat_sto
-            del yhat_rls, valuehat_rls, effect_y, effect_v, intercept_y, intercept_v
-            del y, value, use_sto, log_y, log_v, log_resid_y, log_resid_v
-
-            block = self._apply_ses_tuned(
-                block,
-                "_y_neto",
-                "_y_neto_hat",
-                actual_col="y",
-                base_log_cols=("_intercept_y", "driver_effect"),
-                default_alpha=alpha,
-            )
-            block = self._apply_ses_tuned(
-                block,
-                "_v_neto",
-                "_v_neto_hat",
-                actual_col="value",
-                base_log_cols=("_intercept_v", "driver_effect_value"),
-                default_alpha=alpha,
-            )
-
-            if has_period:
-                block = block.with_columns(
-                    (
-                        (
-                            pl.col("_intercept_y")
-                            + pl.col("driver_effect")
-                            + pl.col("_y_neto_hat")
-                        ).exp()
-                        - 1
-                    )
-                    .clip(lower_bound=0.0)
-                    .round(0)
-                    .alias("yhat"),
-                    (
-                        (
-                            pl.col("_intercept_v")
-                            + pl.col("driver_effect_value")
-                            + pl.col("_v_neto_hat")
-                        ).exp()
-                        - 1
-                    )
-                    .clip(lower_bound=0.0)
-                    .round(2)
-                    .alias("valuehat"),
-                )
-            else:
-                block = block.with_columns(
-                    pl.col("_yhat_rls").alias("yhat"),
-                    pl.col("_valuehat_rls").alias("valuehat"),
-                )
-
-            drop_tmp = [
-                c
-                for c in (
-                    "_y_neto",
-                    "_v_neto",
-                    "_y_neto_hat",
-                    "_v_neto_hat",
-                    "_intercept_y",
-                    "_intercept_v",
-                    "_yhat_rls",
-                    "_valuehat_rls",
-                    "_store_uid",
-                )
-                if c in block.columns
-            ]
-            out_b = block.drop(drop_tmp)
-            out_b = self._apply_leaf_guardrail(out_b, section_id)
-            del block
-            return out_b
-
-        for si, store_uid in enumerate(store_uids):
-            coef_store = store_coefs.get(store_uid)
-            if coef_store is None:
-                continue
-
-            sub = panel.filter(pl.col("_store_uid") == store_uid)
-            if sub.height == 0:
-                continue
-
-            if sub.height <= max_rows:
-                batches = [sub]
-            else:
-                uid_list = sub.get_column("unique_id").unique().to_list()
-                n_uid = len(uid_list)
-                avg = max(1, sub.height // max(1, n_uid))
-                batch_uids = max(1, max_rows // avg)
-                batches = [
-                    sub.filter(pl.col("unique_id").is_in(uid_list[i : i + batch_uids]))
-                    for i in range(0, n_uid, batch_uids)
-                ]
-                logger.info(
-                    "  tienda %s: %d filas / %d SKU → %d lotes (≤%d filas)",
-                    store_uid,
-                    sub.height,
-                    n_uid,
-                    len(batches),
-                    max_rows,
-                )
-
-            for bi, chunk in enumerate(batches):
-                out_b = None
-                try:
-                    out_b = _process_sub(chunk, coef_store)
-                except Exception as e:
-                    msg = str(e)
-                    is_mem = isinstance(e, MemoryError) or (
-                        "Unable to allocate" in msg
-                        or "ArrayMemoryError" in type(e).__name__
-                    )
-                    if not is_mem:
-                        raise
-                    logger.warning(
-                        "MemoryError %s lote %d (%d filas); fallback SKU a SKU: %s",
-                        store_uid,
-                        bi,
-                        chunk.height,
-                        msg[:120],
-                    )
-                    for one_uid in chunk.get_column("unique_id").unique().to_list():
-                        one = chunk.filter(pl.col("unique_id") == one_uid)
-                        try:
-                            part = _process_sub(one, coef_store)
-                        except Exception as e2:
-                            logger.error("SKU %s omitido: %s", one_uid, e2)
-                            part = None
-                        if part is not None and part.height:
-                            frames.append(part)
-                        del one, part
-                        gc.collect()
-                if out_b is not None and out_b.height:
-                    frames.append(out_b)
-                del chunk, out_b
-                if (bi + 1) % 3 == 0:
-                    gc.collect()
-
-            del sub, batches
-            if (si + 1) % 2 == 0:
-                gc.collect()
-            if len(frames) >= 20:
-                frames = [pl.concat(frames, how="vertical")]
-                gc.collect()
-
-        if not frames:
-            return pl.DataFrame()
-
-        out = pl.concat(frames, how="vertical")
-        del frames
-        gc.collect()
+        out = pl.concat([warm, rows], how="diagonal_relaxed")
+        if bool(getattr(settings, "LEAF_SORT_OUTPUT", False)):
+            out = out.sort([uid_col, "ds"])
         return out
