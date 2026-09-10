@@ -1,3 +1,58 @@
+## 13.2.17 — contract lock + causal OOS recurrence
+
+- Revierte el fixed-origin global introducido en 13.2.16: OOS sigue siendo holdout para selección/tuning, pero un bloque OOS cerrado puede actualizar el estado SES/RLS para el siguiente origen de la misma cadencia, como exige el contrato expanding/walk-forward.
+- Conserva separación estricta de bloques en fronteras in-sample/OOS/forecast-only y el ancla robusta causal del primer origen OOS.
+- Restaura la envolvente SES OOS 0.75x–1.25x para permitir recurrencia acotada sin congelar el estado.
+- Añade `app.forecasting.contract_gate`, preflight rápido que bloquea cambios de arquitectura, parámetros productivos, semántica OOS, selección de SKU y formatter global antes de lanzar forecasts costosos.
+- Añade `test_v13_contract_lock.py` con invariantes productivos no negociables.
+- ARTIFACT_VERSION=30.
+
+# Changelog
+
+## 13.2.17 — OOS fixed-origin + dormancia 28d + ancla robusta
+
+- El OOS de 28 días pasa a ser un holdout de origen fijo: ningún bloque puede mezclar in-sample y OOS; los coeficientes RLS y la historia AR usados dentro de OOS quedan anclados al último día in-sample.
+- El SES leaf usa durante todo OOS el mismo snapshot de nivel al origen; los actuals OOS solo pueden alimentar el estado operativo posterior/forecast-only, nunca el propio holdout.
+- Dormancia causal desde 28 días observables sin venta, con factor epsilon `1e-12`, para impedir sobreforecast pre-reactivación en gaps que ya forman parte del gate oficial.
+- Al origen OOS se limita solo hacia arriba el nivel SES usando la mediana de las últimas 28 magnitudes positivas desestacionalizadas (mínimo 7 puntos; máximo 1.5x mediana), evitando que picos recientes dejen un baseline inflado.
+- Los bloques leaf/parent quedan alineados explícitamente a las fronteras in-sample/OOS/forecast-only.
+- No cambia la fórmula oficial de wMAPE/BIAS, los alphas/lambdas productivos, drivers ni parent policy.
+- `ARTIFACT_VERSION=29`.
+
+## 13.2.15 — dormancy causal + separación de gates de reactivación
+
+- Mantiene el SES+RLS productivo y la historia común al origen OOS; no cambia wMAPE/BIAS, alphas, lambdas, drivers ni parent policy.
+- Para hojas con >=84 días observables sin venta, aplica un factor de dormancia `1e-6` al forecast mientras no exista una reactivación positiva cerrada. El estado SES no se muta por ausencia de filas.
+- La primera venta positiva tras un gap largo reancla causalmente el SES y libera el factor de dormancia solo para el bloque siguiente; nunca altera el forecast ya emitido.
+- Reduce la envolvente del estado SES OOS desde 0.50x–1.50x a 0.75x–1.25x del estado común al origen para limitar drift dependiente de cadencia.
+- El gate cross-cadence excluye hojas/cadencias con reactivación long-gap OOS porque su diferencia de reacción 1d/7d/14d/28d es esperada por diseño; esas hojas quedan gobernadas por el gate específico de reactivación.
+- Mantiene todos los SKU+Tienda de Secciones 1 y 23 y el formatter global de tablas.
+- `ARTIFACT_VERSION=28`.
+
+## 13.2.14
+
+- Mantiene los gaps como trazabilidad diagnóstica: no vuelve a introducir decay productivo por ausencia de filas SKU/día.
+- Añade cap causal de forecast por escala media positiva cerrada: mínimo entre 2x máximo histórico y 4x media positiva; tras gap largo, 2x media positiva.
+- Añade una envolvente de estado SES durante OOS respecto del estado común al origen (0.50x–1.50x), evitando composición de drift dependiente de la cadencia.
+- Mantiene alpha, parent, lambda/dynamics congelados al origen OOS; OOS solo actualiza estado dentro de esa envolvente.
+- No modifica la fórmula oficial de wMAPE/BIAS, drivers productivos ni la arquitectura RLS+SES.
+- ARTIFACT_VERSION=27.
+
+## 13.2.13
+- Reverts productive observable-zero gap decay introduced in 13.2.11/13.2.12; gap lengths remain diagnostic only.
+- Long-gap reactivation causally re-anchors the stale SES state only after the first positive observation closes, affecting subsequent blocks only.
+- Cross-cadence release gate is scale-aware: a large raw ratio must also imply a material gap relative to the OOS actual median.
+- Spike gate evaluates OOS forecast maxima while retaining historical observed scale.
+- Artifact version 26. No alpha/lambda/driver/parent promotion.
+
+## 13.2.12 — gap staleness acotado + guard scale-aware temprano
+
+- Reemplaza el decay SES acumulativo de v13.2.11 por un ajuste de staleness calculado al origen del bloque desde el último positivo cerrado. El estado SES base no se multiplica repetidamente por ceros observables entre bloques.
+- El factor gap queda estrictamente en `(0, 1]`, con `LEAF_GAP_DECAY_MIN_FACTOR=0.25`, horizonte máximo de 56 días observables y alpha efectivo mínimo 0.025. Esto evita underflow a cero y diferencias explosivas 1d/7d/14d/28d.
+- El guard de magnitud leaf se activa desde el nivel robusto de warm-up, incluso antes de acumular 7 positivos cerrados, eliminando floors absolutos implícitos en series de escala muy pequeña.
+- El gate de reactivaciones largas bloquea específicamente la patología relevante: **sobreforecast** del nivel stale respecto a la primera venta positiva posterior al gap. Los saltos alcistas impredecibles permanecen diagnosticados pero no bloquean por sí solos la release.
+- `ARTIFACT_VERSION=25`. No cambia wMAPE oficial, arquitectura RLS+SES, drivers, lambdas, alphas productivos ni política de parent.
+
 ## 13.2.11 — SES gap-aware + historia canónica entre cadencias
 
 - Corrige series SKU+Tienda con largos periodos sin venta: una ausencia leaf cuenta como cero solo cuando la misma Sección+Tienda es observable ese día mediante ventas positivas de otros SKU elegibles. No se imputan ceros en días sin evidencia de operación/datos.

@@ -522,8 +522,16 @@ class RLSForecastRunner:
         bno = 1
         frozen_choice_y = None
         frozen_choice_v = None
-        for s in range(seed_n, n, block_days):
-            e = min(s + block_days, n); boundary = s - 1
+        s = seed_n
+        while s < n:
+            # v13.2.16: a block may never straddle in-sample/OOS. The OOS
+            # boundary is a true fixed forecast origin for every cadence.
+            current_period = source_period[s]
+            period_end = s + 1
+            while period_end < n and source_period[period_end] == current_period:
+                period_end += 1
+            e = min(s + block_days, period_end)
+            boundary = s - 1
             candidate_y = choose(cum_ae_y, cum_den_y)
             candidate_v = choose(cum_ae_v, cum_den_v)
             # v13.2.10: dynamics/lambda are snapshotted at the first OOS
@@ -539,6 +547,10 @@ class RLSForecastRunner:
             cand_y = {}; cand_v = {}
             for c in diagnostic_candidates:
                 mode, lam = c
+                # Contrato v13: el forecast de cada bloque usa exclusivamente
+                # el estado disponible en SU origen. Un bloque OOS cerrado puede
+                # avanzar el estado para el siguiente origen, pero nunca cambia
+                # lambda/dynamics seleccionados ni su propio forecast.
                 cand_y[c] = predict_block(Xy_base, paths_y[c][boundary], log_y, s, e, mode)
                 cand_v[c] = predict_block(Xv_base, paths_v[c][boundary], log_v, s, e, mode)
             yh[s:e] = np.round(cand_y[chosen_y], 0); vh[s:e] = np.round(cand_v[chosen_v], 2)
@@ -592,6 +604,7 @@ class RLSForecastRunner:
                     cum_ae_v[c] += float(np.abs(v[s:e][valid_v] - cand_v[c][valid_v]).sum())
                     cum_den_v[c] += float(np.abs(v[s:e][valid_v]).sum())
             bno += 1
+            s = e
 
         # ── Phase 2: exact same-family refit of existing driver groups ─────
         # This runs only on explicit optimization diagnostics.  It does NOT

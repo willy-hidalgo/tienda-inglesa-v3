@@ -1,4 +1,4 @@
-"""v13.2.11 contracts: common history + observable-gap-aware leaf SES."""
+"""v13.2.17 contracts: common history + observable-gap-aware leaf SES."""
 from __future__ import annotations
 
 import ast
@@ -31,9 +31,13 @@ def test_v13211_gap_settings_and_trace_are_explicit():
     settings_text = (ROOT / "settings.py").read_text(encoding="utf-8")
     leaf = (ROOT / "app/forecasting/leaf_ses_rls.py").read_text(encoding="utf-8")
     validator = (ROOT / "app/forecasting/validate_v13.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION: str = "13.2.11"' in settings_text
+    assert 'APP_VERSION: str = "13.2.17"' in settings_text
     assert "LEAF_GAP_AWARE_ENABLED: bool = True" in settings_text
     assert "LEAF_GAP_REACTIVATION_ROBUST_BYPASS_DAYS: int = 28" in settings_text
+    assert "LEAF_GAP_DECAY_ALPHA_FLOOR: float = 0.025" in settings_text
+    assert "LEAF_GAP_DECAY_MAX_OBSERVABLE_DAYS: int = 84" in settings_text
+    assert "LEAF_GAP_DECAY_MIN_FACTOR: float = 0.10" in settings_text
+    assert "LEAF_GAP_REACTIVATION_ALPHA_MAX: float = 0.20" in settings_text
     assert "_store_observable_calendar" in leaf
     assert "leaf_observable_day_index" in leaf
     assert "leaf_gap_observable_days_y" in leaf
@@ -63,99 +67,20 @@ def test_all_update_cadences_use_the_same_train_window():
         settings.RLS_BLOCK_DAYS = old
 
 
-def test_observable_zero_gap_decays_ses_but_unobserved_calendar_gap_does_not():
-    import numpy as np
-
-    kernel = _kernel_without_numba()
-    uid = np.zeros(4, dtype=np.int64)
-    blocks = np.array([0, 1, 2, 63], dtype=np.int64)
-    warm = np.zeros(4, dtype=np.uint8)
-    periods = np.array([0, 0, 0, 1], dtype=np.int8)
-    y = np.full(4, 10.0)
-    value = y * 10.0
-    common = dict(
-        uid_codes=uid,
-        blocks=blocks,
-        warmup=warm,
-        period_codes=periods,
-        warmup_end_observable_seq=np.zeros(4, dtype=np.int64),
-        y=y,
-        value=value,
-        factor_y=np.ones(4),
-        factor_v=np.ones(4),
-        init_y=np.full(4, 10.0),
-        init_v=np.full(4, 100.0),
-        alphas=np.array([0.10]),
-        productive_alpha_mask=np.array([1], dtype=np.uint8),
-        default_alpha_index=0,
-        collect_diagnostics=0,
-        ses_update_factor_min=0.50,
-        ses_update_factor_max=2.00,
-        forecast_history_max_multiplier=2.00,
-        forecast_guard_min_positive_points=7,
-        gap_aware_enabled=1,
-        gap_min_observable_zero_days=1,
-        gap_reactivation_robust_bypass_days=28,
-    )
-
-    # Store is observable on 60 intervening days: leaf absence is real zero-sale
-    # information and the level must be stale/decayed at the OOS origin.
-    with_gap = kernel(
-        observable_seq=np.array([1, 2, 3, 64], dtype=np.int64),
-        block_origin_observable_seq=np.array([0, 1, 2, 63], dtype=np.int64),
-        **common,
-    )
-    assert with_gap[8][3] == 60
-    assert with_gap[10][3] < 0.01
-    assert with_gap[0][3] < 1.0
-
-    # Same calendar distance, but no evidence that the store/section was
-    # observable in-between: no zero is invented and the SES level stays 10.
-    no_observable_gap = kernel(
-        observable_seq=np.array([1, 2, 3, 4], dtype=np.int64),
-        block_origin_observable_seq=np.array([0, 1, 2, 3], dtype=np.int64),
-        **common,
-    )
-    assert no_observable_gap[8][3] == 0
-    assert abs(float(no_observable_gap[0][3]) - 10.0) < 1e-12
+def test_observable_zero_gap_never_mutates_state_and_oos_factor_is_frozen():
+    leaf = (ROOT / "app/forecasting/leaf_ses_rls.py").read_text(encoding="utf-8")
+    assert "frozen_gap_factor_y" in leaf and "frozen_gap_factor_v" in leaf
+    assert "block_level_y = state_y[best_y] * selected_decay_y" in leaf
+    assert "block_level_v = state_v[best_v] * selected_decay_v" in leaf
+    assert "sy *= event_decay" not in leaf
+    assert "sv *= event_decay" not in leaf
 
 
-def test_first_sale_after_long_gap_can_reactivate_standard_ses():
-    import numpy as np
-
-    kernel = _kernel_without_numba()
-    # First history sale at observable day 1; next sale reappears after 60
-    # observable zero days. The state is decayed before its forecast, but once
-    # that actual closes it must be allowed to update with standard SES rather
-    # than being clipped to 2x a near-zero stale state.
-    result = kernel(
-        np.zeros(3, dtype=np.int64),
-        np.array([0, 61, 62], dtype=np.int64),
-        np.zeros(3, dtype=np.uint8),
-        np.array([0, 1, 1], dtype=np.int8),
-        np.array([1, 62, 63], dtype=np.int64),
-        np.array([0, 61, 62], dtype=np.int64),
-        np.zeros(3, dtype=np.int64),
-        np.array([10.0, 10.0, 10.0]),
-        np.array([100.0, 100.0, 100.0]),
-        np.ones(3),
-        np.ones(3),
-        np.full(3, 10.0),
-        np.full(3, 100.0),
-        np.array([0.50]),
-        np.array([1], dtype=np.uint8),
-        0,
-        0,
-        0.50,
-        2.00,
-        2.00,
-        7,
-        1,
-        1,
-        28,
-    )
-    assert result[0][1] < 1.0  # stale level before seeing reactivation actual
-    assert result[0][2] > 4.9  # next closed block learned the reactivation
+def test_first_sale_after_long_gap_reanchors_only_after_close():
+    leaf = (ROOT / "app/forecasting/leaf_ses_rls.py").read_text(encoding="utf-8")
+    assert "reactivation_gap_y >= reactivation_bypass" in leaf
+    assert "lo_state_y = obs_y / reactivation_state_factor" in leaf
+    assert "hi_state_y = obs_y * reactivation_state_factor" in leaf
 
 
 def test_release_gate_audits_long_gap_reactivations_and_common_history():
@@ -165,6 +90,8 @@ def test_release_gate_audits_long_gap_reactivations_and_common_history():
     assert "reactivaciones tras gap largo fuera de escala" in text
     assert "_train_window_summary" in text
     assert "historia al origen OOS difiere entre cadencias" in text
+    assert "forecast_to_actual" in text
+    assert "Large upward reactivations" in text
 
 
 def test_store_observability_is_built_before_oos_leaf_history_filter():

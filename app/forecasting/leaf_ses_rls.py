@@ -51,10 +51,24 @@ class LeafModelConfig:
     ses_update_factor_min: float
     ses_update_factor_max: float
     forecast_history_max_multiplier: float
+    forecast_history_mean_multiplier: float
+    long_gap_forecast_mean_multiplier: float
     forecast_guard_min_positive_points: int
+    oos_state_anchor_min_factor: float
+    oos_state_anchor_max_factor: float
+    oos_recent_positive_window: int
+    oos_recent_median_min_points: int
+    oos_recent_median_max_factor: float
     gap_aware_enabled: bool
     gap_min_observable_zero_days: int
+    gap_decay_alpha_floor: float
+    gap_decay_max_observable_days: int
+    gap_decay_min_factor: float
     gap_reactivation_robust_bypass_days: int
+    gap_reactivation_alpha_max: float
+    gap_reactivation_state_factor: float
+    gap_dormant_observable_days: int
+    gap_dormant_factor: float
     default_parent: str
 
     @classmethod
@@ -105,16 +119,81 @@ class LeafModelConfig:
         )
         if forecast_history_max_multiplier < 1.0:
             raise ValueError("LEAF_FORECAST_HISTORY_MAX_MULTIPLIER debe ser >= 1")
+        forecast_history_mean_multiplier = float(
+            getattr(settings, "LEAF_FORECAST_HISTORY_MEAN_MULTIPLIER", 4.00)
+        )
+        if forecast_history_mean_multiplier < 1.0:
+            raise ValueError("LEAF_FORECAST_HISTORY_MEAN_MULTIPLIER debe ser >= 1")
+        long_gap_forecast_mean_multiplier = float(
+            getattr(settings, "LEAF_LONG_GAP_FORECAST_MEAN_MULTIPLIER", 2.00)
+        )
+        if long_gap_forecast_mean_multiplier < 1.0:
+            raise ValueError("LEAF_LONG_GAP_FORECAST_MEAN_MULTIPLIER debe ser >= 1")
         forecast_guard_min_positive_points = max(
             int(getattr(settings, "LEAF_FORECAST_GUARD_MIN_POSITIVE_POINTS", 7)), 1
         )
+        oos_state_anchor_min_factor = float(
+            getattr(settings, "LEAF_OOS_STATE_ANCHOR_MIN_FACTOR", 0.50)
+        )
+        oos_state_anchor_max_factor = float(
+            getattr(settings, "LEAF_OOS_STATE_ANCHOR_MAX_FACTOR", 1.50)
+        )
+        if not (0.0 < oos_state_anchor_min_factor <= 1.0 <= oos_state_anchor_max_factor):
+            raise ValueError(
+                "LEAF_OOS_STATE_ANCHOR_MIN/MAX inválidos; se requiere 0 < min <= 1 <= max"
+            )
+        oos_recent_positive_window = max(
+            int(getattr(settings, "LEAF_OOS_RECENT_POSITIVE_WINDOW", 28)), 1
+        )
+        oos_recent_median_min_points = max(
+            int(getattr(settings, "LEAF_OOS_RECENT_MEDIAN_MIN_POINTS", 7)), 1
+        )
+        oos_recent_median_min_points = min(
+            oos_recent_median_min_points, oos_recent_positive_window
+        )
+        oos_recent_median_max_factor = float(
+            getattr(settings, "LEAF_OOS_RECENT_MEDIAN_MAX_FACTOR", 1.50)
+        )
+        if oos_recent_median_max_factor < 1.0:
+            raise ValueError("LEAF_OOS_RECENT_MEDIAN_MAX_FACTOR debe ser >= 1")
         gap_aware_enabled = bool(getattr(settings, "LEAF_GAP_AWARE_ENABLED", True))
         gap_min_observable_zero_days = max(
             int(getattr(settings, "LEAF_GAP_MIN_OBSERVABLE_ZERO_DAYS", 1)), 1
         )
+        gap_decay_alpha_floor = float(
+            getattr(settings, "LEAF_GAP_DECAY_ALPHA_FLOOR", 0.025)
+        )
+        if not (0.0 < gap_decay_alpha_floor <= 1.0):
+            raise ValueError("LEAF_GAP_DECAY_ALPHA_FLOOR debe estar en (0,1]")
+        gap_decay_max_observable_days = max(
+            int(getattr(settings, "LEAF_GAP_DECAY_MAX_OBSERVABLE_DAYS", 56)), 1
+        )
+        gap_decay_min_factor = float(
+            getattr(settings, "LEAF_GAP_DECAY_MIN_FACTOR", 0.25)
+        )
+        if not (0.0 < gap_decay_min_factor <= 1.0):
+            raise ValueError("LEAF_GAP_DECAY_MIN_FACTOR debe estar en (0,1]")
         gap_reactivation_robust_bypass_days = max(
             int(getattr(settings, "LEAF_GAP_REACTIVATION_ROBUST_BYPASS_DAYS", 28)), 1
         )
+        gap_reactivation_alpha_max = float(
+            getattr(settings, "LEAF_GAP_REACTIVATION_ALPHA_MAX", 0.20)
+        )
+        if not (0.0 < gap_reactivation_alpha_max <= 1.0):
+            raise ValueError("LEAF_GAP_REACTIVATION_ALPHA_MAX debe estar en (0,1]")
+        gap_reactivation_state_factor = float(
+            getattr(settings, "LEAF_GAP_REACTIVATION_STATE_FACTOR", 2.00)
+        )
+        if gap_reactivation_state_factor < 1.0:
+            raise ValueError("LEAF_GAP_REACTIVATION_STATE_FACTOR debe ser >= 1")
+        gap_dormant_observable_days = max(
+            int(getattr(settings, "LEAF_GAP_DORMANT_OBSERVABLE_DAYS", 84)), 1
+        )
+        gap_dormant_factor = float(
+            getattr(settings, "LEAF_GAP_DORMANT_FACTOR", 1e-6)
+        )
+        if not (0.0 < gap_dormant_factor <= 1.0):
+            raise ValueError("LEAF_GAP_DORMANT_FACTOR debe estar en (0,1]")
         return cls(
             block_days=int(getattr(settings, "RLS_BLOCK_DAYS", 28)),
             warmup_days=int(getattr(settings, "LEAF_INITIAL_LEVEL_DAYS", 28)),
@@ -129,10 +208,24 @@ class LeafModelConfig:
             ses_update_factor_min=update_factor_min,
             ses_update_factor_max=update_factor_max,
             forecast_history_max_multiplier=forecast_history_max_multiplier,
+            forecast_history_mean_multiplier=forecast_history_mean_multiplier,
+            long_gap_forecast_mean_multiplier=long_gap_forecast_mean_multiplier,
             forecast_guard_min_positive_points=forecast_guard_min_positive_points,
+            oos_state_anchor_min_factor=oos_state_anchor_min_factor,
+            oos_state_anchor_max_factor=oos_state_anchor_max_factor,
+            oos_recent_positive_window=oos_recent_positive_window,
+            oos_recent_median_min_points=oos_recent_median_min_points,
+            oos_recent_median_max_factor=oos_recent_median_max_factor,
             gap_aware_enabled=gap_aware_enabled,
             gap_min_observable_zero_days=gap_min_observable_zero_days,
+            gap_decay_alpha_floor=gap_decay_alpha_floor,
+            gap_decay_max_observable_days=gap_decay_max_observable_days,
+            gap_decay_min_factor=gap_decay_min_factor,
             gap_reactivation_robust_bypass_days=gap_reactivation_robust_bypass_days,
+            gap_reactivation_alpha_max=gap_reactivation_alpha_max,
+            gap_reactivation_state_factor=gap_reactivation_state_factor,
+            gap_dormant_observable_days=gap_dormant_observable_days,
+            gap_dormant_factor=gap_dormant_factor,
             default_parent=default_parent,
         )
 
@@ -141,6 +234,38 @@ def _block_expr(train_start: dt.date, block_days: int) -> pl.Expr:
     return (
         ((pl.col("ds").cast(pl.Date) - pl.lit(train_start)).dt.total_days() // block_days)
         .cast(pl.Int32)
+        .alias("_block")
+    )
+
+
+def _period_block_expr(
+    train_start: dt.date,
+    test_start: dt.date,
+    forecast_start: dt.date,
+    block_days: int,
+) -> pl.Expr:
+    """Block id aligned to period boundaries.
+
+    In-sample, OOS and forecast-only never share a block. This matters for
+    fixed-origin OOS: no cadence may absorb a partial OOS tail inside the last
+    historical block simply because ``block_days`` differs.
+    """
+    ds = pl.col("ds").cast(pl.Date)
+    hist = ((ds - pl.lit(train_start)).dt.total_days() // block_days).cast(pl.Int32)
+    oos = (
+        ((ds - pl.lit(test_start)).dt.total_days() // block_days).cast(pl.Int32)
+        + pl.lit(1_000_000, dtype=pl.Int32)
+    )
+    fo = (
+        ((ds - pl.lit(forecast_start)).dt.total_days() // block_days).cast(pl.Int32)
+        + pl.lit(2_000_000, dtype=pl.Int32)
+    )
+    return (
+        pl.when(ds < pl.lit(test_start))
+        .then(hist)
+        .when(ds < pl.lit(forecast_start))
+        .then(oos)
+        .otherwise(fo)
         .alias("_block")
     )
 
@@ -203,6 +328,8 @@ def _store_observable_calendar(
     *,
     oos_observable_store_days: pl.DataFrame | None = None,
     train_start: dt.date,
+    test_start: dt.date,
+    forecast_start: dt.date,
     forecast_end: dt.date,
     block_days: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -264,7 +391,7 @@ def _store_observable_calendar(
         .join(observed, on=["_store_uid", "ds"], how="left")
         .with_columns(
             pl.col("_store_observed").fill_null(0).cast(pl.Int8),
-            _block_expr(train_start, block_days),
+            _period_block_expr(train_start, test_start, forecast_start, block_days),
         )
         .sort(["_store_uid", "ds"])
         .with_columns(
@@ -489,6 +616,8 @@ def _parent_block_table(
     parent_forecasts: pl.DataFrame,
     *,
     train_start: dt.date,
+    test_start: dt.date,
+    forecast_start: dt.date,
     block_days: int,
     driver_effect_limit: float,
     driver_reference_days: int,
@@ -510,7 +639,7 @@ def _parent_block_table(
     lim = float(max(driver_effect_limit, 1.0))
     p = parent_forecasts.with_columns(
         pl.col("ds").cast(pl.Date),
-        _block_expr(train_start, block_days),
+        _period_block_expr(train_start, test_start, forecast_start, block_days),
     ).sort(["unique_id", "ds"])
     eligible = (
         pl.col("rls_metric_eligible").fill_null(False)
@@ -949,20 +1078,29 @@ def _ses_walkforward_kernel(
     gap_aware_enabled: int,
     gap_min_observable_zero_days: int,
     gap_reactivation_robust_bypass_days: int,
+    gap_decay_alpha_floor: float = 0.025,
+    gap_decay_max_observable_days: int = 56,
+    gap_decay_min_factor: float = 0.25,
+    gap_reactivation_alpha_max: float = 0.20,
+    gap_reactivation_state_factor: float = 2.00,
+    gap_dormant_observable_days: int = 84,
+    gap_dormant_factor: float = 1e-6,
+    forecast_history_mean_multiplier: float = 4.00,
+    long_gap_forecast_mean_multiplier: float = 2.00,
+    oos_state_anchor_min_factor: float = 0.50,
+    oos_state_anchor_max_factor: float = 1.50,
+    oos_recent_positive_window: int = 28,
+    oos_recent_median_min_points: int = 7,
+    oos_recent_median_max_factor: float = 1.50,
 ):
-    """Causal walk-forward SES with robust updates and observable-gap decay.
+    """Causal walk-forward SES with robust updates and diagnostic gap traces.
 
-    v13.2.11 keeps the same SES+RLS family but fixes a structural omission of
-    sparse leaf panels: missing SKU/day rows were previously invisible to the
-    SES state.  The kernel now receives a cumulative *store-observable* day
-    index.  If the store/section had other positive sales while this leaf had
-    none, those closed days are equivalent to causal zero observations and the
-    SES state advances as ``level *= (1-alpha)**gap``.
-
-    Days where the store/section itself has no positive transaction are not
-    counted, avoiding the unsafe assumption that an ingestion gap or store
-    closure is a zero sale.  OOS observability is consumed only after a block
-    closes; block-origin indexes exclude the current block by construction.
+    v13.2.17 restores the established v13 walk-forward contract: model
+    selection is frozen at OOS origin, but actuals from a CLOSED OOS block may
+    update the operational SES state for the NEXT origin of the same cadence.
+    Missing SKU/day rows never mutate SES. Gap observability is a causal
+    forecast-origin signal only. A recent-positive median robustifies the first
+    OOS anchor without using OOS information.
     """
     n = len(uid_codes)
     na = len(alphas)
@@ -991,9 +1129,23 @@ def _ses_walkforward_kernel(
     update_min = max(min(float(ses_update_factor_min), 1.0), 1e-12)
     update_max = max(float(ses_update_factor_max), 1.0)
     history_mult = max(float(forecast_history_max_multiplier), 1.0)
+    history_mean_mult = max(float(forecast_history_mean_multiplier), 1.0)
+    long_gap_mean_mult = max(float(long_gap_forecast_mean_multiplier), 1.0)
     guard_min_points = max(int(forecast_guard_min_positive_points), 1)
+    anchor_min = min(max(float(oos_state_anchor_min_factor), 1e-9), 1.0)
+    anchor_max = max(float(oos_state_anchor_max_factor), 1.0)
     gap_min = max(int(gap_min_observable_zero_days), 1)
     reactivation_bypass = max(int(gap_reactivation_robust_bypass_days), 1)
+    gap_alpha_floor = min(max(float(gap_decay_alpha_floor), 1e-9), 1.0)
+    gap_max_days = max(int(gap_decay_max_observable_days), 1)
+    gap_factor_floor = min(max(float(gap_decay_min_factor), 1e-9), 1.0)
+    reactivation_alpha_max = min(max(float(gap_reactivation_alpha_max), 1e-9), 1.0)
+    reactivation_state_factor = max(float(gap_reactivation_state_factor), 1.0)
+    dormant_days = max(int(gap_dormant_observable_days), 1)
+    dormant_factor = min(max(float(gap_dormant_factor), 1e-15), 1.0)
+    recent_window = max(int(oos_recent_positive_window), 1)
+    recent_min_points = min(max(int(oos_recent_median_min_points), 1), recent_window)
+    recent_median_max_factor = max(float(oos_recent_median_max_factor), 1.0)
     use_gap = int(gap_aware_enabled) == 1
 
     i = 0
@@ -1022,8 +1174,27 @@ def _ses_walkforward_kernel(
         # Causal magnitude history shared by all alpha candidates.
         hist_max_y = 0.0
         hist_max_v = 0.0
+        hist_sum_y = 0.0
+        hist_sum_v = 0.0
         hist_n_y = 0
         hist_n_v = 0
+
+        # Ring buffer of the latest positive DESEASONALIZED magnitudes. It is
+        # updated only after a block closes, so the median available at the OOS
+        # origin is strictly causal and independent of future OOS observations.
+        recent_y = np.zeros(recent_window, dtype=np.float64)
+        recent_v = np.zeros(recent_window, dtype=np.float64)
+        recent_n_y = 0
+        recent_n_v = 0
+        recent_pos_y = 0
+        recent_pos_v = 0
+
+        # Common OOS-origin state envelope. 1d/7d/14d/28d may close blocks at
+        # different times, but recursive SES updates cannot drift arbitrarily
+        # far from the same causal state available at the OOS boundary.
+        oos_anchor_y = np.zeros(na, dtype=np.float64)
+        oos_anchor_v = np.zeros(na, dtype=np.float64)
+        oos_anchor_ready = 0
 
         # Last positive support is only for trace/audit of reactivations.
         last_positive_seq_y = -1
@@ -1033,6 +1204,8 @@ def _ses_walkforward_kernel(
         # holdout boundary has not been reached yet.
         frozen_best_y = -1
         frozen_best_v = -1
+        frozen_gap_factor_y = -1.0
+        frozen_gap_factor_v = -1.0
 
         k = i
         while k < j:
@@ -1067,37 +1240,63 @@ def _ses_walkforward_kernel(
                 if frozen_best_y < 0:
                     frozen_best_y = best_y
                     frozen_best_v = best_v
+                if oos_anchor_ready == 0:
+                    recent_median_y = 0.0
+                    recent_median_v = 0.0
+                    if recent_n_y >= recent_min_points:
+                        tmp_y = np.empty(recent_n_y, dtype=np.float64)
+                        for q in range(recent_n_y):
+                            tmp_y[q] = recent_y[q]
+                        tmp_y.sort()
+                        mid_y = recent_n_y // 2
+                        recent_median_y = (
+                            tmp_y[mid_y]
+                            if recent_n_y % 2 == 1
+                            else 0.5 * (tmp_y[mid_y - 1] + tmp_y[mid_y])
+                        )
+                    if recent_n_v >= recent_min_points:
+                        tmp_v = np.empty(recent_n_v, dtype=np.float64)
+                        for q in range(recent_n_v):
+                            tmp_v[q] = recent_v[q]
+                        tmp_v.sort()
+                        mid_v = recent_n_v // 2
+                        recent_median_v = (
+                            tmp_v[mid_v]
+                            if recent_n_v % 2 == 1
+                            else 0.5 * (tmp_v[mid_v - 1] + tmp_v[mid_v])
+                        )
+                    for a in range(na):
+                        ay0 = max(state_y[a], 0.0)
+                        av0 = max(state_v[a], 0.0)
+                        # Downward-only robust clamp: persistent recent levels
+                        # move the median itself; isolated spikes cannot keep the
+                        # OOS anchor arbitrarily above recent typical demand.
+                        if recent_median_y > 0.0:
+                            robust_hi_y = recent_median_y * recent_median_max_factor
+                            if ay0 > robust_hi_y:
+                                ay0 = robust_hi_y
+                        if recent_median_v > 0.0:
+                            robust_hi_v = recent_median_v * recent_median_max_factor
+                            if av0 > robust_hi_v:
+                                av0 = robust_hi_v
+                        oos_anchor_y[a] = ay0
+                        oos_anchor_v[a] = av0
+                        # Align the operational state to the same robust first
+                        # OOS origin; later CLOSED OOS blocks may update it for
+                        # the next origin of the same cadence.
+                        state_y[a] = ay0
+                        state_v[a] = av0
+                    oos_anchor_ready = 1
                 best_y = frozen_best_y
                 best_v = frozen_best_v
 
             origin_seq = max(int(block_origin_observable_seq[k]), 0)
-            selected_advance_y = max(origin_seq - int(state_seq_y[best_y]), 0)
-            selected_advance_v = max(origin_seq - int(state_seq_v[best_v]), 0)
-            selected_decay_y = 1.0
-            selected_decay_v = 1.0
-            if use_gap and selected_advance_y >= gap_min:
-                selected_decay_y = (1.0 - alphas[best_y]) ** selected_advance_y
-            if use_gap and selected_advance_v >= gap_min:
-                selected_decay_v = (1.0 - alphas[best_v]) ** selected_advance_v
 
-            # Advance every candidate state through closed observable zero days
-            # before this block. This is equivalent to standard SES updates with
-            # y=0, but without materializing ~26M dense leaf rows.
-            for a in range(na):
-                gy = max(origin_seq - int(state_seq_y[a]), 0)
-                gv = max(origin_seq - int(state_seq_v[a]), 0)
-                if use_gap and gy >= gap_min:
-                    state_y[a] *= (1.0 - alphas[a]) ** gy
-                if use_gap and gv >= gap_min:
-                    state_v[a] *= (1.0 - alphas[a]) ** gv
-                if origin_seq > state_seq_y[a]:
-                    state_seq_y[a] = origin_seq
-                if origin_seq > state_seq_v[a]:
-                    state_seq_v[a] = origin_seq
-
-            block_level_y = state_y[best_y]
-            block_level_v = state_v[best_v]
-
+            # v13.2.12: gap staleness is a bounded ORIGIN adjustment, never a
+            # destructive mutation of the SES state. Repeated 1d/7d/14d blocks
+            # therefore cannot compound the same no-sale gap to ~0 while 28d
+            # sees it only once. The total gap is measured from the last closed
+            # positive event and the decay is bounded away from zero.
             gap_since_positive_y = 0
             gap_since_positive_v = 0
             if last_positive_seq_y >= 0:
@@ -1105,12 +1304,74 @@ def _ses_walkforward_kernel(
             if last_positive_seq_v >= 0:
                 gap_since_positive_v = max(origin_seq - last_positive_seq_v, 0)
 
+            # v13.2.15: bounded gap staleness is a FORECAST-ORIGIN adjustment,
+            # never a state mutation. In history it is recomputed causally per
+            # closed block. At the first OOS origin it is snapshotted and then
+            # frozen for the whole OOS/FO horizon, so 1d/7d/14d/28d cannot
+            # compound or progressively strengthen the same pre-OOS gap.
+            candidate_decay_y = 1.0
+            candidate_decay_v = 1.0
+            if use_gap and gap_since_positive_y >= dormant_days:
+                candidate_decay_y = dormant_factor
+            elif use_gap and gap_since_positive_y >= gap_min:
+                decay_days_y = min(gap_since_positive_y, gap_max_days)
+                candidate_decay_y = max(
+                    gap_factor_floor, (1.0 - gap_alpha_floor) ** decay_days_y
+                )
+            if use_gap and gap_since_positive_v >= dormant_days:
+                candidate_decay_v = dormant_factor
+            elif use_gap and gap_since_positive_v >= gap_min:
+                decay_days_v = min(gap_since_positive_v, gap_max_days)
+                candidate_decay_v = max(
+                    gap_factor_floor, (1.0 - gap_alpha_floor) ** decay_days_v
+                )
+
+            if block_period != 0:
+                if frozen_gap_factor_y < 0.0:
+                    frozen_gap_factor_y = candidate_decay_y
+                    frozen_gap_factor_v = candidate_decay_v
+                selected_decay_y = frozen_gap_factor_y
+                selected_decay_v = frozen_gap_factor_v
+            else:
+                selected_decay_y = candidate_decay_y
+                selected_decay_v = candidate_decay_v
+
+            block_level_y = state_y[best_y] * selected_decay_y
+            block_level_v = state_v[best_v] * selected_decay_v
+
+            # Causal scale-aware forecast cap. v13.2.15 combines the prior
+            # 2x-history-maximum guard with a robust positive-history mean cap.
+            # The mean term prevents one old large observation from authorizing
+            # a stale high forecast indefinitely. During a long observed gap the
+            # cap tightens further, without mutating/decaying the SES state.
             cap_y = 0.0
             cap_v = 0.0
-            if hist_n_y >= guard_min_points and hist_max_y > 0.0:
-                cap_y = history_mult * hist_max_y
-            if hist_n_v >= guard_min_points and hist_max_v > 0.0:
-                cap_v = history_mult * hist_max_v
+            guard_base_y = hist_max_y if hist_n_y > 0 else float(init_y[i])
+            guard_base_v = hist_max_v if hist_n_v > 0 else float(init_v[i])
+            if guard_base_y > 0.0:
+                cap_y = history_mult * guard_base_y
+            if guard_base_v > 0.0:
+                cap_v = history_mult * guard_base_v
+            if hist_n_y > 0:
+                hist_mean_y = hist_sum_y / hist_n_y
+                if hist_mean_y > 0.0:
+                    mean_cap_y = history_mean_mult * hist_mean_y
+                    if cap_y <= 0.0 or mean_cap_y < cap_y:
+                        cap_y = mean_cap_y
+                    if gap_since_positive_y >= reactivation_bypass:
+                        long_gap_cap_y = long_gap_mean_mult * hist_mean_y
+                        if long_gap_cap_y < cap_y:
+                            cap_y = long_gap_cap_y
+            if hist_n_v > 0:
+                hist_mean_v = hist_sum_v / hist_n_v
+                if hist_mean_v > 0.0:
+                    mean_cap_v = history_mean_mult * hist_mean_v
+                    if cap_v <= 0.0 or mean_cap_v < cap_v:
+                        cap_v = mean_cap_v
+                    if gap_since_positive_v >= reactivation_bypass:
+                        long_gap_cap_v = long_gap_mean_mult * hist_mean_v
+                        if long_gap_cap_v < cap_v:
+                            cap_v = long_gap_cap_v
 
             # Forecast every row using only block-origin state/history.
             for r in range(k, e):
@@ -1169,6 +1430,8 @@ def _ses_walkforward_kernel(
                 sv_seq = int(state_seq_v[a])
                 lp_y = last_positive_seq_y
                 lp_v = last_positive_seq_v
+                block_reactivated_y = 0
+                block_reactivated_v = 0
                 for r in range(k, e):
                     if warmup[r] == 1 or period_codes[r] == 2:
                         continue
@@ -1208,48 +1471,114 @@ def _ses_walkforward_kernel(
                         continue
                     if np.isfinite(y[r]) and y[r] > 0.0:
                         event_seq = max(int(observable_seq[r]), 0)
-                        zeros_before_y = max(event_seq - sy_seq - 1, 0)
-                        if use_gap and zeros_before_y >= gap_min:
-                            sy *= (1.0 - alphas[a]) ** zeros_before_y
+                        zeros_before_y = max(event_seq - lp_y - 1, 0) if lp_y >= 0 else 0
                         fy = factor_y[r] if np.isfinite(factor_y[r]) and factor_y[r] > 0.0 else 1.0
                         obs_y = max(np.expm1(np.log1p(y[r]) - np.log(fy)), 0.0)
                         reactivation_gap_y = 0
                         if lp_y >= 0:
                             reactivation_gap_y = max(event_seq - lp_y - 1, 0)
-                        if sy > 0.0 and reactivation_gap_y < reactivation_bypass:
-                            lo_y = sy * update_min
-                            hi_y = sy * update_max
-                            if obs_y < lo_y:
-                                obs_y = lo_y
-                            elif obs_y > hi_y:
-                                obs_y = hi_y
-                        sy = alphas[a] * obs_y + (1.0 - alphas[a]) * sy
+                        if reactivation_gap_y >= reactivation_bypass:
+                            block_reactivated_y = 1
+                            # A real positive reactivation is now closed and may
+                            # re-anchor only the NEXT block. Clamp the stale state
+                            # around the observed deseasonalized magnitude; do not
+                            # decay beforehand and do not alter the already-issued
+                            # forecast for this observation.
+                            if obs_y > 0.0:
+                                if sy > 0.0:
+                                    lo_state_y = obs_y / reactivation_state_factor
+                                    hi_state_y = obs_y * reactivation_state_factor
+                                    if sy < lo_state_y:
+                                        sy = lo_state_y
+                                    elif sy > hi_state_y:
+                                        sy = hi_state_y
+                                else:
+                                    sy = obs_y
+                            update_alpha_y = min(alphas[a], reactivation_alpha_max)
+                        else:
+                            if sy > 0.0:
+                                lo_y = sy * update_min
+                                hi_y = sy * update_max
+                                if obs_y < lo_y:
+                                    obs_y = lo_y
+                                elif obs_y > hi_y:
+                                    obs_y = hi_y
+                            update_alpha_y = alphas[a]
+                        sy = update_alpha_y * obs_y + (1.0 - update_alpha_y) * sy
                         sy_seq = event_seq
                         lp_y = event_seq
 
                         if np.isfinite(value[r]) and value[r] > 0.0:
-                            zeros_before_v = max(event_seq - sv_seq - 1, 0)
-                            if use_gap and zeros_before_v >= gap_min:
-                                sv *= (1.0 - alphas[a]) ** zeros_before_v
+                            zeros_before_v = max(event_seq - lp_v - 1, 0) if lp_v >= 0 else 0
                             fv = factor_v[r] if np.isfinite(factor_v[r]) and factor_v[r] > 0.0 else 1.0
                             obs_v = max(np.expm1(np.log1p(value[r]) - np.log(fv)), 0.0)
                             reactivation_gap_v = 0
                             if lp_v >= 0:
                                 reactivation_gap_v = max(event_seq - lp_v - 1, 0)
-                            if sv > 0.0 and reactivation_gap_v < reactivation_bypass:
-                                lo_v = sv * update_min
-                                hi_v = sv * update_max
-                                if obs_v < lo_v:
-                                    obs_v = lo_v
-                                elif obs_v > hi_v:
-                                    obs_v = hi_v
-                            sv = alphas[a] * obs_v + (1.0 - alphas[a]) * sv
+                            if reactivation_gap_v >= reactivation_bypass:
+                                block_reactivated_v = 1
+                                if obs_v > 0.0:
+                                    if sv > 0.0:
+                                        lo_state_v = obs_v / reactivation_state_factor
+                                        hi_state_v = obs_v * reactivation_state_factor
+                                        if sv < lo_state_v:
+                                            sv = lo_state_v
+                                        elif sv > hi_state_v:
+                                            sv = hi_state_v
+                                    else:
+                                        sv = obs_v
+                                update_alpha_v = min(alphas[a], reactivation_alpha_max)
+                            else:
+                                if sv > 0.0:
+                                    lo_v = sv * update_min
+                                    hi_v = sv * update_max
+                                    if obs_v < lo_v:
+                                        obs_v = lo_v
+                                    elif obs_v > hi_v:
+                                        obs_v = hi_v
+                                update_alpha_v = alphas[a]
+                            sv = update_alpha_v * obs_v + (1.0 - update_alpha_v) * sv
                             sv_seq = event_seq
                             lp_v = event_seq
+                # OOS recurrence is allowed, but it is bounded against the
+                # common OOS-origin state rather than compounding a relative
+                # guard around each newly-updated state. This is the key
+                # cross-cadence stabilizer in v13.2.15.
+                if block_period == 1 and oos_anchor_ready == 1:
+                    ay0 = oos_anchor_y[a]
+                    av0 = oos_anchor_v[a]
+                    if ay0 > 0.0:
+                        lo_anchor_y = ay0 * anchor_min
+                        hi_anchor_y = ay0 * anchor_max
+                        # A confirmed long-gap reactivation may legitimately
+                        # reset downward; only the upper anchor remains binding
+                        # for that closing block. Ordinary OOS updates retain
+                        # both sides of the common-origin envelope.
+                        if block_reactivated_y == 0 and sy < lo_anchor_y:
+                            sy = lo_anchor_y
+                        elif sy > hi_anchor_y:
+                            sy = hi_anchor_y
+                    if av0 > 0.0:
+                        lo_anchor_v = av0 * anchor_min
+                        hi_anchor_v = av0 * anchor_max
+                        if block_reactivated_v == 0 and sv < lo_anchor_v:
+                            sv = lo_anchor_v
+                        elif sv > hi_anchor_v:
+                            sv = hi_anchor_v
                 state_y[a] = max(sy, 0.0)
                 state_v[a] = max(sv, 0.0)
                 state_seq_y[a] = sy_seq
                 state_seq_v[a] = sv_seq
+
+            # A confirmed long-gap reactivation is available only after the
+            # block closes. From the NEXT block onward the leaf is no longer
+            # dormant; the pre-OOS staleness factor must not keep suppressing
+            # an already-reactivated series. Selection remains frozen.
+            if block_period == 1:
+                if block_reactivated_y == 1:
+                    frozen_gap_factor_y = 1.0
+                if block_reactivated_v == 1:
+                    frozen_gap_factor_v = 1.0
 
             # Update causal raw-scale history and last-positive pointers only
             # AFTER the block closes. Forecast-only never changes either.
@@ -1260,13 +1589,29 @@ def _ses_walkforward_kernel(
                     event_seq = max(int(observable_seq[r]), 0)
                     last_positive_seq_y = event_seq
                     hist_n_y += 1
+                    hist_sum_y += y[r]
                     if y[r] > hist_max_y:
                         hist_max_y = y[r]
+                    fy_hist = factor_y[r] if np.isfinite(factor_y[r]) and factor_y[r] > 0.0 else 1.0
+                    obs_hist_y = max(np.expm1(np.log1p(y[r]) - np.log(fy_hist)), 0.0)
+                    if obs_hist_y > 0.0:
+                        recent_y[recent_pos_y] = obs_hist_y
+                        recent_pos_y = (recent_pos_y + 1) % recent_window
+                        if recent_n_y < recent_window:
+                            recent_n_y += 1
                     if np.isfinite(value[r]) and value[r] > 0.0:
                         last_positive_seq_v = event_seq
                         hist_n_v += 1
+                        hist_sum_v += value[r]
                         if value[r] > hist_max_v:
                             hist_max_v = value[r]
+                        fv_hist = factor_v[r] if np.isfinite(factor_v[r]) and factor_v[r] > 0.0 else 1.0
+                        obs_hist_v = max(np.expm1(np.log1p(value[r]) - np.log(fv_hist)), 0.0)
+                        if obs_hist_v > 0.0:
+                            recent_v[recent_pos_v] = obs_hist_v
+                            recent_pos_v = (recent_pos_v + 1) % recent_window
+                            if recent_n_v < recent_window:
+                                recent_n_v += 1
 
             k = e
         i = j
@@ -1518,6 +1863,8 @@ def build_leaf_forecasts(
         oos_obs,
         oos_observable_store_days=oos_observable_store_days,
         train_start=train_start,
+        test_start=test_start,
+        forecast_start=forecast_start,
         forecast_end=forecast_end,
         block_days=cfg.block_days,
     )
@@ -1568,7 +1915,7 @@ def build_leaf_forecasts(
     rows = (
         pl.concat([historical, oos_grid, forecast_grid], how="diagonal_relaxed")
         .with_columns(
-            _block_expr(train_start, cfg.block_days),
+            _period_block_expr(train_start, test_start, forecast_start, cfg.block_days),
             pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
         )
     )
@@ -1580,6 +1927,8 @@ def build_leaf_forecasts(
     parent_daily = _parent_block_table(
         parent_forecasts,
         train_start=train_start,
+        test_start=test_start,
+        forecast_start=forecast_start,
         block_days=cfg.block_days,
         driver_effect_limit=cfg.driver_effect_limit,
         driver_reference_days=cfg.driver_reference_days,
@@ -1656,6 +2005,20 @@ def build_leaf_forecasts(
         1 if cfg.gap_aware_enabled else 0,
         cfg.gap_min_observable_zero_days,
         cfg.gap_reactivation_robust_bypass_days,
+        cfg.gap_decay_alpha_floor,
+        cfg.gap_decay_max_observable_days,
+        cfg.gap_decay_min_factor,
+        cfg.gap_reactivation_alpha_max,
+        cfg.gap_reactivation_state_factor,
+        cfg.gap_dormant_observable_days,
+        cfg.gap_dormant_factor,
+        cfg.forecast_history_mean_multiplier,
+        cfg.long_gap_forecast_mean_multiplier,
+        cfg.oos_state_anchor_min_factor,
+        cfg.oos_state_anchor_max_factor,
+        cfg.oos_recent_positive_window,
+        cfg.oos_recent_median_min_points,
+        cfg.oos_recent_median_max_factor,
     )
 
     if optimization_phase2 and parent_diagnostics_out is not None:

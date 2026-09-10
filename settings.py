@@ -9,7 +9,7 @@ import datetime as dt
 import os
 from pathlib import Path
 
-APP_VERSION: str = "13.2.11"
+APP_VERSION: str = "13.2.17"
 
 # No existe corrección post-hoc de sesgo por período: in-sample, OOS y
 # forecast-only usan exactamente la misma familia/modelo en cada origen.
@@ -131,30 +131,62 @@ LEAF_SES_UPDATE_FACTOR_MIN: float = 0.50
 LEAF_SES_UPDATE_FACTOR_MAX: float = 2.00
 
 
-# v13.2.11: SES leaf gap-aware. Un día sin fila del SKU solo cuenta como cero
-# cuando la tienda/sección es observable ese día (existe al menos una venta
-# positiva de otro SKU elegible). El estado SES se avanza causalmente a través
-# de esos ceros observables con la misma alpha seleccionada; no se imputan como
-# cero días sin evidencia de operación/datos de la tienda.
+# v13.2.15: gap observability never mutates the SES state. A bounded staleness
+# factor is computed from information available at the block origin; at the OOS
+# boundary it is snapshotted once and then frozen for the complete OOS/FO run.
+# Thus all cadences start from the same gap adjustment and cannot compound it.
 LEAF_GAP_AWARE_ENABLED: bool = True
 LEAF_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 1
-# Tras un gap largo, la primera venta positiva es una reactivación real: se
-# aplica el SES estándar (sin el clip relativo anti-spike) para no impedir que
-# el estado vuelva a aprender de la nueva magnitud.
+# Para gaps de 1..83 días se usa un ajuste de staleness acotado al origen;
+# para >=84 días entra el estado de dormancia definido abajo. Nunca muta SES.
+LEAF_GAP_DECAY_ALPHA_FLOOR: float = 0.025
+LEAF_GAP_DECAY_MAX_OBSERVABLE_DAYS: int = 84
+LEAF_GAP_DECAY_MIN_FACTOR: float = 0.10
 LEAF_GAP_REACTIVATION_ROBUST_BYPASS_DAYS: int = 28
+LEAF_GAP_REACTIVATION_ALPHA_MAX: float = 0.20
+# On the first closed positive after a long gap, the stale state is clamped
+# around that observed deseasonalized magnitude before the normal SES update.
+# This affects only subsequent blocks and prevents both stale-high and stale-low
+# levels from dominating a reactivated series.
+LEAF_GAP_REACTIVATION_STATE_FACTOR: float = 2.00
+
+# v13.2.15: una hoja con >=84 días observables sin venta se trata como
+# dormante en el forecast hasta que una venta positiva real cierre el bloque.
+# Se usa epsilon >0 (no cero exacto) para preservar la identidad log/validator.
+LEAF_GAP_DORMANT_OBSERVABLE_DAYS: int = 28
+LEAF_GAP_DORMANT_FACTOR: float = 1e-12
 
 # Guard causal de magnitud del forecast leaf. Se activa solo después de contar
 # suficientes positivos ya cerrados y limita el forecast a un múltiplo del
 # máximo positivo observado ANTES del bloque. El valor 2.0 coincide con el gate
 # de no-regresión y deja margen amplio para crecimiento real.
 LEAF_FORECAST_HISTORY_MAX_MULTIPLIER: float = 2.00
+# v13.2.15: segundo guard robusto por escala media positiva cerrada. El cap
+# productivo es el mínimo entre 2x máximo histórico y 4x media positiva; tras
+# gaps largos usa 2x media para evitar arrastrar un nivel pre-gap obsoleto.
+LEAF_FORECAST_HISTORY_MEAN_MULTIPLIER: float = 4.00
+LEAF_LONG_GAP_FORECAST_MEAN_MULTIPLIER: float = 2.00
 LEAF_FORECAST_GUARD_MIN_POSITIVE_POINTS: int = 7
+
+# Contrato v13: OOS no participa en tuning, pero los actuals de un bloque OOS
+# cerrado SÍ pueden actualizar el estado operativo para el siguiente origen de
+# esa misma cadencia. La envolvente evita drift explosivo sin congelar el estado.
+LEAF_OOS_STATE_ANCHOR_MIN_FACTOR: float = 0.75
+LEAF_OOS_STATE_ANCHOR_MAX_FACTOR: float = 1.25
+
+# v13.2.16: robustez del nivel al origen OOS. Si el SES quedó elevado por
+# picos recientes, se limita solo hacia arriba usando la mediana causal de las
+# últimas ventas positivas desestacionalizadas. No cambia alpha ni drivers.
+LEAF_OOS_RECENT_POSITIVE_WINDOW: int = 28
+LEAF_OOS_RECENT_MEDIAN_MIN_POINTS: int = 7
+LEAF_OOS_RECENT_MEDIAN_MAX_FACTOR: float = 1.50
 
 # Gate end-to-end obligatorio para declarar los cuatro escenarios listos.
 # No altera forecasts; bloquea una release con spikes/cambios de escala absurdos.
 RELEASE_GATE_MAX_FORECAST_TO_POSITIVE_MEDIAN: float = 8.0
 RELEASE_GATE_MAX_FORECAST_TO_OBSERVED_MAX: float = 2.0
 RELEASE_GATE_MAX_CROSS_CADENCE_MEDIAN_RATIO: float = 4.0
+RELEASE_GATE_MIN_CROSS_CADENCE_SCALED_GAP: float = 2.0
 RELEASE_GATE_LONG_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 28
 RELEASE_GATE_LONG_GAP_MAX_FACTOR_ERROR: float = 4.0
 RELEASE_GATE_SENTINEL_MAX_IN_SAMPLE_WMAPE: float = 3.0
@@ -165,7 +197,7 @@ RELEASE_GATE_SENTINELS: tuple[tuple[str, str, str, str], ...] = (
 )
 
 # Optimización estadística v13.x dentro de la MISMA familia SES+RLS.
-# v13.2.11 mantiene restaurada la configuración productiva estadística de v13.1.1.
+# v13.2.12 mantiene restaurada la configuración productiva estadística de v13.1.1.
 # Corrige la contaminación del holdout: alpha/lambda/dynamics/parent se eligen
 # exclusivamente con historia in-sample cerrada. OOS puede actualizar el estado
 # operativo para la cadencia siguiente, pero nunca cambia una selección/tuning.

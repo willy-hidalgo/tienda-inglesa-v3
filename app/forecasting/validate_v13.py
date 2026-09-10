@@ -214,8 +214,9 @@ def validate(path: Path) -> list[str]:
     if _count(leaf.filter((pl.col("leaf_forecast_cap_value") > 0.0) & (pl.col("valuehat_raw") > pl.col("leaf_forecast_cap_value") + tol))):
         errors.append("valuehat_raw excede leaf_forecast_cap_value")
 
-    # v13.2.11 gap-aware trace. Observable-day indexes/gaps are causal
-    # bookkeeping, while decay factors must remain in (0, 1].
+    # v13.2.15 gap trace. Observable-day indexes/gaps are causal bookkeeping.
+    # A bounded forecast-origin staleness factor is allowed, but it never
+    # mutates the SES state and must remain strictly in (0, 1].
     if _count(leaf.filter(pl.col("leaf_observable_day_index") < 0)):
         errors.append("leaf_observable_day_index negativo")
     if _count(leaf.filter((pl.col("leaf_gap_observable_days_y") < 0) | (pl.col("leaf_gap_observable_days_value") < 0))):

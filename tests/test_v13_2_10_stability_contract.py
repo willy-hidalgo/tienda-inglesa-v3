@@ -1,4 +1,4 @@
-"""v13.2.11 contracts: frozen OOS selection + robust causal leaf stability."""
+"""v13.2.17 contracts: frozen OOS selection + robust causal leaf stability."""
 from pathlib import Path
 import ast
 
@@ -37,7 +37,7 @@ def _kernel_without_numba():
 
 def test_v13_2_10_keeps_statistical_baseline_and_adds_only_stability_guards():
     s = _settings_assignments()
-    assert s["APP_VERSION"] == "13.2.11"
+    assert s["APP_VERSION"] == "13.2.17"
     assert tuple(s["LEAF_SES_ALPHA_CANDIDATES"]) == (
         0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80
     )
@@ -64,7 +64,7 @@ def test_robust_ses_update_prevents_one_peak_from_resetting_level():
 
     kernel = _kernel_without_numba()
     # Eight stable history points, one extreme history peak, then OOS. With
-    # alpha=.8 the unguarded SES would jump near 800; v13.2.11 constrains the
+    # alpha=.8 the unguarded SES would jump near 800; v13.2.17 constrains the
     # deseasonalized innovation to at most 2x the pre-event state.
     y = np.array([10.] * 8 + [1000., 10., 10.])
     n = len(y)
@@ -151,7 +151,7 @@ def test_validator_and_dashboard_audit_know_about_v13210_guards():
     assert "leaf_forecast_cap_value" in validator
     assert "yhat_raw excede leaf_forecast_cap_y" in validator
     artifacts = (ROOT / "app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert 'ARTIFACT_VERSION = 24' in artifacts
+    assert 'ARTIFACT_VERSION = 30' in artifacts
     assert '"rls_metric_eligible"' in artifacts
     assert '_WMAPE_COLS' in artifacts
     assert 'sort("unique_id")' in consistency

@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 24
+ARTIFACT_VERSION = 30
 
 SERIES_COLS_PREFERRED = [
     "unique_id", "ds", "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",

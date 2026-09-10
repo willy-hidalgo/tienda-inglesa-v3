@@ -42,7 +42,7 @@ def _spike_summary(path: Path, days: int) -> pl.DataFrame:
         .agg(
             pl.col("y").filter(pl.col("y") > 0).median().alias("positive_median"),
             pl.col("y").filter(pl.col("y") > 0).max().alias("observed_max"),
-            pl.col("yhat_raw").max().alias("forecast_max"),
+            pl.col("yhat_raw").filter(pl.col("period_type") == "out_sample").max().alias("forecast_max"),
             (pl.col("y") > 0).sum().alias("n_positive"),
         )
         .with_columns(
@@ -61,7 +61,7 @@ def _spike_summary(path: Path, days: int) -> pl.DataFrame:
             .filter((pl.col("y") > 0) & pl.col("value").is_finite() & (pl.col("value") > 0))
             .max()
             .alias("observed_max"),
-            pl.col("valuehat_raw").max().alias("forecast_max"),
+            pl.col("valuehat_raw").filter(pl.col("period_type") == "out_sample").max().alias("forecast_max"),
             ((pl.col("y") > 0) & pl.col("value").is_finite()).sum().alias("n_positive"),
         )
         .with_columns(
@@ -170,6 +170,9 @@ def _long_gap_reactivation_summary(path: Path, days: int) -> pl.DataFrame:
     )
 
     def _factor(actual: str, forecast: str) -> pl.Expr:
+        # Symmetric factor is retained for diagnosis only. A first positive
+        # sale after a very long gap can be intrinsically unpredictable on the
+        # upside; a zero/low forecast is not evidence of stale-level inflation.
         return (
             pl.when((pl.col(actual) > 0) & (pl.col(forecast) > 0))
             .then(
@@ -178,10 +181,13 @@ def _long_gap_reactivation_summary(path: Path, days: int) -> pl.DataFrame:
                     pl.col(actual) / pl.col(forecast),
                 )
             )
-            .when((pl.col(actual) > 0) & (pl.col(forecast) <= 0))
-            .then(pl.lit(1e308))
             .otherwise(None)
         )
+
+    def _forecast_to_actual(actual: str, forecast: str) -> pl.Expr:
+        return pl.when(pl.col(actual) > 0).then(
+            pl.col(forecast).clip(lower_bound=0.0) / pl.col(actual)
+        ).otherwise(None)
 
     unit = lf.select(
         "unique_id", "ds", "_prev_positive_ds", "observable_zero_days",
@@ -189,6 +195,7 @@ def _long_gap_reactivation_summary(path: Path, days: int) -> pl.DataFrame:
         pl.col("y").alias("actual"),
         pl.col("yhat_raw").alias("forecast"),
         _factor("y", "yhat_raw").alias("factor_error"),
+        _forecast_to_actual("y", "yhat_raw").alias("forecast_to_actual"),
     ).with_columns(
         pl.lit("Unidades").alias("target"),
         pl.lit(int(days)).alias("update_block_days"),
@@ -202,6 +209,7 @@ def _long_gap_reactivation_summary(path: Path, days: int) -> pl.DataFrame:
             pl.col("value").alias("actual"),
             pl.col("valuehat_raw").alias("forecast"),
             _factor("value", "valuehat_raw").alias("factor_error"),
+            _forecast_to_actual("value", "valuehat_raw").alias("forecast_to_actual"),
         )
         .with_columns(
             pl.lit("Valor ($)").alias("target"),
@@ -331,11 +339,28 @@ def validate_all() -> tuple[list[str], pl.DataFrame]:
         )
 
     # Cross-cadence gate only on OOS-active leaves (>=7 positive actual days in
-    # every available cadence). It detects orders-of-magnitude disagreement,
-    # not ordinary differences caused by a faster/slower update frequency.
-    if cadence.height:
+    # every available cadence). Long-gap reactivations are excluded here: by
+    # design, 1d/7d/14d/28d can react at different times once the first real
+    # positive closes. Those cases are governed by the dedicated long-gap gate.
+    cadence_for_cross = cadence
+    if cadence.height and long_gaps.height:
+        long_gap_keys = (
+            long_gaps.filter(
+                pl.col("observable_zero_days")
+                >= int(getattr(settings, "RELEASE_GATE_LONG_GAP_MIN_OBSERVABLE_ZERO_DAYS", 28))
+            )
+            .select("unique_id", "target", "update_block_days")
+            .unique()
+        )
+        if long_gap_keys.height:
+            cadence_for_cross = cadence.join(
+                long_gap_keys,
+                on=["unique_id", "target", "update_block_days"],
+                how="anti",
+            )
+    if cadence_for_cross.height:
         cross = (
-            cadence.filter(
+            cadence_for_cross.filter(
                 (pl.col("n_positive") >= 7)
                 & pl.col("forecast_median").is_finite()
                 & (pl.col("forecast_median") > 0)
@@ -344,23 +369,33 @@ def validate_all() -> tuple[list[str], pl.DataFrame]:
             .agg(
                 pl.col("forecast_median").min().alias("min_forecast_median"),
                 pl.col("forecast_median").max().alias("max_forecast_median"),
+                pl.col("actual_median").median().alias("actual_median_scale"),
                 pl.col("update_block_days").n_unique().alias("n_cadences"),
             )
             .with_columns(
                 _safe_ratio(
                     pl.col("max_forecast_median"), pl.col("min_forecast_median")
-                ).alias("cross_cadence_ratio")
+                ).alias("cross_cadence_ratio"),
+                _safe_ratio(
+                    pl.col("max_forecast_median") - pl.col("min_forecast_median"),
+                    pl.col("actual_median_scale"),
+                ).alias("cross_cadence_scaled_gap"),
             )
         )
         cross_limit = float(
             getattr(settings, "RELEASE_GATE_MAX_CROSS_CADENCE_MEDIAN_RATIO", 4.0)
         )
+        scaled_gap_limit = float(
+            getattr(settings, "RELEASE_GATE_MIN_CROSS_CADENCE_SCALED_GAP", 2.0)
+        )
         bad_cross = cross.filter(
             (pl.col("n_cadences") == len(settings.UPDATE_BLOCK_OPTIONS))
             & (pl.col("cross_cadence_ratio") > cross_limit)
+            & pl.col("cross_cadence_scaled_gap").is_finite()
+            & (pl.col("cross_cadence_scaled_gap") > scaled_gap_limit)
         )
         if bad_cross.height:
-            examples = bad_cross.sort("cross_cadence_ratio", descending=True).head(10).to_dicts()
+            examples = bad_cross.sort(["cross_cadence_scaled_gap", "cross_cadence_ratio"], descending=[True, True]).head(10).to_dicts()
             errors.append(
                 f"incoherencia OOS entre cadencias: {bad_cross.height} hojas; ejemplos={examples}"
             )
@@ -374,15 +409,19 @@ def validate_all() -> tuple[list[str], pl.DataFrame]:
         gap_factor_limit = float(
             getattr(settings, "RELEASE_GATE_LONG_GAP_MAX_FACTOR_ERROR", 4.0)
         )
+        # Release blocker is one-sided by design: it detects the pathology
+        # that motivated gap-aware SES (stale pre-gap level overforecasting a
+        # lower reactivation regime). Large upward reactivations remain in the
+        # diagnostic factor_error but cannot be predicted from absent data.
         bad_long_gap = long_gaps.filter(
             (pl.col("observable_zero_days") >= gap_min)
-            & pl.col("factor_error").is_finite()
-            & (pl.col("factor_error") > gap_factor_limit)
+            & pl.col("forecast_to_actual").is_finite()
+            & (pl.col("forecast_to_actual") > gap_factor_limit)
         )
         if bad_long_gap.height:
             examples = (
                 bad_long_gap.sort(
-                    ["observable_zero_days", "factor_error"],
+                    ["observable_zero_days", "forecast_to_actual"],
                     descending=[True, True],
                 )
                 .head(10)

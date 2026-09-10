@@ -513,7 +513,7 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
         formula_rows = [
             ("Nivel inicial", "MEDIANA(actual positivo en warm-up inicial de 28 días calendario)."),
             ("Actual desestacionalizado", "exp(log(1+actual) - log(factor_drivers)) - 1, solo actual>0."),
-            ("SES", "El estado usa positivos desestacionalizados y, desde v13.2.11, decae con ceros solo en días observables de la misma Sección+Tienda; días sin evidencia de operación/datos no se imputan."),
+            ("SES", "El estado usa positivos desestacionalizados. Los gaps observables no mutan el estado; v13.2.16 aplica solo un factor de staleness acotado, congelado al origen OOS, y reancla causalmente tras una reactivación observada."),
             ("Aplicación drivers", "factor_drivers = exp(efecto_drivers_RLS)."),
             ("Forecast raw", "max(exp(log(1+nivel_SES) + efecto_drivers_RLS) - 1, 0)."),
             ("wMAPE oficial", "SUM(|forecast-actual| para actual>0) / SUM(|actual| para actual>0)."),

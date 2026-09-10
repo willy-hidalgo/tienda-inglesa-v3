@@ -28,7 +28,7 @@ El warm-up es inicialización del mismo modelo SES+RLS; no una familia estadíst
 
 ### Recurrencia
 
-Después del warm-up, el SES usa toda la historia disponible. Desde v13.2.11, los días sin venta sí hacen avanzar causalmente el estado cuando la misma Sección+Tienda fue observable ese día; días sin evidencia de operación/datos no se convierten en cero. En v13.2.10 la hoja **no usa** la separación intercepto/no-intercepto de los coeficientes RLS, porque esa descomposición puede cambiar mucho bajo colinealidad aunque el forecast agregado del parent sea estable. La transferencia usa una magnitud identificable y centrada:
+Después del warm-up, el SES usa toda la historia disponible. En v13.2.17 los días sin fila SKU no mutan el estado SES. La observabilidad de la Sección+Tienda se usa para medir staleness; al origen OOS se congela un factor acotado de gap que ajusta el forecast sin componer decay entre cadencias. En v13.2.10 la hoja **no usa** la separación intercepto/no-intercepto de los coeficientes RLS, porque esa descomposición puede cambiar mucho bajo colinealidad aunque el forecast agregado del parent sea estable. La transferencia usa una magnitud identificable y centrada:
 
 ```text
 nivel_parent_t = mediana de actuals positivos del parent en los 28 días previos cerrados
@@ -229,7 +229,7 @@ La recomendación se construye solo con bloques cerrados: mejora >=1 pp frente a
 
 La auditoría complementaria de `zero_rate` usa `y<=0` para describir ocurrencia por hoja, weekday, mes y bloque. Es diagnóstica: no altera la definición oficial de wMAPE/BIAS ni introduce una capa de occurrence/share.
 
-## 12. Baseline vigente v13.2.11
+## 12. Baseline candidato vigente v13.2.17
 
 La configuración productiva de parámetros permanece congelada en el baseline v13.1.1:
 
@@ -238,4 +238,4 @@ La configuración productiva de parámetros permanece congelada en el baseline v
 - Valor ($) no incorpora price de forma productiva;
 - no hay exclusiones node-specific productivas.
 
-La corrección v13.2.11 conserva los guards de v13.2.10 y añade SES gap-aware con días cero observables por Sección+Tienda, reactivación causal tras gaps largos y una ventana histórica canónica idéntica entre 1d/7d/14d/28d. Las promociones históricas documentadas en v13.2.0/v13.2.2 permanecen como antecedentes experimentales, no como configuración vigente.
+v13.2.17 conserva la observabilidad de gaps y la ventana histórica canónica. El staleness se calcula causalmente pero se congela al primer origen OOS para toda la corrida OOS/FO; nunca muta el estado SES. Además, el forecast leaf queda limitado por escala positiva histórica robusta y las actualizaciones OOS del estado se mantienen dentro de una envolvente respecto del estado común al origen. Las promociones históricas documentadas en v13.2.0/v13.2.2 permanecen como antecedentes experimentales, no como configuración vigente.

@@ -39,7 +39,7 @@ def test_phase2_cli_is_explicit_and_dashboard_schema_unchanged():
     assert '"--optimization-phase2"' in cli
     assert "args.optimization_diagnostics or args.optimization_phase2" in cli
     dash = (ROOT / "app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert "ARTIFACT_VERSION = 24" in dash
+    assert "ARTIFACT_VERSION = 30" in dash
 
 
 def test_value_metric_support_is_y_positive_not_value_positive():

@@ -95,7 +95,7 @@ La auditoría lee solo una `unique_id` mediante predicate/projection pushdown. N
 
 ## Artefactos
 
-`ARTIFACT_VERSION = 24`.
+`ARTIFACT_VERSION = 25`.
 
 Cada directorio `dashboard/` contiene:
 

@@ -1,4 +1,4 @@
-"""v13.2.11 contracts: OOS is validation/recurrence, never tuning."""
+"""v13.2.17 contracts: OOS is validation/recurrence, never tuning."""
 from pathlib import Path
 import ast
 
@@ -21,7 +21,7 @@ def _settings_assignments():
 
 def test_v13_2_9_keeps_statistical_baseline_frozen():
     s = _settings_assignments()
-    assert s["APP_VERSION"] == "13.2.11"
+    assert s["APP_VERSION"] == "13.2.17"
     assert tuple(s["LEAF_SES_ALPHA_CANDIDATES"]) == (
         0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80
     )
@@ -80,7 +80,7 @@ def test_ses_alpha_is_frozen_by_history_when_oos_errors_reverse_preference_witho
     exec(compile(module, "<ses-kernel>", "exec"), namespace)
     kernel = namespace["_ses_walkforward_kernel"]
 
-    # The exact history-selected alpha may change under the v13.2.11 robust
+    # The exact history-selected alpha may change under the v13.2.17 robust
     # recurrence, but once OOS starts the selection must remain frozen.
     y = np.array([10., 20., 40., 40., 5., 5., 200., 200., 5., 5., 200., 50.])
     value = y * 10.0

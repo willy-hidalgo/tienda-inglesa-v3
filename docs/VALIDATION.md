@@ -55,7 +55,7 @@ uv run python -m app.dashboard_consistency --all-update-blocks
 
 Comprueba:
 
-- `ARTIFACT_VERSION = 24`;
+- `ARTIFACT_VERSION = 25`;
 - fingerprint exacto del forecast;
 - filas/keys consistentes;
 - wMAPE/BIAS bottom-up;

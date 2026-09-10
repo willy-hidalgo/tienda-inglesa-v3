@@ -1,7 +1,7 @@
-# Tienda Inglesa Forecasting — v13.2.11
+# Tienda Inglesa Forecasting — v13.2.17
 
 
-> **v13.2.11 gap-aware stability.** Todas las cadencias comparten la misma historia al origen OOS. El SES leaf consume causalmente los días sin venta únicamente cuando la Sección+Tienda fue observable ese día; los gaps de ingestión/cierre no se convierten en ceros. Las reactivaciones largas quedan trazadas y auditadas por el regression gate. Se conservan el formatter numérico global y los guards de estabilidad de v13.2.10.
+> **v13.2.17 contract-lock + causal OOS recurrence + dormancy 28d + robust OOS level.** Mantiene la historia común al origen OOS y el SES+RLS productivo. Una hoja con >=84 días observables sin venta entra en dormancia de forecast (factor 1e-6, sin mutar el estado SES) hasta que una venta positiva real cierre el bloque; entonces se reancla causalmente para el siguiente origen. Se conserva el formatter global y entran todos los SKU+Tienda.
 
 Herramienta de forecasting jerárquico para **Sección → Tienda → SKU+Tienda**, diseñada para ser causal, explicable, rápida y auditable.
 
@@ -15,7 +15,7 @@ La arquitectura productiva se simplificó deliberadamente:
 2. **Tienda:** RLS expansivo con la misma familia y los mismos drivers.
 3. **SKU+Tienda:** un único modelo **SES + RLS parent**:
    - nivel inicial = mediana robusta de observaciones positivas en el warm-up inicial;
-   - SES recursivo sobre toda la historia disponible: las ventas positivas actualizan magnitud y los días sin venta avanzan el estado como cero solo cuando la Sección+Tienda es observable ese día;
+   - SES recursivo sobre toda la historia disponible: las ventas positivas actualizan magnitud; los días sin venta no mutan el estado SES y solo alimentan la trazabilidad de gap/dormancia cuando la Sección+Tienda es observable;
    - el forecast RLS de **Tienda o Sección** se convierte en movimiento relativo contra un nivel causal reciente del mismo parent y se aplica sobre el nivel SES;
    - el parent se elige causalmente por el menor wMAPE oficial acumulado en bloques cerrados previos.
 4. **In-sample, OOS y forecast-only usan exactamente la misma composición.** Solo cambia la información disponible en cada origen temporal.
@@ -271,7 +271,7 @@ El candidato nace únicamente de bloques históricos cerrados y exige: mejora le
 
 El diagnóstico persiste únicamente agregados leaf×período×candidato, no series diarias alternativas, para conservar memoria. La misma corrida audita `zero_rate` por SKU+Tienda y patrones por weekday/mes/bloque sin afectar la métrica oficial (`y!=0`) ni la selección productiva.
 
-`Phase 5` permanece disponible solo como diagnóstico. La versión productiva candidata actual es `APP_VERSION=13.2.11`; `ARTIFACT_VERSION=24`.
+`Phase 5` permanece disponible solo como diagnóstico. La versión productiva candidata actual es `APP_VERSION=13.2.17`; `ARTIFACT_VERSION=29`.
 
 
 ## Corrección productiva v13.2.10 — estabilidad causal leaf y freeze OOS
