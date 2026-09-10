@@ -500,7 +500,20 @@ class RLSForecastPipeline:
         with _stage_timer(f"{seccion}: agregación OOS (lazy+streaming)"):
             df_oos_all = self._aggregator.aggregate(raw_oos_lf)
             _depth_oos = pl.col("unique_id").str.count_matches(r"\|\|", literal=False)
-            oos_leaves = df_oos_all.filter(_depth_oos == 2)
+            oos_leaves_all = df_oos_all.filter(_depth_oos == 2)
+            # Observabilidad Sección+Tienda usa TODO SKU elegible del OOS, incluso
+            # un SKU nuevo sin historia leaf. Así un día operativo no desaparece
+            # del calendario gap-aware por el semi-join de hojas pronosticables.
+            oos_observable_store_days = (
+                oos_leaves_all.select(
+                    pl.col("unique_id")
+                    .str.replace(r"\|\|S:.*$", "")
+                    .alias("_store_uid"),
+                    pl.col("ds").cast(pl.Date),
+                )
+                .unique()
+            )
+            oos_leaves = oos_leaves_all
             # Solo hojas vistas en train: evita introducir series sin historial.
             if train_leaves.height and oos_leaves.height:
                 leaf_uids = train_leaves.select("unique_id").unique()
@@ -733,6 +746,7 @@ class RLSForecastPipeline:
                 hz,
                 meta=meta,
                 parent_forecasts=parent_forecasts,
+                oos_observable_store_days=oos_observable_store_days,
                 diagnostics_out=(
                     self._optimization_ses_frames
                     if self._optimization_diagnostics

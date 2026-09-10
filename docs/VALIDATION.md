@@ -43,7 +43,9 @@ El validator comprueba:
 - warm-up con efecto RLS neutro;
 - forecast-only no elegible para métricas;
 - identidad algebraica SES + efecto RLS;
-- factor RLS = `exp(driver_effect)`.
+- factor RLS = `exp(driver_effect)`;
+- `driver_effect = clip(log1p(forecast_RLS_parent) - log1p(nivel_parent_causal), log(0.50), log(2.00))` post-warm-up;
+- `driver_factor_y/value` dentro de `[0.50, 2.00]` post-warm-up.
 
 ## Auditoría del dashboard
 
@@ -53,7 +55,7 @@ uv run python -m app.dashboard_consistency --all-update-blocks
 
 Comprueba:
 
-- `ARTIFACT_VERSION = 22`;
+- `ARTIFACT_VERSION = 25`;
 - fingerprint exacto del forecast;
 - filas/keys consistentes;
 - wMAPE/BIAS bottom-up;
@@ -227,3 +229,23 @@ Validar que `leaf_parent_candidates.parquet` contenga únicamente `current_polic
 Un candidato histórico Section/Store requiere >=1 pp de mejora, >=4 folds, >=60% de folds no peores y deterioro de |BIAS| <=1 pp. El OOS no puede crear candidatos. `validated_parent_switch` exige no empeorar wMAPE OOS y deterioro de |BIAS| <=0.5 pp; empeorar wMAPE o deteriorar |BIAS| >1 pp produce `holdout_veto`.
 
 La auditoría `leaf_zero_rate_*` es descriptiva y nunca debe alimentar wMAPE/BIAS oficial, selección de alpha/lambda, selección de parent o forecast-only.
+
+## Gate bloqueante v13.2.11 — estabilidad, gaps y no-regresión end-to-end
+
+`validate_v13` es bloqueante para los cuatro escenarios. Además de la identidad SES+RLS, rechaza cualquier forecast post-warm-up si:
+
+- `driver_factor_y` o `driver_factor_value` sale de `[0.50, 2.00]`;
+- el efecto transferido no coincide con `clip(log1p(forecast_RLS_parent)-log1p(nivel_parent_causal)-centro_causal)`;
+- el forecast raw no puede reconstruirse exactamente desde `SES level + driver_effect + leaf_forecast_cap`;
+- `yhat_raw/valuehat_raw` excede el tope causal persistido cuando ese guard está activo.
+
+
+`dashboard_consistency` debe auditar la misma población que `metrics.parquet`: el panel slim de métricas conserva `rls_metric_eligible`, por lo que warm-ups que alcanzan OOS quedan excluidos de ambos lados de la identidad. `ARTIFACT_VERSION=24` identifica este contrato.
+
+El objetivo de este gate es impedir la reaparición de los defectos observados en el dashboard: colapso/salto sostenido del nivel OOS por importar un offset de nivel del parent, picos aislados y contaminación del holdout que haga divergir las cadencias. La preparación `dashboard-ready-all` no debe declarar `DASHBOARD READY` si cualquiera de los cuatro bloques falla esta auditoría.
+
+
+Además, `python -m app.forecasting.regression_gate --all-update-blocks` es parte obligatoria de `dashboard-ready-all`. Bloquea la release si detecta spikes leaf fuera de escala frente a la historia positiva, incoherencias de órdenes de magnitud entre cadencias o regresiones patológicas en los casos centinela `455436@00154` y `478160@00003`. Este gate no modifica forecasts.
+
+
+El gate v13.2.11 verifica además que las cuatro cadencias compartan la misma ventana in-sample al origen OOS y bloquea reactivaciones positivas tras >=28 días observables sin venta cuando el error forecast/actual supera el factor configurado.

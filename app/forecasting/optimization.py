@@ -400,9 +400,17 @@ def audit_promoted_exclusions(refit_summary: pl.DataFrame) -> pl.DataFrame:
     """
     if refit_summary.height == 0:
         return _empty()
-    cfg = getattr(settings, "RLS_DRIVER_GROUP_EXCLUSIONS", {}) or {}
+    # Reaudit both currently active exclusions and historical promotions that
+    # were later rolled back from production.  The history registry is
+    # governance-only; it must never feed the productive RLS design.
+    cfgs = (
+        getattr(settings, "RLS_DRIVER_GROUP_EXCLUSION_AUDIT_HISTORY", {}) or {},
+        getattr(settings, "RLS_DRIVER_GROUP_EXCLUSIONS", {}) or {},
+    )
     promoted: list[dict] = []
-    if isinstance(cfg, dict):
+    for cfg in cfgs:
+        if not isinstance(cfg, dict):
+            continue
         for uid, targets in cfg.items():
             if not isinstance(targets, dict):
                 continue

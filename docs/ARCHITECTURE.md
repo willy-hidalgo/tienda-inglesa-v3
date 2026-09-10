@@ -11,7 +11,8 @@ Datos históricos
     │                     ├── elegir parent por wMAPE histórico causal
     ├── RLS Tienda ───────┘                 │
     │                                       ▼
-    └── SKU+Tienda ── mediana inicial → SES de magnitud → + efecto RLS parent
+    └── SKU+Tienda ── mediana inicial → SES de magnitud → + efecto RLS relativo
+                                                     (forecast parent / nivel causal + guard)
                                                     │
                                                     ▼
                                   in-sample / OOS / forecast-only
@@ -46,7 +47,7 @@ Modela la magnitud propia de la hoja. El estado inicial es robusto a ceros y pic
 
 ### Parent RLS
 
-Aporta la dinámica agregada. No sustituye el nivel leaf. Se elige entre Tienda y Sección según el wMAPE oficial histórico disponible antes del bloque objetivo.
+Aporta la dinámica agregada. No sustituye el nivel leaf. Se elige entre Tienda y Sección según el wMAPE oficial histórico disponible antes del bloque objetivo. La hoja no transfiere la separación intercepto/no-intercepto de coeficientes. Usa el forecast RLS del parent relativo a la mediana positiva causal del mismo parent en los 28 días cerrados previos y lo acota a un factor `[0.50, 2.00]`. La contribución no-intercepto original se conserva solo como traza de auditoría; una explosión de coeficientes no puede redefinir el nivel SES.
 
 ## Misma familia temporal
 

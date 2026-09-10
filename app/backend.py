@@ -1613,41 +1613,13 @@ def ds_range(df: pl.DataFrame) -> tuple[dt.date | None, dt.date | None]:
 
 
 def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Formatea columnas numéricas para la UI:
-      12345.2 → "12,345"  (entero con separador de miles)
-    El resto de columnas se deja igual.
-    """
-    if df.height == 0:
-        return df
-    num_cols = [
-        c
-        for c in (
-            "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
-            "driver_effect", "driver_effect_value", "abs_error",
-        )
-        if c in df.columns
-    ]
-    if not num_cols:
-        return df
+    """Conserva los dtypes numéricos del detalle para la UI.
 
-    def _fmt(v: float | None) -> str:
-        if v is None:
-            return ""
-        try:
-            if v != v:  # NaN
-                return ""
-            return f"{round(float(v)):,}"
-        except (TypeError, ValueError):
-            return ""
-
-    exprs = [
-        pl.col(c)
-        .map_elements(_fmt, return_dtype=pl.Utf8)
-        .alias(c)
-        for c in num_cols
-    ]
-    return df.with_columns(exprs)
+    El formato visual (incluido separador de miles) se aplica de forma central
+    en ``app.dashboard._dashboard_dataframe``. Convertir números a texto aquí
+    impediría que el contrato global de formato se aplique de manera uniforme.
+    """
+    return df
 
 
 def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:

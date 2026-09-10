@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 22
+ARTIFACT_VERSION = 30
 
 SERIES_COLS_PREFERRED = [
     "unique_id", "ds", "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
@@ -58,6 +58,10 @@ SERIES_COLS_PREFERRED = [
     # v13 coherent leaf traceability.
     "initial_level_y", "initial_level_value", "warmup_positive_days", "leaf_start", "leaf_warmup_end",
     "ses_level_y", "ses_level_value", "ses_alpha_y", "ses_alpha_value",
+    "leaf_forecast_cap_y", "leaf_forecast_cap_value",
+    "leaf_observable_day_index",
+    "leaf_gap_observable_days_y", "leaf_gap_observable_days_value",
+    "leaf_gap_decay_factor_y", "leaf_gap_decay_factor_value",
     "driver_effect", "driver_effect_value", "driver_factor_y", "driver_factor_value",
     "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
     "parent_driver_mode_y", "parent_driver_mode_value",
@@ -68,7 +72,7 @@ SERIES_COLS_PREFERRED = [
 
 
 # Columnas mínimas para WMAPE (reduce picos de memoria al preparar unidades)
-_WMAPE_COLS = ("unique_id", "ds", "y", "yhat", "period_type", "value", "valuehat", "valuehat28")
+_WMAPE_COLS = ("unique_id", "ds", "y", "yhat", "period_type", "value", "valuehat", "valuehat28", "rls_metric_eligible")
 
 
 def _rss_mb() -> float:

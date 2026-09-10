@@ -1,3 +1,119 @@
+## 13.2.17 — contract lock + causal OOS recurrence
+
+- Revierte el fixed-origin global introducido en 13.2.16: OOS sigue siendo holdout para selección/tuning, pero un bloque OOS cerrado puede actualizar el estado SES/RLS para el siguiente origen de la misma cadencia, como exige el contrato expanding/walk-forward.
+- Conserva separación estricta de bloques en fronteras in-sample/OOS/forecast-only y el ancla robusta causal del primer origen OOS.
+- Restaura la envolvente SES OOS 0.75x–1.25x para permitir recurrencia acotada sin congelar el estado.
+- Añade `app.forecasting.contract_gate`, preflight rápido que bloquea cambios de arquitectura, parámetros productivos, semántica OOS, selección de SKU y formatter global antes de lanzar forecasts costosos.
+- Añade `test_v13_contract_lock.py` con invariantes productivos no negociables.
+- ARTIFACT_VERSION=30.
+
+# Changelog
+
+## 13.2.17 — OOS fixed-origin + dormancia 28d + ancla robusta
+
+- El OOS de 28 días pasa a ser un holdout de origen fijo: ningún bloque puede mezclar in-sample y OOS; los coeficientes RLS y la historia AR usados dentro de OOS quedan anclados al último día in-sample.
+- El SES leaf usa durante todo OOS el mismo snapshot de nivel al origen; los actuals OOS solo pueden alimentar el estado operativo posterior/forecast-only, nunca el propio holdout.
+- Dormancia causal desde 28 días observables sin venta, con factor epsilon `1e-12`, para impedir sobreforecast pre-reactivación en gaps que ya forman parte del gate oficial.
+- Al origen OOS se limita solo hacia arriba el nivel SES usando la mediana de las últimas 28 magnitudes positivas desestacionalizadas (mínimo 7 puntos; máximo 1.5x mediana), evitando que picos recientes dejen un baseline inflado.
+- Los bloques leaf/parent quedan alineados explícitamente a las fronteras in-sample/OOS/forecast-only.
+- No cambia la fórmula oficial de wMAPE/BIAS, los alphas/lambdas productivos, drivers ni parent policy.
+- `ARTIFACT_VERSION=29`.
+
+## 13.2.15 — dormancy causal + separación de gates de reactivación
+
+- Mantiene el SES+RLS productivo y la historia común al origen OOS; no cambia wMAPE/BIAS, alphas, lambdas, drivers ni parent policy.
+- Para hojas con >=84 días observables sin venta, aplica un factor de dormancia `1e-6` al forecast mientras no exista una reactivación positiva cerrada. El estado SES no se muta por ausencia de filas.
+- La primera venta positiva tras un gap largo reancla causalmente el SES y libera el factor de dormancia solo para el bloque siguiente; nunca altera el forecast ya emitido.
+- Reduce la envolvente del estado SES OOS desde 0.50x–1.50x a 0.75x–1.25x del estado común al origen para limitar drift dependiente de cadencia.
+- El gate cross-cadence excluye hojas/cadencias con reactivación long-gap OOS porque su diferencia de reacción 1d/7d/14d/28d es esperada por diseño; esas hojas quedan gobernadas por el gate específico de reactivación.
+- Mantiene todos los SKU+Tienda de Secciones 1 y 23 y el formatter global de tablas.
+- `ARTIFACT_VERSION=28`.
+
+## 13.2.14
+
+- Mantiene los gaps como trazabilidad diagnóstica: no vuelve a introducir decay productivo por ausencia de filas SKU/día.
+- Añade cap causal de forecast por escala media positiva cerrada: mínimo entre 2x máximo histórico y 4x media positiva; tras gap largo, 2x media positiva.
+- Añade una envolvente de estado SES durante OOS respecto del estado común al origen (0.50x–1.50x), evitando composición de drift dependiente de la cadencia.
+- Mantiene alpha, parent, lambda/dynamics congelados al origen OOS; OOS solo actualiza estado dentro de esa envolvente.
+- No modifica la fórmula oficial de wMAPE/BIAS, drivers productivos ni la arquitectura RLS+SES.
+- ARTIFACT_VERSION=27.
+
+## 13.2.13
+- Reverts productive observable-zero gap decay introduced in 13.2.11/13.2.12; gap lengths remain diagnostic only.
+- Long-gap reactivation causally re-anchors the stale SES state only after the first positive observation closes, affecting subsequent blocks only.
+- Cross-cadence release gate is scale-aware: a large raw ratio must also imply a material gap relative to the OOS actual median.
+- Spike gate evaluates OOS forecast maxima while retaining historical observed scale.
+- Artifact version 26. No alpha/lambda/driver/parent promotion.
+
+## 13.2.12 — gap staleness acotado + guard scale-aware temprano
+
+- Reemplaza el decay SES acumulativo de v13.2.11 por un ajuste de staleness calculado al origen del bloque desde el último positivo cerrado. El estado SES base no se multiplica repetidamente por ceros observables entre bloques.
+- El factor gap queda estrictamente en `(0, 1]`, con `LEAF_GAP_DECAY_MIN_FACTOR=0.25`, horizonte máximo de 56 días observables y alpha efectivo mínimo 0.025. Esto evita underflow a cero y diferencias explosivas 1d/7d/14d/28d.
+- El guard de magnitud leaf se activa desde el nivel robusto de warm-up, incluso antes de acumular 7 positivos cerrados, eliminando floors absolutos implícitos en series de escala muy pequeña.
+- El gate de reactivaciones largas bloquea específicamente la patología relevante: **sobreforecast** del nivel stale respecto a la primera venta positiva posterior al gap. Los saltos alcistas impredecibles permanecen diagnosticados pero no bloquean por sí solos la release.
+- `ARTIFACT_VERSION=25`. No cambia wMAPE oficial, arquitectura RLS+SES, drivers, lambdas, alphas productivos ni política de parent.
+
+## 13.2.11 — SES gap-aware + historia canónica entre cadencias
+
+- Corrige series SKU+Tienda con largos periodos sin venta: una ausencia leaf cuenta como cero solo cuando la misma Sección+Tienda es observable ese día mediante ventas positivas de otros SKU elegibles. No se imputan ceros en días sin evidencia de operación/datos.
+- El estado SES avanza causalmente por esos ceros observables sin densificar decenas de millones de filas leaf: `level *= (1-alpha)^gap`. El wMAPE/BIAS oficial sigue usando exclusivamente `y!=0`.
+- La primera venta tras >=28 días observables sin venta se trata como reactivación: después de cerrar el bloque actualiza el mismo SES estándar sin el clip anti-spike relativo a un estado ya decaído casi a cero.
+- Se trazan `leaf_observable_day_index`, `leaf_gap_observable_days_y/value` y `leaf_gap_decay_factor_y/value` en `forecast.parquet` y en la auditoría leaf del dashboard.
+- Las cadencias 1d/7d/14d/28d usan ahora exactamente la misma ventana histórica al origen OOS: la mayor ventana completa múltiplo de 28 días. La cadencia cambia cuándo se actualiza el estado, no qué días de historia entran al modelo.
+- `regression_gate` incorpora dos controles bloqueantes: identidad de la ventana histórica entre cadencias y reactivaciones OOS patológicas tras gaps largos.
+- Se mantienen todos los SKU+Tienda de Secciones 1 y 23, el formatter numérico global del dashboard y la configuración estadística productiva congelada (sin promociones de alpha/lambda/drivers/parent).
+- `ARTIFACT_VERSION` sube a `24` por las nuevas trazas gap-aware visibles en los artefactos del dashboard.
+
+## 13.2.10 — Hotfix dashboard: formato numérico global
+
+- Todas las tablas de Streamlit pasan ahora por un único wrapper `_dashboard_dataframe`.
+- Todo campo numérico no porcentual usa coma como separador de miles (`%,d` para enteros, `%,.2f` para decimales).
+- Las columnas porcentuales mantienen su formato `%` y los identificadores (Tienda, SKU, Sección, códigos, `unique_id`) se fuerzan como texto.
+- `format_detail_display` deja de convertir números a strings: conserva dtypes numéricos y delega el formato visual al wrapper global.
+- Se añade un test contractual que falla si aparece un `st.dataframe` fuera del wrapper o si se pierde el formato de miles.
+- No cambia forecast, métricas, `APP_VERSION` ni `ARTIFACT_VERSION`; los artefactos v13.2.10 actuales siguen siendo válidos.
+
+## 13.2.10 — Frozen OOS selection + robust causal SES state + leaf magnitude guard
+
+- Corrige la selección de entrada: se elimina definitivamente `select_best_skus`, el modo demo y cualquier whitelist/top-N de SKU. `selected.parquet` contiene todo SKU+Tienda elegible de las secciones 1 y 23 (dentro de los locales configurados y ventas válidas), sin muestreo posterior al join master+ventas.
+- Mantiene congelados los parámetros estadísticos productivos del baseline v13.1.1: misma grilla SES, mismas lambdas RLS, sin promociones productivas de drivers ni switches de parent.
+- Hace explícito el snapshot de selección al origen OOS: `alpha` SES, parent Section/Store y configuración RLS `dynamics/lambda` quedan congelados al entrar al holdout. Los actuals OOS solo pueden avanzar el estado recursivo después de cerrar un bloque.
+- Robustifica la actualización SES sin cambiar de familia: cada observación positiva desestacionalizada se limita causalmente a `[0.50x, 2.00x]` del estado inmediatamente anterior antes de aplicar el alpha seleccionado. Un pico aislado ya no puede resetear el nivel leaf; un cambio sostenido sigue propagándose por eventos sucesivos.
+- Añade un guard causal de magnitud final: después de al menos 7 positivos cerrados, el forecast leaf no puede exceder `2.0x` el máximo positivo observado antes del bloque. Se persisten `leaf_forecast_cap_y` / `leaf_forecast_cap_value` y `validate_v13` reconstruye la identidad productiva incluyendo ese guard.
+- Corrige la causa del falso/real mismatch de `dashboard_consistency`: `_WMAPE_COLS` conserva ahora `rls_metric_eligible`, de modo que `metrics.parquet` y la recomputación desde `forecast.parquet` usan exactamente la misma población elegible, incluidas hojas cuyo warm-up alcanza OOS. La comparación numérica de la muestra es además determinista y con tolerancia relativa estricta.
+- `ARTIFACT_VERSION` sube a `23` porque los artefactos de dashboard incorporan las trazas del guard y la métrica elegible corregida.
+- No se promueve ningún alpha/lambda/driver/parent de Phase 2. El `regression_gate` 1d/7d/14d/28d sigue siendo bloqueante y debe quedar `OK` antes de retomar optimización estadística.
+
+## 13.2.9 — Holdout-pure selection + centered identifiable parent transfer
+
+- Mantiene congelados los parámetros productivos del baseline v13.1.1: misma grilla SES, mismas lambdas RLS y sin promociones productivas de price/exclusiones.
+- Corrige una contaminación del holdout detectada por el regression gate: los errores OOS ya no pueden cambiar la selección productiva de `alpha`, `dynamics/lambda` ni parent `Section/Store`. OOS puede actualizar el estado recursivo para el siguiente origen de la misma cadencia, pero nunca participa en tuning.
+- Conserva la transferencia identificable de v13.2.8 (`log1p(forecast RLS parent) - log1p(nivel causal parent)`) y añade un centrado causal del offset persistente del bloque. Si un bloque completo cambia de escala >1.5x frente a la referencia cerrada, ese offset se trata como nivel/calibración del parent —propiedad del SES— y no como driver leaf.
+- Añade trazas `driver_effect_center` / `driver_effect_value_center` y actualiza `validate_v13` para auditar exactamente `effect = clip(raw - reference - center)`.
+- La variación diaria dentro del bloque se conserva; no se agrega ningún modelo ni driver nuevo y `gamma=1` sigue siendo la identidad productiva.
+- El regression gate 1d/7d/14d/28d sigue siendo bloqueante; esta versión debe superar el gate antes de cualquier promoción estadística adicional.
+
+## 13.2.8 — Identifiable parent-RLS transfer + blocking regression gate
+
+- Mantiene congelados alpha/lambda/drivers productivos del baseline v13.1.1.
+- Sustituye la transferencia leaf basada en el término RLS no-intercepto por una magnitud identificable: `log1p(forecast_parent_RLS) - log1p(nivel_parent_causal)`.
+- `nivel_parent_causal` usa la mediana positiva de los 28 días cerrados previos al origen del bloque; no usa actuals del bloque objetivo.
+- Conserva la descomposición no-intercepto original únicamente en `driver_effect_coef_raw` / `driver_effect_value_coef_raw` para auditoría.
+- Reduce el guard del factor RLS leaf a `[0.50, 2.00]`; una descomposición de coeficientes explosiva ya no puede generar picos de 100x/1000x en 1d.
+- Añade `app.forecasting.regression_gate`: spikes fuera de escala, coherencia OOS entre 1d/7d/14d/28d y casos centinela `455436@00154` / `478160@00003`.
+- `dashboard-ready-all` no declara el dashboard listo si falla ese gate.
+- No agrega modelos ni drivers nuevos; la composición sigue siendo SES leaf + RLS Sección/Tienda.
+
+## 13.2.7 — Emergency RLS→leaf transfer correction
+
+- Mantiene congelados alpha/lambda/drivers productivos del baseline v13.1.1.
+- Corrige la transferencia del `driver_effect` RLS a SKU+Tienda: el efecto bruto se centra causalmente contra una referencia reciente de 28 días antes de modificar el nivel SES.
+- Agrega guard productivo explícito `driver_factor ∈ [0.50, 2.50]`, evitando colapsos de nivel y explosiones puntuales como las observadas en 28d/1d.
+- `forecast.parquet` conserva `driver_effect_raw` y `driver_effect_reference` para reconstrucción/auditoría.
+- `validate_v13` bloquea outputs que violen el guard o la identidad `effect = clip(raw-reference)`.
+- Dashboard/main continúan soportando 1d/7d/14d/28d mediante `dashboard-ready-all`.
+- No se incorpora ningún modelo nuevo ni driver nuevo; la composición sigue siendo SES leaf + RLS Sección/Tienda.
+
 ## 13.2.6 — Emergency statistical rollback / regression freeze
 
 - Restores the **productive statistical configuration of v13.1.1** after end-to-end regressions were observed in later v13.2 promotions (notably abnormal 1d OOS spikes and depressed 28d leaf levels).

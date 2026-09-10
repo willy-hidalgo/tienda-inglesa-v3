@@ -328,8 +328,11 @@ def test_format_detail_display():
         }
     )
     out = backend.format_detail_display(df)
-    assert out["y"][0] == "12,345"
-    assert out["yhat"][0] == "1,001"
-    assert out["value"][0] == "999,999"
-    assert out["valuehat"][0] == "0"
-    assert out["abs_error"][0] == "235"
+    # El backend conserva números; la coma de miles es responsabilidad del
+    # formatter global de Streamlit, no de una conversión irreversible a texto.
+    assert out["y"][0] == 12345.2
+    assert out["yhat"][0] == 1000.9
+    assert out["value"][0] == 999999.4
+    assert out["valuehat"][0] == 0.4
+    assert out["abs_error"][0] == 234.6
+    assert out.schema["y"] == pl.Float64

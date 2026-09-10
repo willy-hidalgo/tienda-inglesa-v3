@@ -6,10 +6,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_main_exposes_one_click_dashboard_ready_all():
     text = (ROOT / "app/main.py").read_text(encoding="utf-8")
-    assert "PREPARAR DASHBOARD COMPLETO · 1d/7d/14d/28d + auditorías" in text
+    assert "PREPARAR DASHBOARD COMPLETO · 1d/7d/14d/28d + auditorías + gate" in text
     assert '"dashboard-ready-all": "15"' in text
     assert '"prepare-dashboard-all": "15"' in text
-    assert "range(1, 16)" in text
+    assert "range(1, 17)" in text
 
 
 def test_dashboard_ready_pipeline_is_non_optimization_and_validates_everything():
@@ -19,6 +19,7 @@ def test_dashboard_ready_pipeline_is_non_optimization_and_validates_everything()
     assert '"app.dashboard_artifacts"' in text
     assert '"app.forecasting.validate_v13"' in text
     assert '"app.dashboard_consistency"' in text
+    assert '"app.forecasting.regression_gate"' in text
     assert "--optimization-phase2" not in text
     assert "--optimization-diagnostics" not in text
     assert "DASHBOARD READY" in text

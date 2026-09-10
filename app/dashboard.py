@@ -55,14 +55,95 @@ _RANK_HEIGHT = 35 + 5 * 35  # ~5 filas visibles
 _SENTINEL_TIENDA = "— Todas las tiendas —"
 _SENTINEL_SKU = "— Todos los SKU —"
 
+# Contrato global de presentación numérica del dashboard:
+# - todo número NO porcentual usa coma como separador de miles;
+# - porcentajes conservan su formato porcentual explícito;
+# - códigos/identificadores se muestran como texto y nunca pierden ceros a la izquierda.
+_IDENTIFIER_COLUMNS = {
+    "codigo", "código", "tienda", "store", "store_id", "sku", "sku_id",
+    "seccion", "sección", "unique_id", "unidad", "cohort", "estado", "sel.",
+}
+
+
+def _normalized_column_name(name: str) -> str:
+    return str(name).strip().casefold()
+
+
+def _is_identifier_column(name: str) -> bool:
+    return _normalized_column_name(name) in _IDENTIFIER_COLUMNS
+
+
+def _is_percentage_column(name: str) -> bool:
+    # El dashboard expresa las columnas porcentuales en puntos porcentuales y
+    # las identifica explícitamente con "%" en el encabezado. No inferir
+    # porcentajes desde nombres genéricos para evitar reinterpretar ratios/factores.
+    return "%" in str(name)
+
+
+def _numeric_format_for_dtype(dtype: object) -> str | None:
+    """Devuelve el formato Streamlit con separador de miles para dtypes numéricos."""
+    dtype_name = str(dtype)
+    if dtype_name.startswith(("Int", "UInt")):
+        return "%,d"
+    if dtype_name.startswith(("Float", "Decimal")):
+        return "%,.2f"
+    return None
+
+
+def _dashboard_column_config(
+    data: object,
+    explicit: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Construye la configuración GLOBAL de columnas para cualquier tabla.
+
+    Las configuraciones explícitas (por ejemplo anchos o precisión especial de
+    porcentajes) prevalecen, pero toda columna numérica no porcentual que no
+    tenga override recibe automáticamente `%,d` o `%,.2f`.
+    """
+    explicit = dict(explicit or {})
+    try:
+        schema = data.schema if isinstance(data, pl.DataFrame) else pl.DataFrame(data).schema
+    except Exception:
+        schema = {}
+
+    config: dict[str, object] = {}
+    for name, dtype in schema.items():
+        if name in explicit:
+            continue
+        if _is_identifier_column(name):
+            config[name] = st.column_config.TextColumn(name)
+            continue
+        numeric_format = _numeric_format_for_dtype(dtype)
+        if numeric_format is None:
+            continue
+        if _is_percentage_column(name):
+            config[name] = st.column_config.NumberColumn(name, format="%.2f%%")
+        else:
+            config[name] = st.column_config.NumberColumn(name, format=numeric_format)
+
+    config.update(explicit)
+    return config
+
+
+def _dashboard_dataframe(
+    data: object,
+    *,
+    column_config: dict[str, object] | None = None,
+    **kwargs: object,
+):
+    """Único punto de entrada para tablas del dashboard.
+
+    Esto evita que una tabla nueva omita accidentalmente el separador de miles.
+    """
+    return st.dataframe(
+        data,
+        column_config=_dashboard_column_config(data, column_config),
+        **kwargs,
+    )
+
 
 def _ranking_styler(df: pl.DataFrame, *, yellow: bool = False) -> pl.DataFrame:
-    """Return Polars directly; Streamlit applies display formats via column_config.
-
-    Keeping the grid in Polars preserves a single tabular engine and keeps the
-    dashboard aligned with the project architecture. ``yellow`` is
-    retained only for call-site compatibility; it does not alter the data.
-    """
+    """Return Polars directly; display formatting is centralized globally."""
     return df
 
 def _ranking_excel_bytes(df: pl.DataFrame) -> bytes:
@@ -119,7 +200,16 @@ def _load_leaf_audit_source(mtime_key: float, forecast_path: str, unique_id: str
         "y", "yhat", "value", "valuehat", "yhat_raw", "valuehat_raw",
         "initial_level_y", "initial_level_value", "warmup_positive_days", "leaf_start", "leaf_warmup_end",
         "ses_level_y", "ses_level_value", "ses_alpha_y", "ses_alpha_value",
+        "leaf_observable_day_index",
+        "leaf_gap_observable_days_y", "leaf_gap_observable_days_value",
+        "leaf_gap_decay_factor_y", "leaf_gap_decay_factor_value",
         "driver_effect", "driver_effect_value", "driver_factor_y", "driver_factor_value",
+        "driver_effect_raw", "driver_effect_value_raw",
+        "driver_effect_reference", "driver_effect_value_reference",
+        "driver_effect_center", "driver_effect_value_center",
+        "driver_effect_coef_raw", "driver_effect_value_coef_raw",
+        "driver_parent_rls_forecast_y", "driver_parent_rls_forecast_value",
+        "driver_reference_level_y", "driver_reference_level_value",
         "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
         "parent_driver_mode_y", "parent_driver_mode_value",
         "leaf_level_method_y", "leaf_level_method_value", "modelo_seleccionado",
@@ -158,7 +248,26 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
     level_col = "ses_level_value" if is_value else "ses_level_y"
     alpha_col = "ses_alpha_value" if is_value else "ses_alpha_y"
     effect_col = "driver_effect_value" if is_value else "driver_effect"
+    raw_effect_col = "driver_effect_value_raw" if is_value else "driver_effect_raw"
+    ref_effect_col = (
+        "driver_effect_value_reference" if is_value else "driver_effect_reference"
+    )
+    center_effect_col = (
+        "driver_effect_value_center" if is_value else "driver_effect_center"
+    )
+    coef_effect_col = (
+        "driver_effect_value_coef_raw" if is_value else "driver_effect_coef_raw"
+    )
+    parent_rls_forecast_col = (
+        "driver_parent_rls_forecast_value" if is_value else "driver_parent_rls_forecast_y"
+    )
+    parent_reference_level_col = (
+        "driver_reference_level_value" if is_value else "driver_reference_level_y"
+    )
     factor_col = "driver_factor_value" if is_value else "driver_factor_y"
+    cap_col = "leaf_forecast_cap_value" if is_value else "leaf_forecast_cap_y"
+    gap_days_col = "leaf_gap_observable_days_value" if is_value else "leaf_gap_observable_days_y"
+    gap_decay_col = "leaf_gap_decay_factor_value" if is_value else "leaf_gap_decay_factor_y"
     parent_col = "parent_model_value" if is_value else "parent_model_y"
     parent_wmape_col = "parent_wmape_value" if is_value else "parent_wmape_y"
     driver_mode_col = "parent_driver_mode_value" if is_value else "parent_driver_mode_y"
@@ -198,6 +307,17 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
     actual = pl.col(actual_col).cast(pl.Float64).fill_null(0.0)
     forecast = pl.col(forecast_col).cast(pl.Float64).fill_null(0.0)
     eligible = actual > 0
+    forecast_uncapped = (((ses_level + 1.0).log() + driver_effect).exp() - 1.0).clip(lower_bound=0.0)
+    cap_expr = (
+        pl.col(cap_col).cast(pl.Float64).fill_null(0.0)
+        if cap_col in work.columns
+        else pl.lit(0.0)
+    )
+    forecast_rebuilt = (
+        pl.when(cap_expr > 0.0)
+        .then(pl.min_horizontal(forecast_uncapped, cap_expr))
+        .otherwise(forecast_uncapped)
+    )
 
     daily = work.with_columns(
         pl.col("ds").dt.strftime("%A").alias("weekday") if "ds" in work.columns else pl.lit(None).alias("weekday"),
@@ -213,7 +333,9 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
         pl.when(eligible).then(actual.abs()).otherwise(0.0).alias("wmape_denominator"),
         pl.when(eligible).then(forecast - actual).otherwise(0.0).alias("bias_numerator"),
         pl.when(eligible).then(actual.abs()).otherwise(0.0).alias("bias_denominator"),
-        (((ses_level + 1.0).log() + driver_effect).exp() - 1.0).clip(lower_bound=0.0).alias("forecast_rebuilt_raw"),
+        forecast_uncapped.alias("forecast_rebuilt_uncapped_raw"),
+        cap_expr.alias("leaf_forecast_cap"),
+        forecast_rebuilt.alias("forecast_rebuilt_raw"),
     ).with_columns(
         pl.when(pl.col("_deseason_log").is_not_null())
           .then(pl.col("_deseason_log").exp() - 1.0)
@@ -253,8 +375,9 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
     )
 
     # Explicit, review-friendly column order. Driver values are shown as date
-    # calendar context + leaf EDP; the applied model contribution is the parent
-    # RLS total non-intercept effect/factor stored by production.
+    # calendar context + leaf EDP. The productive leaf movement is the selected
+    # parent RLS forecast relative to its causal recent level; the original
+    # non-intercept coefficient contribution is audit-only.
     ordered_exprs: list[pl.Expr] = []
     def add(src: str, alias: str | None = None):
         if src in daily.columns:
@@ -276,11 +399,22 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
     add(level_col, "Nivel SES antes de drivers")
     add("actual_deseasonalized", "Actual desestacionalizado")
     add(alpha_col, "Alpha SES")
+    add("leaf_observable_day_index", "Índice día observable tienda")
+    add(gap_days_col, "Días observables sin venta al origen")
+    add(gap_decay_col, "Factor decay gap aplicado al origen")
     add(parent_col, "Parent RLS seleccionado")
     add(parent_wmape_col, "wMAPE histórico parent")
     add(driver_mode_col, "Modo aplicación drivers")
+    add(coef_effect_col, "Contribución no-intercepto RLS (audit-only)")
+    add(parent_rls_forecast_col, "Forecast RLS parent")
+    add(parent_reference_level_col, "Nivel causal parent")
+    add(raw_effect_col, "log1p(Forecast RLS parent)")
+    add(ref_effect_col, "log1p(Nivel causal parent)")
+    add(center_effect_col, "Centrado causal offset parent (log)")
     add(effect_col, "Efecto conjunto drivers (log)")
     add(factor_col, "Factor conjunto drivers")
+    add("forecast_rebuilt_uncapped_raw", "Forecast reconstruido antes de guard")
+    add("leaf_forecast_cap", "Tope causal forecast leaf")
     add("forecast_rebuilt_raw", "Forecast reconstruido raw")
     add(raw_fc_col, "Forecast raw almacenado")
     add(forecast_col, "Forecast final")
@@ -379,7 +513,7 @@ def _leaf_audit_excel_bytes(df: pl.DataFrame, *, unidad: str, label: str) -> byt
         formula_rows = [
             ("Nivel inicial", "MEDIANA(actual positivo en warm-up inicial de 28 días calendario)."),
             ("Actual desestacionalizado", "exp(log(1+actual) - log(factor_drivers)) - 1, solo actual>0."),
-            ("SES", "El estado se actualiza causalmente solo con actual positivo desestacionalizado; y=0 mantiene el nivel."),
+            ("SES", "El estado usa positivos desestacionalizados. Los gaps observables no mutan el estado; v13.2.16 aplica solo un factor de staleness acotado, congelado al origen OOS, y reancla causalmente tras una reactivación observada."),
             ("Aplicación drivers", "factor_drivers = exp(efecto_drivers_RLS)."),
             ("Forecast raw", "max(exp(log(1+nivel_SES) + efecto_drivers_RLS) - 1, 0)."),
             ("wMAPE oficial", "SUM(|forecast-actual| para actual>0) / SUM(|actual| para actual>0)."),
@@ -1080,7 +1214,7 @@ if use_fast and len(scenario_paths) >= 2:
         _cadence_rows = _cached_cadence_summary(_paths_key, view.seccion, view.unidad)
         if _cadence_rows:
             st.caption(f"Sección {view.seccion} · {view.unidad} · OOS 28 días")
-            st.dataframe(
+            _dashboard_dataframe(
                 _cadence_rows,
                 hide_index=True,
                 width="content",
@@ -1144,7 +1278,7 @@ def _show_ranking(display, key: str, pending_key: str, extract_field: str) -> No
         c for c in display.columns if c not in preferred and c != "unique_id" and c not in hidden
     ]
     _rank_view = display.select(visible)
-    event = st.dataframe(
+    event = _dashboard_dataframe(
         _ranking_styler(_rank_view),
         width="stretch",
         hide_index=True,
@@ -1228,7 +1362,7 @@ with col_g:
             if c != "unique_id" and (_show_acid_metrics or c not in _acid_cols)
         ]
         _global_table_view = _global_rank_display.select(_global_cols)
-        _global_event = st.dataframe(
+        _global_event = _dashboard_dataframe(
             _ranking_styler(_global_table_view, yellow=False),
             width="stretch",
             hide_index=True,
@@ -1558,7 +1692,7 @@ if use_fast:
         ) if _global_rank_all.height else pl.DataFrame()
         if _na.height:
             _na_visible = [c for c in ["Código", "Descripción", "wMAPE (%)", "BIAS (%)", "Pronóstico OOS", "Cohort", "Días con venta", "% ≠0", "unique_id"] if c in _na.columns]
-            _na_event = st.dataframe(
+            _na_event = _dashboard_dataframe(
                 _ranking_styler(_na.select([c for c in _na_visible if c != "unique_id"])),
                 width="stretch", height=250, hide_index=True,
                 on_select="rerun", selection_mode="single-row", key=f"nonactive_table_{view.seccion}_{view.unidad}",
@@ -1629,7 +1763,7 @@ if use_fast:
 
 with st.expander("Ver datos detallados"):
     st.caption(f"Agregación **{view.freq}** · Unidad **{view.unidad}**")
-    st.dataframe(
+    _dashboard_dataframe(
         _ranking_styler(view.detail),
         width="stretch",
         hide_index=True,

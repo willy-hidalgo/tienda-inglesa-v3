@@ -4,9 +4,14 @@ from __future__ import annotations
 import datetime as dt
 import math
 
+import numpy as np
 import polars as pl
 
-from app.forecasting.leaf_ses_rls import _positive_median_levels, build_leaf_forecasts
+from app.forecasting.leaf_ses_rls import (
+    _positive_median_levels,
+    _relative_parent_forecast_effect_path,
+    build_leaf_forecasts,
+)
 
 
 def _leaf_rows(start: dt.date, n: int, *, uid: str = "1||T:00154||S:455436") -> pl.DataFrame:
@@ -114,8 +119,8 @@ def test_same_ses_rls_family_generates_insample_oos_and_forecast_only():
     assert float(max_diff or 0.0) < 1e-8
 
 
-def test_negative_parent_effect_respects_nonnegative_raw_identity():
-    """La identidad auditada incluye el piso físico 0 antes del redondeo."""
+def test_nonidentifiable_coefficient_offset_does_not_drive_leaf_transfer():
+    """A huge coefficient split must not matter when parent RLS forecast is stable."""
     start = dt.date(2024, 1, 1)
     train = _leaf_rows(start, 84)
     test_start = start + dt.timedelta(days=84)
@@ -124,11 +129,14 @@ def test_negative_parent_effect_respects_nonnegative_raw_identity():
     fc_end = fc_start + dt.timedelta(days=27)
     oos = _leaf_rows(test_start, 28)
 
-    # Un efecto muy negativo hace que la transformación algebraica sin piso
-    # sea negativa para niveles leaf pequeños. Producción debe almacenar 0.
     parents = _parent_rows(start, fc_end).with_columns(
-        pl.lit(math.log(0.01)).alias("driver_effect"),
-        pl.lit(math.log(0.01)).alias("driver_effect_value"),
+        # Parent forecast equals its observed level, while the raw coefficient
+        # decomposition is deliberately absurd. Productive leaf transfer must
+        # use the forecast/causal-level ratio, not this coefficient split.
+        pl.col("y").alias("yhat"),
+        pl.col("value").alias("valuehat"),
+        pl.lit(math.log(0.000001)).alias("driver_effect"),
+        pl.lit(math.log(1000000.0)).alias("driver_effect_value"),
         pl.when(pl.col("ds") >= fc_start).then(pl.lit("forecast_only"))
         .when(pl.col("ds") >= test_start).then(pl.lit("out_sample"))
         .otherwise(pl.lit("in_sample")).alias("period_type"),
@@ -147,16 +155,33 @@ def test_negative_parent_effect_respects_nonnegative_raw_identity():
         section_id="1", horizons=hz,
     )
     post = out.filter(pl.col("ds") > pl.col("leaf_warmup_end"))
-    assert post.filter(pl.col("yhat_raw") == 0.0).height > 0
-    ident = (
-        (pl.col("ses_level_y").clip(lower_bound=0.0).log1p() + pl.col("driver_effect"))
-        .exp()
-        .sub(1.0)
-        .clip(lower_bound=0.0)
-    )
-    max_diff = post.select((pl.col("yhat_raw") - ident).abs().max()).item()
-    assert float(max_diff or 0.0) < 1e-8
+    assert post.select(pl.col("driver_effect_coef_raw").abs().max()).item() > 5.0
+    assert post.select(pl.col("driver_effect_value_coef_raw").abs().max()).item() > 5.0
+    # Parent RLS forecast matches causal parent level => transferred movement ~1x.
+    assert post.select(pl.col("driver_effect").abs().max()).item() < 1e-10
+    assert post.select(pl.col("driver_effect_value").abs().max()).item() < 1e-10
 
+
+def test_driver_transfer_guard_caps_single_day_explosion():
+    actual = np.full(40, 100.0, dtype=np.float64)
+    forecast = np.full(40, 100.0, dtype=np.float64)
+    forecast[35] = 100000.0
+    blocks = np.arange(40, dtype=np.int64)
+    support = np.ones(40, dtype=bool)
+    stable, ref, raw, ref_log, center = _relative_parent_forecast_effect_path(
+        actual, forecast, blocks, support,
+        reference_days=28, reference_min_points=7,
+        reference_shift_factor=1.50,
+        factor_min=0.50, factor_max=2.00,
+    )
+    assert np.isfinite(stable).all()
+    assert np.isfinite(ref).all()
+    assert np.isfinite(raw).all()
+    assert np.isfinite(ref_log).all()
+    assert np.isfinite(center).all()
+    assert math.exp(float(stable[35])) <= 2.00 + 1e-12
+    assert math.exp(float(stable[35])) >= 0.50 - 1e-12
+    assert abs(float(ref[35]) - 100.0) < 1e-12
 
 def test_ses_state_uses_history_beyond_warmup():
     start = dt.date(2024, 1, 1)

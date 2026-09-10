@@ -20,7 +20,7 @@ def _settings_assignments():
 
 def test_v13_2_6_restores_v13_1_1_productive_statistical_baseline():
     s = _settings_assignments()
-    assert s["APP_VERSION"] == "13.2.6"
+    assert s["APP_VERSION"] == "13.2.17"
     assert tuple(s["LEAF_SES_ALPHA_CANDIDATES"]) == (0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80)
     assert tuple(s["RLS_FORGETTING_FACTOR_CANDIDATES"]) == (0.970, 0.985, 0.995)
     assert tuple(s["RLS_VALUE_PRICE_NODE_IDS"]) == ()

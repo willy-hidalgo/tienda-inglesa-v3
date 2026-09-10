@@ -28,8 +28,10 @@ def test_ses_diagnostics_use_same_walkforward_kernel_and_holdout_is_separate():
     assert 'period_names = ("in_sample", "out_sample")' in text
     # Forecast-only has no actual support for tuning.
     assert "collect_diagnostics == 1 and pc <= 1" in text
-    # Productive forecast remains the exact SES+RLS identity.
-    assert "yhat[r] = max(np.expm1(np.log1p(max(ly, 0.0)) + np.log(fy)), 0.0)" in text
+    # Productive forecast remains the same SES+RLS identity, with the v13.2.17
+    # causal leaf magnitude guard applied after reconstruction.
+    assert "py = max(np.expm1(np.log1p(max(ly, 0.0)) + np.log(fy)), 0.0)" in text
+    assert "if cap_y > 0.0 and py > cap_y" in text
 
 
 def test_rls_diagnostics_score_only_existing_candidates_and_existing_driver_groups():
@@ -49,7 +51,7 @@ def test_optimization_artifacts_do_not_touch_dashboard_or_pandas():
     assert "streamlit" not in text
     assert "promote" not in text or "no se promueve" in text or "never changes" in text
     dash = (ROOT / "app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert "ARTIFACT_VERSION = 22" in dash
+    assert "ARTIFACT_VERSION = 30" in dash
 
 
 def test_optimization_summary_polars_smoke():

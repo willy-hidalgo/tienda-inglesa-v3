@@ -520,12 +520,37 @@ class RLSForecastRunner:
                         })
 
         bno = 1
-        for s in range(seed_n, n, block_days):
-            e = min(s + block_days, n); boundary = s - 1
-            chosen_y = choose(cum_ae_y, cum_den_y); chosen_v = choose(cum_ae_v, cum_den_v)
+        frozen_choice_y = None
+        frozen_choice_v = None
+        s = seed_n
+        while s < n:
+            # v13.2.16: a block may never straddle in-sample/OOS. The OOS
+            # boundary is a true fixed forecast origin for every cadence.
+            current_period = source_period[s]
+            period_end = s + 1
+            while period_end < n and source_period[period_end] == current_period:
+                period_end += 1
+            e = min(s + block_days, period_end)
+            boundary = s - 1
+            candidate_y = choose(cum_ae_y, cum_den_y)
+            candidate_v = choose(cum_ae_v, cum_den_v)
+            # v13.2.10: dynamics/lambda are snapshotted at the first OOS
+            # origin. OOS actuals can update the recursive coefficient state,
+            # but they can never re-select the RLS configuration.
+            block_has_history = bool(np.any(source_period[s:e] == "in_sample"))
+            if block_has_history:
+                chosen_y, chosen_v = candidate_y, candidate_v
+            else:
+                if frozen_choice_y is None:
+                    frozen_choice_y, frozen_choice_v = candidate_y, candidate_v
+                chosen_y, chosen_v = frozen_choice_y, frozen_choice_v
             cand_y = {}; cand_v = {}
             for c in diagnostic_candidates:
                 mode, lam = c
+                # Contrato v13: el forecast de cada bloque usa exclusivamente
+                # el estado disponible en SU origen. Un bloque OOS cerrado puede
+                # avanzar el estado para el siguiente origen, pero nunca cambia
+                # lambda/dynamics seleccionados ni su propio forecast.
                 cand_y[c] = predict_block(Xy_base, paths_y[c][boundary], log_y, s, e, mode)
                 cand_v[c] = predict_block(Xv_base, paths_v[c][boundary], log_v, s, e, mode)
             yh[s:e] = np.round(cand_y[chosen_y], 0); vh[s:e] = np.round(cand_v[chosen_v], 2)
@@ -561,9 +586,15 @@ class RLSForecastRunner:
                 Xv_base, cv_coef, value_driver_cols, "Valor ($)",
                 cand_v.get(("base", chosen_v[1])), support_values=y,
             )
-            # Official selection support: y>0.  Value uses the same sale-event
+            # Productive dynamics/lambda selection is HISTORY-ONLY. OOS is a
+            # holdout: its actuals may advance the recursive RLS state for a
+            # later operational origin, but its errors never enter the
+            # cumulative scores that choose dynamics/lambda. This keeps the
+            # selection contract identical across 1d/7d/14d/28d.
+            history_mask = source_period[s:e] == "in_sample"
+            # Official selection support: y>0. Value uses the same sale-event
             # support so both targets follow the client's contractual metric.
-            valid_y = np.isfinite(y[s:e]) & (y[s:e] > 0.0)
+            valid_y = history_mask & np.isfinite(y[s:e]) & (y[s:e] > 0.0)
             valid_v = valid_y & np.isfinite(v[s:e])
             for c in candidates:
                 if valid_y.any():
@@ -573,6 +604,7 @@ class RLSForecastRunner:
                     cum_ae_v[c] += float(np.abs(v[s:e][valid_v] - cand_v[c][valid_v]).sum())
                     cum_den_v[c] += float(np.abs(v[s:e][valid_v]).sum())
             bno += 1
+            s = e
 
         # ── Phase 2: exact same-family refit of existing driver groups ─────
         # This runs only on explicit optimization diagnostics.  It does NOT
@@ -997,6 +1029,7 @@ class RLSForecastRunner:
         horizons: dict,
         meta: dict | None = None,
         parent_forecasts: pl.DataFrame | None = None,
+        oos_observable_store_days: pl.DataFrame | None = None,
         diagnostics_out: list[pl.DataFrame] | None = None,
         parent_diagnostics_out: list[pl.DataFrame] | None = None,
     ) -> pl.DataFrame:
@@ -1011,6 +1044,7 @@ class RLSForecastRunner:
             train_leaves=train_leaves,
             oos_leaves=oos_leaves,
             parent_forecasts=parent_forecasts,
+            oos_observable_store_days=oos_observable_store_days,
             section_id=str(section_id),
             horizons=horizons,
             meta=meta,

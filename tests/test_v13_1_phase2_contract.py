@@ -39,7 +39,7 @@ def test_phase2_cli_is_explicit_and_dashboard_schema_unchanged():
     assert '"--optimization-phase2"' in cli
     assert "args.optimization_diagnostics or args.optimization_phase2" in cli
     dash = (ROOT / "app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert "ARTIFACT_VERSION = 22" in dash
+    assert "ARTIFACT_VERSION = 30" in dash
 
 
 def test_value_metric_support_is_y_positive_not_value_positive():
@@ -94,19 +94,24 @@ def test_extra_ses_alphas_cannot_change_productive_selection():
     factor = np.ones(6, dtype=np.float64)
     init_y = np.full(6, 10.0)
     init_v = np.full(6, 100.0)
+    observable_seq = np.arange(1, 7, dtype=np.int64)
+    block_origin_seq = np.array([0, 0, 2, 2, 4, 4], dtype=np.int64)
+    warmup_end_seq = np.full(6, 2, dtype=np.int64)
 
     prod_alphas = np.array([0.1, 0.2], dtype=np.float64)
     prod_mask = np.array([1, 1], dtype=np.uint8)
     base = _ses_walkforward_kernel(
-        uid, blocks, warm, periods, y, v, factor, factor,
-        init_y, init_v, prod_alphas, prod_mask, 0, 0,
+        uid, blocks, warm, periods, observable_seq, block_origin_seq, warmup_end_seq,
+        y, v, factor, factor, init_y, init_v, prod_alphas, prod_mask, 0, 0,
+        0.50, 2.00, 2.00, 7, 1, 1, 28,
     )
 
     all_alphas = np.array([0.0025, 0.1, 0.2], dtype=np.float64)
     all_mask = np.array([0, 1, 1], dtype=np.uint8)
     phase2 = _ses_walkforward_kernel(
-        uid, blocks, warm, periods, y, v, factor, factor,
-        init_y, init_v, all_alphas, all_mask, 1, 1,
+        uid, blocks, warm, periods, observable_seq, block_origin_seq, warmup_end_seq,
+        y, v, factor, factor, init_y, init_v, all_alphas, all_mask, 1, 1,
+        0.50, 2.00, 2.00, 7, 1, 1, 28,
     )
 
     np.testing.assert_allclose(base[0], phase2[0], rtol=0, atol=1e-12)
