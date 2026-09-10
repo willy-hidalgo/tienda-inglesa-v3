@@ -137,4 +137,4 @@ def test_phase4_is_diagnostic_only():
     assert "driver_strength_recommendation.parquet" in text
     assert "calendar_day_recurrence.parquet" in text
     assert "LEAF_DRIVER_STRENGTH" not in (ROOT / "settings.py").read_text(encoding="utf-8")
-    assert settings.APP_VERSION == "13.2.6"
+    assert settings.APP_VERSION == "13.2.11"

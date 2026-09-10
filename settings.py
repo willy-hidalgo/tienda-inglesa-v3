@@ -9,10 +9,7 @@ import datetime as dt
 import os
 from pathlib import Path
 
-APP_VERSION: str = "13.2.6"
-
-# ── Modo de demostración de selección de datos ──────────────────────────────
-DEMO_MODE = os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+APP_VERSION: str = "13.2.11"
 
 # No existe corrección post-hoc de sesgo por período: in-sample, OOS y
 # forecast-only usan exactamente la misma familia/modelo en cada origen.
@@ -70,6 +67,10 @@ PIPELINE_WMAPE_OOS_ONLY: bool = True
 UPDATE_BLOCK_OPTIONS: tuple[int, ...] = (1, 7, 14, 28)
 RLS_BLOCK_DAYS: int = 28
 RLS_INITIAL_SEED_DAYS: int = 28
+# v13.2.11: todas las cadencias comparten exactamente la misma historia al
+# origen OOS. La longitud canónica es múltiplo de 28, por lo que también es
+# divisible por 1/7/14/28 y no altera la semántica de actualización.
+CANONICAL_HISTORY_BLOCK_DAYS: int = 28
 UPDATE_BLOCKS_DIR = OUT_DIR / "update_blocks"
 
 def update_block_out_dir(days: int) -> Path:
@@ -96,8 +97,8 @@ METRICS_MODE: str = "rolling_28"
 #   1) Nivel = SES de magnitudes positivas desestacionalizadas.
 #   2) Estado inicial = mediana positiva de los primeros 28 días calendario.
 #   3) El mejor alpha SES se selecciona causalmente con bloques previos.
-#   4) RLS tienda/sección aporta el efecto no-intercepto de sus coeficientes
-#      en escala log1p; el SES aporta el nivel base de la hoja.
+#   4) RLS tienda/sección aporta movimiento relativo de su forecast respecto
+#      del nivel causal reciente del parent; el SES aporta el nivel base leaf.
 #   5) Tienda vs sección se elige por wMAPE RLS acumulado de bloques previos.
 #   6) La MISMA composición genera in-sample, OOS y forecast-only.
 LEAF_INITIAL_LEVEL_DAYS: int = 28
@@ -106,17 +107,74 @@ LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (
     0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80
 )
 LEAF_PARENT_DEFAULT: str = "store"
-LEAF_DRIVER_EFFECT_LIMIT: float = 20.0  # guard numérico, no calibración del modelo
+# Transferencia RLS→hoja estable e identificable (v13.2.10).
+# El SES es dueño del nivel leaf. El parent RLS aporta SOLO movimiento relativo:
+# forecast_parent / nivel_parent_causal. El nivel parent causal se calcula con
+# actuals positivos de bloques cerrados previos, por lo que no existe leakage.
+# Esto evita usar la descomposición no-intercepto de coeficientes RLS, que no es
+# identificable bajo colinealidad y podía explotar en 1d aunque el forecast parent
+# agregado fuese razonable. Además, el cociente identificable se centra contra
+# su referencia causal reciente; si TODO un bloque cambia de offset >1.5x, ese
+# salto persistente se trata como cambio de nivel del parent (propiedad del SES)
+# y no como driver leaf. La variación diaria dentro del bloque sí se conserva.
+LEAF_DRIVER_EFFECT_LIMIT: float = 20.0  # guard numérico de trazabilidad del coeficiente bruto
+LEAF_DRIVER_REFERENCE_DAYS: int = 28
+LEAF_DRIVER_REFERENCE_MIN_POINTS: int = 7
+LEAF_DRIVER_REFERENCE_SHIFT_FACTOR: float = 1.50
+LEAF_DRIVER_FACTOR_MIN: float = 0.50
+LEAF_DRIVER_FACTOR_MAX: float = 2.00
+
+# v13.2.10: robustez causal del estado SES leaf. Cada observación positiva
+# desestacionalizada puede mover el estado solo dentro de un rango relativo al
+# estado disponible al origen; no usa información futura ni cambia la familia SES.
+LEAF_SES_UPDATE_FACTOR_MIN: float = 0.50
+LEAF_SES_UPDATE_FACTOR_MAX: float = 2.00
+
+
+# v13.2.11: SES leaf gap-aware. Un día sin fila del SKU solo cuenta como cero
+# cuando la tienda/sección es observable ese día (existe al menos una venta
+# positiva de otro SKU elegible). El estado SES se avanza causalmente a través
+# de esos ceros observables con la misma alpha seleccionada; no se imputan como
+# cero días sin evidencia de operación/datos de la tienda.
+LEAF_GAP_AWARE_ENABLED: bool = True
+LEAF_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 1
+# Tras un gap largo, la primera venta positiva es una reactivación real: se
+# aplica el SES estándar (sin el clip relativo anti-spike) para no impedir que
+# el estado vuelva a aprender de la nueva magnitud.
+LEAF_GAP_REACTIVATION_ROBUST_BYPASS_DAYS: int = 28
+
+# Guard causal de magnitud del forecast leaf. Se activa solo después de contar
+# suficientes positivos ya cerrados y limita el forecast a un múltiplo del
+# máximo positivo observado ANTES del bloque. El valor 2.0 coincide con el gate
+# de no-regresión y deja margen amplio para crecimiento real.
+LEAF_FORECAST_HISTORY_MAX_MULTIPLIER: float = 2.00
+LEAF_FORECAST_GUARD_MIN_POSITIVE_POINTS: int = 7
+
+# Gate end-to-end obligatorio para declarar los cuatro escenarios listos.
+# No altera forecasts; bloquea una release con spikes/cambios de escala absurdos.
+RELEASE_GATE_MAX_FORECAST_TO_POSITIVE_MEDIAN: float = 8.0
+RELEASE_GATE_MAX_FORECAST_TO_OBSERVED_MAX: float = 2.0
+RELEASE_GATE_MAX_CROSS_CADENCE_MEDIAN_RATIO: float = 4.0
+RELEASE_GATE_LONG_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 28
+RELEASE_GATE_LONG_GAP_MAX_FACTOR_ERROR: float = 4.0
+RELEASE_GATE_SENTINEL_MAX_IN_SAMPLE_WMAPE: float = 3.0
+RELEASE_GATE_SENTINEL_MAX_OOS_ABS_BIAS: float = 1.00
+RELEASE_GATE_SENTINELS: tuple[tuple[str, str, str, str], ...] = (
+    ("1", "00154", "455436", "Valor ($)"),
+    ("1", "00003", "478160", "Valor ($)"),
+)
 
 # Optimización estadística v13.x dentro de la MISMA familia SES+RLS.
-# v13.2.6 RESTAURA la configuración productiva estadística de v13.1.1 como
-# baseline estable después de detectar regresiones visuales/end-to-end en v13.2.x.
+# v13.2.11 mantiene restaurada la configuración productiva estadística de v13.1.1.
+# Corrige la contaminación del holdout: alpha/lambda/dynamics/parent se eligen
+# exclusivamente con historia in-sample cerrada. OOS puede actualizar el estado
+# operativo para la cadencia siguiente, pero nunca cambia una selección/tuning.
 # Las extensiones posteriores permanecen solo como diagnóstico hasta superar
 # un gate de regresión completo en 1d/7d/14d/28d. El OOS actual no hace tuning.
 STAT_OPTIMIZATION_ENABLED: bool = True
 STAT_OPTIMIZATION_PROMOTE_AUTOMATICALLY: bool = False
 # Phase 2/3/4 mantiene un espacio diagnóstico alrededor del productivo.
-# En v13.2.6 alpha=0.30 y lambda=0.990/0.9975 vuelven a ser SOLO diagnóstico.
+# alpha=0.30 y lambda=0.990/0.9975 permanecen SOLO diagnóstico.
 # Ninguno participa en producción hasta demostrar no-regresión end-to-end.
 STAT_OPT_SES_EXTRA_ALPHAS: tuple[float, ...] = (0.0025, 0.0075, 0.30, 0.50)
 STAT_OPT_RLS_EXTRA_LAMBDAS: tuple[float, ...] = (0.990, 0.9975, 1.0)
@@ -243,9 +301,22 @@ RLS_DEFAULT_DYNAMICS: str = "base"
 # Valor($) vuelve al diseño productivo estable v13.1.1 sin asp/edp/discount.
 # Las pruebas con price continúan disponibles exclusivamente en diagnóstico.
 RLS_VALUE_PRICE_NODE_IDS: tuple[str, ...] = ()
-# v13.2.6 desactiva las exclusiones productivas promovidas en v13.2.2.
+# v13.2.11 mantiene desactivadas las exclusiones productivas promovidas en v13.2.2.
 # Permanecen como evidencia experimental, no como configuración productiva.
 RLS_DRIVER_GROUP_EXCLUSIONS: dict[str, dict[str, tuple[str, ...]]] = {}
+
+# Historial de promociones v13.2.2 para reauditoría diagnóstica.
+# NO participa en la configuración productiva ni altera el forecast: producción
+# sigue leyendo exclusivamente RLS_DRIVER_GROUP_EXCLUSIONS.
+RLS_DRIVER_GROUP_EXCLUSION_AUDIT_HISTORY: dict[str, dict[str, tuple[str, ...]]] = {
+    "1||T:00211": {
+        "Unidades": ("month",),
+        "Valor ($)": ("month",),
+    },
+    "23||T:00006": {
+        "Unidades": ("price",),
+    },
+}
 # Los drivers AR del bloque objetivo se construyen recursivamente: nunca usan
 # actuals del propio bloque que todavía no eran conocidos al emitir el forecast.
 MIN_Y_TO_UPDATE = 1.0  # actualiza RLS solo cuando y supera este umbral
@@ -445,7 +516,7 @@ def section_horizons(
     Contrato operativo:
     - OOS son siempre los últimos 28 días calendario con actuals;
     - forecast-only empieza al día siguiente y dura 28 días;
-    - la historia previa se alinea a la cadencia seleccionada 1/7/14/28d;
+    - las cuatro cadencias comparten exactamente la misma historia previa al OOS;
     - in-sample, OOS y forecast-only usan la misma familia de modelo.
     """
     cfg = SECCIONES[seccion]
@@ -474,18 +545,28 @@ def section_horizons(
             f"({first_data} → {last_actual})."
         )
 
-    # El histórico previo al OOS se alinea a la cadencia seleccionada. Durante
-    # los 28 días OOS se emiten forecasts secuenciales en bloques de update_days
-    # y, al cerrarse cada bloque, sus actuals pasan al siguiente ajuste.
-    delta_days = (oos_start - first_data).days
-    offset = delta_days % update_days
-    train_start = first_data + dt.timedelta(days=offset)
+    # v13.2.11: el histórico al origen OOS es IDÉNTICO para 1d/7d/14d/28d.
+    # Antes se desplazaba train_start según update_days (p.ej. 1d podía ver 2–4
+    # días adicionales), contaminando la comparación de cadencias. Elegimos la
+    # mayor ventana completa cuyo largo sea múltiplo del bloque canónico de 28d;
+    # como 1/7/14/28 dividen 28, la misma ventana queda alineada para todos.
     train_end = oos_start - dt.timedelta(days=1)
-    train_days = (train_end - train_start).days + 1
-    if train_days < update_days or train_days % update_days != 0:
+    available_days = (train_end - first_data).days + 1
+    canonical_block = int(CANONICAL_HISTORY_BLOCK_DAYS)
+    if canonical_block <= 0:
+        raise ValueError("CANONICAL_HISTORY_BLOCK_DAYS debe ser positivo")
+    canonical_days = (available_days // canonical_block) * canonical_block
+    if canonical_days < max(UPDATE_BLOCK_OPTIONS):
         raise ValueError(
-            f"Sección {seccion}: train no queda alineado a bloques de "
-            f"{update_days} días ({train_start} → {train_end}, {train_days})."
+            f"Sección {seccion}: historia insuficiente para una ventana canónica "
+            f"de {canonical_block} días ({first_data} → {train_end})."
+        )
+    train_start = train_end - dt.timedelta(days=canonical_days - 1)
+    train_days = canonical_days
+    if train_days % update_days != 0:
+        raise ValueError(
+            f"Sección {seccion}: ventana canónica {train_days}d no divisible por "
+            f"cadencia {update_days}d."
         )
 
     forecast_start = oos_end + dt.timedelta(days=1)

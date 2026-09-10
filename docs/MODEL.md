@@ -28,14 +28,27 @@ El warm-up es inicialización del mismo modelo SES+RLS; no una familia estadíst
 
 ### Recurrencia
 
-Después del warm-up, el SES usa toda la historia disponible. Los días sin venta no hacen caer la magnitud del estado. Para una observación positiva se remueve primero el efecto RLS del parent y luego se actualiza SES:
+Después del warm-up, el SES usa toda la historia disponible. Desde v13.2.11, los días sin venta sí hacen avanzar causalmente el estado cuando la misma Sección+Tienda fue observable ese día; días sin evidencia de operación/datos no se convierten en cero. En v13.2.10 la hoja **no usa** la separación intercepto/no-intercepto de los coeficientes RLS, porque esa descomposición puede cambiar mucho bajo colinealidad aunque el forecast agregado del parent sea estable. La transferencia usa una magnitud identificable y centrada:
 
 ```text
-obs_ajustada = expm1(log1p(actual) - efecto_RLS_parent)
-L_t = alpha * obs_ajustada + (1-alpha) * L_{t-1}
+nivel_parent_t = mediana de actuals positivos del parent en los 28 días previos cerrados
+raw_t          = log1p(forecast_RLS_parent_t)
+referencia_t   = log1p(nivel_parent_t)
+relativo_t      = raw_t - referencia_t
+centro_t        = mediana causal reciente de relativo_t
+efecto_leaf_t  = clip(relativo_t - centro_t, log(0.50), log(2.00))
+obs_ajustada   = expm1(log1p(actual_leaf) - efecto_leaf_t)
+obs_robusta    = clip(obs_ajustada, 0.50*L_{t-1}, 2.00*L_{t-1})
+L_t            = alpha * obs_robusta + (1-alpha) * L_{t-1}
+cap_t          = 2.00 * max(actual positivo en bloques cerrados previos)
+forecast_leaf  = min(max(expm1(log1p(L_t_origen)+efecto_leaf_t), 0), cap_t)
 ```
 
-El alpha se selecciona causalmente entre candidatos usando wMAPE oficial acumulado en bloques cerrados previos.
+La referencia se fija al inicio de cada bloque de actualización. Por tanto, 1d puede incorporar el día cerrado anterior, 7d cada semana, etc.; ningún actual del bloque objetivo interviene en su propio forecast. Si un bloque completo cambia de offset por más de `LEAF_DRIVER_REFERENCE_SHIFT_FACTOR`, ese offset persistente se centra usando el propio path de forecasts conocido al origen y no se transfiere como nivel leaf. El coeficiente no-intercepto bruto se conserva únicamente como traza de auditoría.
+
+Desde v13.2.10 la recurrencia SES es robusta: un único positivo extremo no puede mover el estado más allá del rango causal `[0.50x, 2.00x]` respecto del estado previo antes de aplicar alpha. Además, tras 7 positivos cerrados, el forecast final queda protegido por un tope de `2.0x` el máximo positivo observado antes del bloque. El tope se calcula en el origen, se persiste en `leaf_forecast_cap_y/value` y nunca usa actuals del bloque objetivo.
+
+El alpha se selecciona causalmente entre candidatos usando **solo historia in-sample cerrada**. Al primer origen OOS se congela explícitamente la selección de alpha, parent y `dynamics/lambda`; los actuals OOS pueden actualizar el estado operativo para un origen posterior de la misma cadencia, pero nunca re-seleccionan la configuración.
 
 ## 3. Selección de parent: Tienda vs Sección
 
@@ -54,22 +67,28 @@ La decisión nunca usa el OOS actual del bloque objetivo.
 
 ## 4. Identidad del forecast leaf
 
-Para cada fecha:
+La hoja usa el forecast RLS del parent relativo al nivel causal del mismo parent:
 
 ```text
-log(1 + forecast_leaf) = log(1 + nivel_SES) + efecto_RLS_parent
+driver_effect_raw       = log1p(forecast_RLS_parent)
+driver_effect_reference = log1p(nivel_parent_causal)
+driver_effect_center    = offset causal persistente del relativo identificable
+efecto_RLS_leaf         = clip(driver_effect_raw - driver_effect_reference - driver_effect_center, log(0.50), log(2.00))
+log(1 + forecast_leaf)  = log(1 + nivel_SES) + efecto_RLS_leaf
 ```
+
+`driver_effect_coef_raw` conserva la contribución no-intercepto original del RLS solo para auditoría y **no entra** en el forecast leaf.
 
 por tanto:
 
 ```text
 forecast_leaf_raw = max(
-    expm1(log1p(nivel_SES) + efecto_RLS_parent),
+    expm1(log1p(nivel_SES) + efecto_RLS_leaf),
     0
 )
 ```
 
-El `max(..., 0)` es únicamente la restricción física de soporte no negativo y forma parte de la identidad productiva antes del redondeo. Esta identidad es la misma en in-sample, OOS y forecast-only.
+El guard equivale a un factor RLS transferido dentro de `[0.50, 2.00]`. Su función es impedir que un offset arbitrario o una explosión de coeficientes del parent destruya el nivel SES. El `max(..., 0)` sigue siendo la restricción física de soporte no negativo. La identidad es la misma en in-sample, OOS y forecast-only.
 
 ## 5. In-sample, OOS y forecast-only
 
@@ -209,3 +228,14 @@ Las trazas comparadas son `current_policy`, `store`, `section` y `ses_only`. `se
 La recomendación se construye solo con bloques cerrados: mejora >=1 pp frente a `current_policy`, >=4 folds, >=60% de folds no peores y deterioro histórico de |BIAS| <=1 pp. El OOS actual se consulta después y solo valida/veta. Esta fase todavía no cambia `parent_model_y`/`parent_model_value` en `forecast.parquet`.
 
 La auditoría complementaria de `zero_rate` usa `y<=0` para describir ocurrencia por hoja, weekday, mes y bloque. Es diagnóstica: no altera la definición oficial de wMAPE/BIAS ni introduce una capa de occurrence/share.
+
+## 12. Baseline vigente v13.2.11
+
+La configuración productiva de parámetros permanece congelada en el baseline v13.1.1:
+
+- alphas SES productivos: `0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80`;
+- lambdas RLS productivos: `0.970, 0.985, 0.995`;
+- Valor ($) no incorpora price de forma productiva;
+- no hay exclusiones node-specific productivas.
+
+La corrección v13.2.11 conserva los guards de v13.2.10 y añade SES gap-aware con días cero observables por Sección+Tienda, reactivación causal tras gaps largos y una ventana histórica canónica idéntica entre 1d/7d/14d/28d. Las promociones históricas documentadas en v13.2.0/v13.2.2 permanecen como antecedentes experimentales, no como configuración vigente.

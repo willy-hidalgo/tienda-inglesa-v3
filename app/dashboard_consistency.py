@@ -270,6 +270,7 @@ def audit_metric_sample(
                 "sum_abs_error", "sum_signed_error", "sum_abs_y_all_points",
                 "sum_abs_error_all_points", "sum_signed_error_all_points", "metric_cohort",
             )
+            .sort("unique_id")
             .head(sample_per_unit)
         )
         if target.height == 0:
@@ -341,6 +342,19 @@ def audit_metric_sample(
             )
         )
 
+        # The artifact and the audit can aggregate the same floating-point
+        # rows in a different physical order (eager DataFrame vs parquet scan).
+        # Compare with a strict scale-aware tolerance instead of absolute 1e-9;
+        # this preserves the identity check while avoiding false mismatches from
+        # summation order on large Value/quantity totals.
+        def _different(calc_col: str, metric_col: str) -> pl.Expr:
+            calc_expr = pl.col(calc_col)
+            metric_expr = pl.col(metric_col)
+            scale = pl.max_horizontal(
+                pl.lit(1.0), calc_expr.abs(), metric_expr.abs()
+            )
+            return (calc_expr - metric_expr).abs() > (pl.lit(tolerance) * scale)
+
         cmp = (
             target.rename({
                 "wmape": "_wmape_metric",
@@ -361,29 +375,29 @@ def audit_metric_sample(
                 | (
                     pl.col("_wmape_calc").is_not_null()
                     & pl.col("_wmape_metric").is_not_null()
-                    & ((pl.col("_wmape_calc") - pl.col("_wmape_metric")).abs() > tolerance)
+                    & _different("_wmape_calc", "_wmape_metric")
                 )
                 | (
                     pl.col("_bias_calc").is_not_null()
                     & pl.col("_bias_metric").is_not_null()
-                    & ((pl.col("_bias_calc") - pl.col("_bias_metric")).abs() > tolerance)
+                    & _different("_bias_calc", "_bias_metric")
                 )
-                | ((pl.col("_sum_abs_error_calc") - pl.col("_sum_abs_error_metric")).abs() > tolerance)
-                | ((pl.col("_sum_abs_y_calc") - pl.col("_sum_abs_y_metric")).abs() > tolerance)
-                | ((pl.col("_sum_signed_error_calc") - pl.col("_sum_signed_error_metric")).abs() > tolerance)
+                | _different("_sum_abs_error_calc", "_sum_abs_error_metric")
+                | _different("_sum_abs_y_calc", "_sum_abs_y_metric")
+                | _different("_sum_signed_error_calc", "_sum_signed_error_metric")
                 | (
                     pl.col("_wmape_all_points_calc").is_not_null()
                     & pl.col("_wmape_all_points_metric").is_not_null()
-                    & ((pl.col("_wmape_all_points_calc") - pl.col("_wmape_all_points_metric")).abs() > tolerance)
+                    & _different("_wmape_all_points_calc", "_wmape_all_points_metric")
                 )
                 | (
                     pl.col("_bias_all_points_calc").is_not_null()
                     & pl.col("_bias_all_points_metric").is_not_null()
-                    & ((pl.col("_bias_all_points_calc") - pl.col("_bias_all_points_metric")).abs() > tolerance)
+                    & _different("_bias_all_points_calc", "_bias_all_points_metric")
                 )
-                | ((pl.col("_sum_abs_y_all_points_calc") - pl.col("_sum_abs_y_all_points_metric")).abs() > tolerance)
-                | ((pl.col("_sum_abs_error_all_points_calc") - pl.col("_sum_abs_error_all_points_metric")).abs() > tolerance)
-                | ((pl.col("_sum_signed_error_all_points_calc") - pl.col("_sum_signed_error_all_points_metric")).abs() > tolerance)
+                | _different("_sum_abs_y_all_points_calc", "_sum_abs_y_all_points_metric")
+                | _different("_sum_abs_error_all_points_calc", "_sum_abs_error_all_points_metric")
+                | _different("_sum_signed_error_all_points_calc", "_sum_signed_error_all_points_metric")
             )
         )
         if cmp.height:

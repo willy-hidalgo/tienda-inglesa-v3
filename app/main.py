@@ -333,9 +333,14 @@ def build_default_options(project_root: Path) -> list[MenuOption]:
         ),
         MenuOption(
             "15",
-            "PREPARAR DASHBOARD COMPLETO · 1d/7d/14d/28d + auditorías",
+            "PREPARAR DASHBOARD COMPLETO · 1d/7d/14d/28d + auditorías + gate",
             (python, "-m", "app.dashboard_ready"),
             supports_parallel=True,
+        ),
+        MenuOption(
+            "16",
+            "gate end-to-end de no-regresión · 1d/7d/14d/28d",
+            (python, "-m", "app.forecasting.regression_gate", "--all-update-blocks"),
         ),
     ]
 
@@ -358,6 +363,8 @@ _RUN_ALIASES = {
     "dashboard": "14",
     "dashboard-ready-all": "15",
     "prepare-dashboard-all": "15",
+    "regression-gate-all": "16",
+    "release-gate": "16",
 }
 
 
@@ -378,7 +385,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Bloque para procesos --run que operan sobre un único escenario.",
     )
-    run_choices = sorted(set(_RUN_ALIASES) | {str(i) for i in range(1, 16)})
+    run_choices = sorted(set(_RUN_ALIASES) | {str(i) for i in range(1, 17)})
     parser.add_argument(
         "--run",
         type=str,

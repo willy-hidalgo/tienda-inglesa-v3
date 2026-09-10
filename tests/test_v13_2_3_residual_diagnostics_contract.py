@@ -71,7 +71,7 @@ def test_phase3_is_diagnostic_only_and_report_version_is_dynamic():
     assert "required_driver_effect" in text
     assert "unexplained_driver_effect" in text
     assert "settings.RLS_DRIVER_GROUP_EXCLUSIONS =" not in text
-    assert settings.APP_VERSION == "13.2.6"
+    assert settings.APP_VERSION == "13.2.11"
 
 
 def test_promoted_exclusion_is_reaudited_after_parameter_reselection():

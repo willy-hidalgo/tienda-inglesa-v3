@@ -9,7 +9,7 @@ Uso recomendado:
 
 Por defecto reutiliza únicamente escenarios de la MISMA APP_VERSION cuya
 corrida figure como exitosa; cualquier bloque ausente, stale o fallido se
-recalcula. Después repara artefactos y ejecuta ambas auditorías offline.
+recalcula. Después repara artefactos, ejecuta la auditoría estructural, el gate end-to-end de no-regresión y la auditoría del dashboard.
 """
 from __future__ import annotations
 
@@ -75,6 +75,10 @@ def prepare_dashboard_all(*, n_jobs: int | None = None, force_rebuild: bool = Fa
     _run(
         "Auditoría modelo 1d/7d/14d/28d",
         [python, "-m", "app.forecasting.validate_v13", "--all-update-blocks"],
+    )
+    _run(
+        "Gate end-to-end de no-regresión 1d/7d/14d/28d",
+        [python, "-m", "app.forecasting.regression_gate", "--all-update-blocks"],
     )
     _run(
         "Auditoría dashboard 1d/7d/14d/28d",

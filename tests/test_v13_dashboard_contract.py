@@ -13,7 +13,7 @@ def test_dashboard_is_multiblock_and_acid_metrics_are_visibility_only():
 
 def test_dashboard_artifacts_support_all_update_blocks_and_v22():
     text = Path("app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert "ARTIFACT_VERSION = 22" in text
+    assert "ARTIFACT_VERSION = 24" in text
     assert '"--all-update-blocks"' in text
     assert "settings.UPDATE_BLOCK_OPTIONS" in text
 

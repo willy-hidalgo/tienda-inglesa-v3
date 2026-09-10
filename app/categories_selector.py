@@ -33,7 +33,6 @@ class DemandAnalysisConfig:
     selected_path: Path
     out_dir: Path
     focus_sections: list[str]
-    demo_mode: bool
 
     @classmethod
     def from_settings(cls) -> DemandAnalysisConfig:
@@ -45,7 +44,6 @@ class DemandAnalysisConfig:
             selected_path=Path(settings.SELECTED_PATH),
             out_dir=Path(settings.OUT_DIR),
             focus_sections=list(settings.FOCUS_SECTIONS),
-            demo_mode=settings.DEMO_MODE,
         )
 
 
@@ -128,153 +126,60 @@ class SalesCatalogLoader:
         return df
 
 
-class SectionDemandSelector:
-    def __init__(self, focus_sections: list[str]):
-        self._focus_sections = focus_sections
+def _log_full_selection_coverage(df: pl.DataFrame) -> None:
+    """Audita que la selección materializada contiene todos los SKU+Tienda cargados.
 
-    def select(self, df: pl.DataFrame, demo_mode) -> pl.DataFrame:
+    ``SalesCatalogLoader`` ya aplica únicamente los filtros de dominio del proyecto:
+    secciones foco, locales configurados y transacciones de venta positivas. A partir
+    de ese punto no existe muestreo, ranking, top-N ni whitelist de SKU.
+    """
+    if df.height == 0:
+        logger.warning("Selección vacía para las secciones foco: %s", settings.FOCUS_SECTIONS)
+        return
 
-        if demo_mode:
-            df = self.select_best_skus(df)
-
-        by_sec = (
-            df.group_by("SECCION")
-            .agg(
-                pl.col("SALES_DAY").min().alias("min_date"),
-                pl.col("SALES_DAY").max().alias("max_date"),
-            )
-            .sort("SECCION")
+    pairs = df.select(["SECCION", "STORE_ID", "SKU_ID"]).unique()
+    by_sec = (
+        pairs.group_by("SECCION")
+        .agg(
+            pl.len().alias("sku_tienda"),
+            pl.col("SKU_ID").n_unique().alias("skus"),
+            pl.col("STORE_ID").n_unique().alias("tiendas"),
         )
-        logger.info("Rango de fechas por sección:\n%s", by_sec)
-
-        logger.info("Filas seleccionadas (historia completa): %d", df.height)
-        return df
-
-    @staticmethod
-    def select_best_skus(df: pl.DataFrame) -> pl.DataFrame:
-        best_skus = [
-            "412091",
-            "278120",
-            "39472",
-            "581783",
-            "580661",
-            "459977",
-            "541427",
-            "106356",
-            "495933",
-            "516028",
-            "568160",
-            "567332",
-            "41796",
-            "46499",
-            "46853",
-            "75048",
-            "58905",
-            "143871",
-            "85860",
-            "208",
-            "483046",
-            "64048",
-            "606556",
-            "39472",
-            "568161",
-            "58905",
-            "2322",
-            "568160",
-            "489263",
-            "218557",
-            "43549",
-            "190454",
-            "168765",
-            "478352",
-            "565871",
-            "447684",
-            "42231",
-            "473932",
-            "456855",
-            "43422",
-            "568160",
-            "127359",
-            "565118",
-            "6656",
-            "61722",
-            "116741",
-            "100622",
-            "46713",
-            "299478",
-            "495933",
-            "603595",
-            "195295",
-            "219991",
-            "587387",
-            "113618",
-            "514081",
-            "582947",
-            "333113",
-            "113618",
-            "501237",
-            "113618",
-            "218058",
-            "103986",
-            "71765",
-            "113618",
-            "448634",
-            "32757",
-            "71765",
-            "45642",
-            "197305",
-            "474665",
-            "28303",
-            "333110",
-            "197305",
-            "306915",
-            "593461",
-            "306915",
-            "5898",
-            "598287",
-            "218058",
-            "392615",
-            "600005",
-            "582946",
-            "45642",
-            "385301",
-            "519600",
-            "448849",
-            "17245",
-            "25879",
-            "126196",
-            "523647",
-            "288718",
-            "466270",
-            "419464",
-            "90052",
-            "306918",
-            "566325",
-            "197305",
-            "590253",
-            "448848",
-        ]
-        return df.filter(pl.col("SKU_ID").is_in(best_skus))
+        .sort("SECCION")
+    )
+    dates = (
+        df.group_by("SECCION")
+        .agg(
+            pl.col("SALES_DAY").min().alias("min_date"),
+            pl.col("SALES_DAY").max().alias("max_date"),
+        )
+        .sort("SECCION")
+    )
+    logger.info("Cobertura SKU+Tienda completa (sin muestreo/whitelist):\n%s", by_sec)
+    logger.info("Rango de fechas por sección:\n%s", dates)
+    logger.info("Filas seleccionadas (historia completa): %d", df.height)
 
 
 class DemandAnalysisPipeline:
     def __init__(self, config: DemandAnalysisConfig | None = None):
         self._cfg = config or DemandAnalysisConfig.from_settings()
-        self._selector = SectionDemandSelector(self._cfg.focus_sections)
 
     def run(self) -> pl.DataFrame:
-        df = SalesCatalogLoader(self._cfg).load()
-        df_common = self._selector.select(df, self._cfg.demo_mode)
+        # El loader ya devuelve el universo completo elegible de las secciones foco.
+        # No existe una segunda etapa de selección de SKU: se persiste exactamente
+        # todo SKU+Tienda que sobrevivió a los filtros de dominio del loader.
+        df_selected = SalesCatalogLoader(self._cfg).load()
+        _log_full_selection_coverage(df_selected)
         self._cfg.out_dir.mkdir(parents=True, exist_ok=True)
         # Compresión zstd: lectura más rápida y archivo más pequeño
-        df_common.write_parquet(
+        df_selected.write_parquet(
             self._cfg.selected_path,
             compression="zstd",
             compression_level=3,
             statistics=True,
         )
         logger.info("✓ Archivo guardado en: %s", self._cfg.selected_path)
-        return df_common
+        return df_selected
 
 
 def main() -> None:

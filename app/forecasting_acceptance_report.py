@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"ACEPTACIÓN ESTADÍSTICA | APP_VERSION={settings.APP_VERSION}")
     print(f"Forecast: {forecast}")
     print(f"Bloque de actualización: {int(settings.RLS_BLOCK_DAYS)} días | OOS: {int(settings.METRIC_HORIZON_DAYS)} días | forecast-only: {int(settings.METRIC_HORIZON_DAYS)} días")
-    print("Modelo productivo: RLS sección/tienda + SES SKU+tienda (mediana positiva inicial) + parent RLS elegido causalmente.")
+    print("Modelo productivo: RLS sección/tienda + SES SKU+tienda gap-aware (mediana positiva inicial; ceros solo en días de tienda observables) + parent RLS elegido causalmente.")
 
     errors = validate_model(forecast)
     print("\n=== 1) CONTRATO ESTRUCTURAL ===")

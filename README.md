@@ -1,8 +1,11 @@
-# Tienda Inglesa Forecasting — v13.2.6
+# Tienda Inglesa Forecasting — v13.2.11
 
-> **v13.2.6 stability baseline.** The productive SES/RLS statistical configuration has been rolled back to the v13.1.1 baseline after regressions were observed in later v13.2 promotions. The current dashboard/main/all-block operational improvements remain available.
+
+> **v13.2.11 gap-aware stability.** Todas las cadencias comparten la misma historia al origen OOS. El SES leaf consume causalmente los días sin venta únicamente cuando la Sección+Tienda fue observable ese día; los gaps de ingestión/cierre no se convierten en ceros. Las reactivaciones largas quedan trazadas y auditadas por el regression gate. Se conservan el formatter numérico global y los guards de estabilidad de v13.2.10.
 
 Herramienta de forecasting jerárquico para **Sección → Tienda → SKU+Tienda**, diseñada para ser causal, explicable, rápida y auditable.
+
+**Selección de datos:** no existe modo demo, whitelist ni ranking previo de SKU. La selección materializa todos los SKU+Tienda elegibles de las secciones 1 y 23 para los locales configurados; los filtros de ventas se limitan a la validez transaccional existente del pipeline.
 
 ## Contrato productivo v13
 
@@ -12,8 +15,8 @@ La arquitectura productiva se simplificó deliberadamente:
 2. **Tienda:** RLS expansivo con la misma familia y los mismos drivers.
 3. **SKU+Tienda:** un único modelo **SES + RLS parent**:
    - nivel inicial = mediana robusta de observaciones positivas en el warm-up inicial;
-   - SES recursivo sobre toda la historia disponible, actualizando magnitud solo cuando `y > 0`;
-   - el efecto RLS de **Tienda o Sección** se aplica sobre el nivel SES;
+   - SES recursivo sobre toda la historia disponible: las ventas positivas actualizan magnitud y los días sin venta avanzan el estado como cero solo cuando la Sección+Tienda es observable ese día;
+   - el forecast RLS de **Tienda o Sección** se convierte en movimiento relativo contra un nivel causal reciente del mismo parent y se aplica sobre el nivel SES;
    - el parent se elige causalmente por el menor wMAPE oficial acumulado en bloques cerrados previos.
 4. **In-sample, OOS y forecast-only usan exactamente la misma composición.** Solo cambia la información disponible en cada origen temporal.
 
@@ -41,7 +44,9 @@ El dashboard también precalcula `wMAPE incl. y=0` y `BIAS incl. y=0` como **pru
 - cadencias de actualización: `1d / 7d / 14d / 28d`;
 - OOS comparable: `28 días`;
 - forecast-only: `28 días`;
-- warm-up inicial SES: `28 días calendario`, usando solo magnitudes positivas para calcular la mediana inicial.
+- warm-up inicial SES: `28 días calendario`, usando solo magnitudes positivas para calcular la mediana inicial;
+- historia al origen OOS: misma ventana canónica múltiplo de 28 días para 1d/7d/14d/28d;
+- gaps leaf: solo cuentan como cero los días observables de la misma Sección+Tienda.
 
 El in-sample es walk-forward/expanding: cada bloque se pronostica con el estado disponible al inicio del bloque, igual que OOS y forecast-only.
 
@@ -169,6 +174,14 @@ Además del forecast y los artefactos normales del dashboard, se crea `data/outp
 
 El reporte **no promueve automáticamente** parámetros ni drivers. La elección se realiza con bloques históricos cerrados; el OOS actual queda como holdout final.
 
+## Corrección productiva v13.2.11 — gaps de venta y reactivación
+
+`selected.parquet` sigue conteniendo únicamente transacciones positivas, por lo que una fila SKU+Tienda ausente no se interpreta automáticamente como cero. El forecast construye un calendario pequeño por Sección+Tienda y marca como día observable aquel donde existe al menos una venta positiva de cualquier SKU elegible de esa tienda/sección. El SES leaf consume los días observables sin venta propia como actual cero de forma equivalente a la recurrencia SES estándar, sin materializar un panel leaf diario completo.
+
+En cada origen de bloque, el estado se decae solo con información cerrada. La observabilidad del bloque OOS actual no puede afectar su propio forecast; recién entra cuando ese bloque se cierra. Una primera venta después de un gap largo puede reactivar el SES estándar sin quedar atrapada por el guard anti-spike de un estado ya casi nulo.
+
+Las trazas `leaf_gap_observable_days_*` y `leaf_gap_decay_factor_*` permiten auditar el mecanismo en el Excel leaf. El gate de release también identifica reactivaciones OOS con error de factor patológico.
+
 ## Documentación
 
 - [Arquitectura](docs/ARCHITECTURE.md)
@@ -258,7 +271,34 @@ El candidato nace únicamente de bloques históricos cerrados y exige: mejora le
 
 El diagnóstico persiste únicamente agregados leaf×período×candidato, no series diarias alternativas, para conservar memoria. La misma corrida audita `zero_rate` por SKU+Tienda y patrones por weekday/mes/bloque sin afectar la métrica oficial (`y!=0`) ni la selección productiva.
 
-`Phase 5` permanece disponible solo como diagnóstico. La versión productiva actual es `APP_VERSION=13.2.6`; `ARTIFACT_VERSION=22`.
+`Phase 5` permanece disponible solo como diagnóstico. La versión productiva candidata actual es `APP_VERSION=13.2.11`; `ARTIFACT_VERSION=24`.
+
+
+## Corrección productiva v13.2.10 — estabilidad causal leaf y freeze OOS
+
+- `alpha`, parent y `dynamics/lambda` quedan congelados al origen OOS; los actuals OOS solo avanzan estado una vez cerrado el bloque.
+- La observación positiva desestacionalizada usada por SES se limita causalmente a `[0.50x, 2.00x]` del estado previo antes de aplicar alpha.
+- Con al menos 7 positivos cerrados, el forecast leaf se limita a `2.0x` el máximo positivo observado antes del bloque; las trazas `leaf_forecast_cap_y/value` permiten reconstruirlo.
+- `metrics.parquet` conserva `rls_metric_eligible`, corrigiendo hojas cuyo warm-up alcanza OOS.
+- `ARTIFACT_VERSION=23`; no se promueven drivers, lambdas, alphas ni switches de parent.
+
+## Corrección productiva v13.2.9 — holdout puro + transferencia RLS→SKU+Tienda centrada
+
+El SES es propietario del nivel de la hoja. La descomposición intercepto/no-intercepto de los coeficientes RLS se conserva solo para auditoría porque puede cambiar drásticamente bajo colinealidad aunque el forecast agregado del parent siga siendo razonable. Producción usa una magnitud identificable:
+
+```text
+nivel_parent_t = mediana positiva del parent en los 28 días cerrados previos
+raw_t          = log1p(forecast_RLS_parent_t)
+referencia_t   = log1p(nivel_parent_t)
+relativo_t      = raw_t - referencia_t
+centro_t        = offset causal reciente/persistente del relativo identificable
+efecto_leaf_t  = clip(relativo_t - centro_t, log(0.50), log(2.00))
+forecast_leaf  = max(expm1(log1p(nivel_SES) + efecto_leaf_t), 0)
+```
+
+La referencia se fija al origen de cada bloque y usa al menos 7 observaciones positivas cuando están disponibles. No usa actuals del bloque objetivo. Si el relativo identificable cambia de offset de forma persistente en todo un bloque por más de `1.50x`, ese offset se centra para que no sustituya al nivel SES de la hoja. `driver_effect_coef_raw` conserva la antigua contribución no-intercepto únicamente como traza; no entra al forecast. `validate_v13` reconstruye el efecto desde forecast parent + nivel causal + centro y rechaza cualquier factor fuera de `[0.50, 2.00]`.
+
+Además, OOS es holdout estricto para **selección**: sus errores no pueden cambiar alpha SES, dynamics/lambda RLS ni parent Store/Section. Los actuals OOS sí pueden actualizar el estado recursivo una vez cerrado el bloque para simular la cadencia operativa siguiente.
 
 ## Preparación urgente del dashboard 1d/7d/14d/28d
 
@@ -268,7 +308,7 @@ Para dejar los cuatro escenarios disponibles, sincronizados y auditados sin ejec
 uv run python main.py --run dashboard-ready-all --n-jobs 8
 ```
 
-El comando es reanudable: reutiliza únicamente bloques de la misma `APP_VERSION` cuya corrida esté registrada como exitosa; recalcula los demás, repara artefactos y ejecuta `validate_v13` y `dashboard_consistency` para todos los bloques. Al terminar debe imprimir `DASHBOARD READY` y `Escenarios disponibles y validados: 1d, 7d, 14d, 28d`. Después:
+El comando es reanudable: reutiliza únicamente bloques de la misma `APP_VERSION` cuya corrida esté registrada como exitosa; recalcula los demás, repara artefactos y ejecuta `validate_v13`, el gate end-to-end de no-regresión y `dashboard_consistency` para todos los bloques. Al terminar debe imprimir `DASHBOARD READY` y `Escenarios disponibles y validados: 1d, 7d, 14d, 28d`. Después:
 
 ```bash
 uv run python main.py --run dashboard

@@ -6,6 +6,7 @@ schema hygiene.  It does *not* optimize or judge forecast accuracy.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import polars as pl
@@ -60,6 +61,16 @@ def validate(path: Path) -> list[str]:
         "ses_level_y", "ses_level_value", "ses_alpha_y", "ses_alpha_value",
         "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
         "driver_effect", "driver_effect_value", "driver_factor_y", "driver_factor_value",
+        "driver_effect_raw", "driver_effect_value_raw",
+        "driver_effect_reference", "driver_effect_value_reference",
+        "driver_effect_center", "driver_effect_value_center",
+        "driver_effect_coef_raw", "driver_effect_value_coef_raw",
+        "driver_parent_rls_forecast_y", "driver_parent_rls_forecast_value",
+        "driver_reference_level_y", "driver_reference_level_value",
+        "leaf_forecast_cap_y", "leaf_forecast_cap_value",
+        "leaf_observable_day_index",
+        "leaf_gap_observable_days_y", "leaf_gap_observable_days_value",
+        "leaf_gap_decay_factor_y", "leaf_gap_decay_factor_value",
         "rls_block", "rls_train_days",
     }
     missing = sorted(required - cols)
@@ -151,13 +162,13 @@ def validate(path: Path) -> list[str]:
     # debe reconstruir exactamente esa misma identidad; sin el clip, cualquier
     # efecto RLS suficientemente negativo genera un valor algebraico < 0 aunque
     # producción haya almacenado 0.0, produciendo un falso ERROR de identidad.
-    ident_y = (
+    ident_y_uncapped = (
         (pl.col("ses_level_y").clip(lower_bound=0.0).log1p() + pl.col("driver_effect"))
         .exp()
         .sub(1.0)
         .clip(lower_bound=0.0)
     )
-    ident_v = (
+    ident_v_uncapped = (
         (
             pl.col("ses_level_value").clip(lower_bound=0.0).log1p()
             + pl.col("driver_effect_value")
@@ -166,6 +177,14 @@ def validate(path: Path) -> list[str]:
         .sub(1.0)
         .clip(lower_bound=0.0)
     )
+    # v13.2.11 conserva el guard causal de magnitud de v13.2.10, traced explicitly in the
+    # artifact. A cap value <=0 means inactive for that block.
+    ident_y = pl.when(pl.col("leaf_forecast_cap_y") > 0.0).then(
+        pl.min_horizontal(ident_y_uncapped, pl.col("leaf_forecast_cap_y"))
+    ).otherwise(ident_y_uncapped)
+    ident_v = pl.when(pl.col("leaf_forecast_cap_value") > 0.0).then(
+        pl.min_horizontal(ident_v_uncapped, pl.col("leaf_forecast_cap_value"))
+    ).otherwise(ident_v_uncapped)
     tol = 1e-7
     diff_y = pl.col("yhat_raw") - ident_y
     diff_v = pl.col("valuehat_raw") - ident_v
@@ -188,11 +207,88 @@ def validate(path: Path) -> list[str]:
     if _max_abs(leaf, pl.col("valuehat") - pl.col("valuehat_raw").round(2)) > 1e-9:
         errors.append("valuehat no coincide con round(valuehat_raw, 2)")
 
-    # Factor is simply exp(effect); it is traceability, not a second model.
+    if _count(leaf.filter((pl.col("leaf_forecast_cap_y") < 0.0) | (pl.col("leaf_forecast_cap_value") < 0.0))):
+        errors.append("leaf forecast cap negativo")
+    if _count(leaf.filter((pl.col("leaf_forecast_cap_y") > 0.0) & (pl.col("yhat_raw") > pl.col("leaf_forecast_cap_y") + tol))):
+        errors.append("yhat_raw excede leaf_forecast_cap_y")
+    if _count(leaf.filter((pl.col("leaf_forecast_cap_value") > 0.0) & (pl.col("valuehat_raw") > pl.col("leaf_forecast_cap_value") + tol))):
+        errors.append("valuehat_raw excede leaf_forecast_cap_value")
+
+    # v13.2.11 gap-aware trace. Observable-day indexes/gaps are causal
+    # bookkeeping, while decay factors must remain in (0, 1].
+    if _count(leaf.filter(pl.col("leaf_observable_day_index") < 0)):
+        errors.append("leaf_observable_day_index negativo")
+    if _count(leaf.filter((pl.col("leaf_gap_observable_days_y") < 0) | (pl.col("leaf_gap_observable_days_value") < 0))):
+        errors.append("leaf gap observable negativo")
+    if _count(leaf.filter(
+        (pl.col("leaf_gap_decay_factor_y") <= 0.0)
+        | (pl.col("leaf_gap_decay_factor_y") > 1.0 + tol)
+        | (pl.col("leaf_gap_decay_factor_value") <= 0.0)
+        | (pl.col("leaf_gap_decay_factor_value") > 1.0 + tol)
+    )):
+        errors.append("factor de decay gap-aware fuera de (0,1]")
+
+    # Factor is simply exp(stabilized effect); it is traceability, not a second model.
     if _max_abs(leaf, pl.col("driver_factor_y") - pl.col("driver_effect").exp()) > tol:
         errors.append("driver_factor_y != exp(driver_effect)")
     if _max_abs(leaf, pl.col("driver_factor_value") - pl.col("driver_effect_value").exp()) > tol:
         errors.append("driver_factor_value != exp(driver_effect_value)")
+
+    # v13.2.10 regression gate: the transferred parent factor starts from the
+    # identifiable parent forecast / causal parent-level ratio, then removes a
+    # causal block-wide calibration center before the final factor guard. The
+    # non-identifiable coefficient split is retained only as audit metadata.
+    fmin = float(getattr(settings, "LEAF_DRIVER_FACTOR_MIN", 0.50))
+    fmax = float(getattr(settings, "LEAF_DRIVER_FACTOR_MAX", 2.00))
+    bad_factor_y = scored.filter(
+        (pl.col("driver_factor_y") < fmin - tol) | (pl.col("driver_factor_y") > fmax + tol)
+    )
+    bad_factor_v = scored.filter(
+        (pl.col("driver_factor_value") < fmin - tol)
+        | (pl.col("driver_factor_value") > fmax + tol)
+    )
+    if _count(bad_factor_y):
+        errors.append(f"driver_factor_y fuera del guard [{fmin}, {fmax}]")
+    if _count(bad_factor_v):
+        errors.append(f"driver_factor_value fuera del guard [{fmin}, {fmax}]")
+
+    lo = float(math.log(fmin))
+    hi = float(math.log(fmax))
+    expected_effect_y = (
+        pl.col("driver_effect_raw")
+        - pl.col("driver_effect_reference")
+        - pl.col("driver_effect_center")
+    ).clip(lo, hi)
+    expected_effect_v = (
+        pl.col("driver_effect_value_raw")
+        - pl.col("driver_effect_value_reference")
+        - pl.col("driver_effect_value_center")
+    ).clip(lo, hi)
+    if _max_abs(scored, pl.col("driver_effect") - expected_effect_y) > tol:
+        errors.append("driver_effect no coincide con raw-reference-center + guard")
+    if _max_abs(scored, pl.col("driver_effect_value") - expected_effect_v) > tol:
+        errors.append("driver_effect_value no coincide con raw-reference-center + guard")
+
+    # Source identity of the v13.2.10 transfer: raw is log1p(parent RLS forecast)
+    # and reference is log1p(causal parent level). The additional center is a
+    # causal calibration offset derived from identifiable relative forecasts.
+    # Coefficient decomposition is deliberately NOT used productively.
+    raw_from_parent_y = pl.col("driver_parent_rls_forecast_y").clip(lower_bound=0.0).log1p()
+    raw_from_parent_v = pl.col("driver_parent_rls_forecast_value").clip(lower_bound=0.0).log1p()
+    ref_from_level_y = pl.col("driver_reference_level_y").clip(lower_bound=0.0).log1p()
+    ref_from_level_v = pl.col("driver_reference_level_value").clip(lower_bound=0.0).log1p()
+    if _max_abs(scored, pl.col("driver_effect_raw") - raw_from_parent_y) > tol:
+        errors.append("driver_effect_raw != log1p(forecast RLS parent)")
+    if _max_abs(scored, pl.col("driver_effect_value_raw") - raw_from_parent_v) > tol:
+        errors.append("driver_effect_value_raw != log1p(forecast RLS parent)")
+    if _max_abs(scored, pl.col("driver_effect_reference") - ref_from_level_y) > tol:
+        errors.append("driver_effect_reference != log1p(nivel causal parent)")
+    if _max_abs(scored, pl.col("driver_effect_value_reference") - ref_from_level_v) > tol:
+        errors.append("driver_effect_value_reference != log1p(nivel causal parent)")
+    if _count(scored.filter(pl.col("driver_reference_level_y") <= 0.0)):
+        errors.append("hay filas post-warmup sin nivel causal parent de Unidades")
+    if _count(scored.filter(pl.col("driver_reference_level_value") <= 0.0)):
+        errors.append("hay filas post-warmup sin nivel causal parent de Valor")
 
     # Forecast-only never enters metric selection.
     if _count(leaf.filter((pl.col("period_type") == "forecast_only") & pl.col("rls_metric_eligible").fill_null(False))):

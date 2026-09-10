@@ -3,7 +3,7 @@ import settings
 
 
 def test_version_is_major_architecture_reset():
-    assert settings.APP_VERSION == "13.2.6"
+    assert settings.APP_VERSION == "13.2.11"
     assert settings.UPDATE_BLOCK_OPTIONS == (1, 7, 14, 28)
     assert settings.METRIC_HORIZON_DAYS == 28
 
