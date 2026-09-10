@@ -88,7 +88,7 @@ def densify_section_panel(
         fills.append(pl.col("conteo_sku").fill_null(0))
     # Densified calendar rows have no observed source row.  Intercept is a
     # structural driver and must remain 1 on those dates; a null/zero intercept
-    # changes the RLS equation and generated warnings in v11.2.2.
+    # cambiaría la ecuación RLS y generaría inconsistencias.
     if "intercept" in out.columns:
         fills.append(pl.col("intercept").fill_null(1).cast(pl.Int8))
     else:

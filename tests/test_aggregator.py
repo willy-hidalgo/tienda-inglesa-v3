@@ -131,4 +131,3 @@ def test_y_sum_section(sample_sales):
 def test_aggregation_levels_order():
     keys = list(settings.AGGREGATION_LEVELS.keys())
     assert keys == ["SECCION", "STORE_ID", "SKU_ID"]
-    assert settings.FORECAST_LEVELS == ["seccion", "store", "sku"]

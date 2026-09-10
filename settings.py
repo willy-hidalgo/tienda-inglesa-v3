@@ -9,26 +9,16 @@ import datetime as dt
 import os
 from pathlib import Path
 
-APP_VERSION: str = "12.9.12"
+APP_VERSION: str = "13.2.17"
 
-# ── Flag de modelo a nivel hoja ──────────────────────────────────────────────
-DEMO_MODE = os.environ.get("TI_DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+# No existe corrección post-hoc de sesgo por período: in-sample, OOS y
+# forecast-only usan exactamente la misma familia/modelo en cada origen.
 
-# Corrección de sesgo OOS/forecast: factor = Σy/Σŷ en in_sample (por unique_id).
-# Se aplica solo a out_sample y forecast_only (in_sample queda crudo).
-BIAS_CORRECTION: bool = True  # solo nodos agregados; SKU+tienda se excluye estructuralmente
-BIAS_CORRECTION_MIN_POINTS: int = 7
-BIAS_CORRECTION_CLIP: tuple[float, float] = (0.5, 2.0)
-WRITE_SECTION_CHECKPOINTS: bool = False  # checkpoints completos son opt-in; costosos en I/O
-
-# v12.8.5 memory-safe multi-cadence demo.  Para cadencias menores a 28d
-# los estados leaf intermedios crecen casi inversamente con el tamaño de bloque.
-# Se derraman a parquet temporal y se limita el paralelismo para mantener la RAM
-# acotada. El escenario 28d conserva el camino rápido histórico.
+# Ejecución multi-cadencia memory-safe. Para cadencias menores a 28d se limita
+# el paralelismo y se persisten resultados por sección para mantener la RAM acotada.
 MULTIBLOCK_MEMORY_SAFE: bool = True
 MULTIBLOCK_MEMORY_SAFE_THRESHOLD_DAYS: int = 28
 MULTIBLOCK_MAX_JOBS: dict[int, int] = {1: 1, 7: 2, 14: 4, 28: 8}
-MULTIBLOCK_SPILL_COMPRESSION: str = "zstd"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rutas (ancladas al propio archivo → independientes del cwd)
@@ -41,7 +31,6 @@ MASTER_PATH = OUT_DIR / "master.parquet"
 SALES_PATH = OUT_DIR / "sales.parquet"
 SELECTED_PATH = OUT_DIR / "selected.parquet"
 FORECAST_PATH = OUT_DIR / "forecast.parquet"
-WMAPE_PATH = OUT_DIR / "wmape.parquet"
 
 MASTER_XLSX_FILENAME = "Mercadologico_Tienda_secc_1_y_23.xlsx"
 MASTER_DAT_FILENAME = "MercadologicoTienda.dat"
@@ -51,7 +40,6 @@ SALES_FILES_GLOB = "Valida_Profi*"
 # Secciones y filtros
 # ─────────────────────────────────────────────────────────────────────────────
 FOCUS_SECTIONS = ["1", "23"]
-EXCLUDED_CATEGORIES_FOR_RANGE: list[str] = []
 
 SALES_DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
 SOURCE_ENCODING = "cp1252"
@@ -61,8 +49,6 @@ SOURCE_ENCODING = "cp1252"
 # ─────────────────────────────────────────────────────────────────────────────
 # Fechas globales de compatibilidad; las ventanas operativas se definen por
 # sección en SECCIONES y se resuelven con section_horizons().
-TEST_START = dt.date(2025, 11, 1)
-TEST_END = dt.date(2026, 1, 1)
 METRIC_HORIZON_DAYS = 28
 
 # El artefacto wmape.parquet del pipeline prioriza OOS para evitar agregaciones
@@ -75,13 +61,16 @@ PIPELINE_WMAPE_OOS_ONLY: bool = True
 #   actuals 1..84   -> modelo para forecast 85..112
 # La implementación usa un único recorrido RLS y snapshots de coeficientes en
 # cada corte de 28 días; evita refits completos y conserva la semántica expansiva.
-RLS_FIT_MODE: str = "expanding_28"  # "current" restaura el fit único anterior
-# Cadencia de actualización del modelo. Para la demo puede ser 1/7/14/28 días.
+# Cadencia de actualización del modelo: 1/7/14/28 días.
 # OOS y forecast-only permanecen fijos en METRIC_HORIZON_DAYS=28 para que
 # los escenarios sean directamente comparables.
 UPDATE_BLOCK_OPTIONS: tuple[int, ...] = (1, 7, 14, 28)
 RLS_BLOCK_DAYS: int = 28
 RLS_INITIAL_SEED_DAYS: int = 28
+# v13.2.11: todas las cadencias comparten exactamente la misma historia al
+# origen OOS. La longitud canónica es múltiplo de 28, por lo que también es
+# divisible por 1/7/14/28 y no altera la semántica de actualización.
+CANONICAL_HISTORY_BLOCK_DAYS: int = 28
 UPDATE_BLOCKS_DIR = OUT_DIR / "update_blocks"
 
 def update_block_out_dir(days: int) -> Path:
@@ -93,7 +82,7 @@ def update_block_out_dir(days: int) -> Path:
 def update_block_forecast_path(days: int) -> Path:
     return update_block_out_dir(days) / "forecast.parquet"
 
-# v11.2 performance contract: RLS numerical kernels must execute in Numba
+# Performance contract: RLS numerical kernels must execute in Numba
 # nopython mode. With ~100 drivers the covariance update is O(p^2); executing
 # that double loop in Python is not production-viable. cache=True avoids paying
 # compilation cost on every process invocation.
@@ -104,468 +93,163 @@ RLS_NUMBA_KERNELS_REQUIRED: bool = True
 # bloques expanding-28. "current" restaura el cálculo anterior.
 METRICS_MODE: str = "rolling_28"
 
-# SKU+tienda: arquitectura v11.5 (OOS final + fallbacks robustos causales).
-# Regla simple y auditable:
-#   1) SES puro determina el NIVEL base leaf.
-#   2) RLS tienda o sección aporta FORMA y puede aportar UPLIFT DE NIVEL.
-#   3) shape_only y level_shape compiten causalmente con bloques ya cerrados.
-#   4) No existe modelo leaf "none" ni selección mirando el bloque objetivo.
-FAST_LEAF_MODE: bool = True
+# SKU+tienda: contrato productivo único y explicable (v13).
+#   1) Nivel = SES de magnitudes positivas desestacionalizadas.
+#   2) Estado inicial = mediana positiva de los primeros 28 días calendario.
+#   3) El mejor alpha SES se selecciona causalmente con bloques previos.
+#   4) RLS tienda/sección aporta movimiento relativo de su forecast respecto
+#      del nivel causal reciente del parent; el SES aporta el nivel base leaf.
+#   5) Tienda vs sección se elige por wMAPE RLS acumulado de bloques previos.
+#   6) La MISMA composición genera in-sample, OOS y forecast-only.
 LEAF_INITIAL_LEVEL_DAYS: int = 28
 LEAF_SES_ALPHA: float = 0.10
 LEAF_SES_ALPHA_CANDIDATES: tuple[float, ...] = (
     0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.70, 0.80
 )
-LEAF_ALPHA_SCORE_WEIGHTS: tuple[float, float, float, float] = (
-    0.60, 0.30, 0.10, 0.00
-)
-LEAF_ALPHA_BIAS_WEIGHT: float = 0.20
-LEAF_ALPHA_SCORE_MIN_DEN: float = 1e-9
-
-# Detección conservadora de régimen. El nivel estructural es la mediana de
-# hasta 5 bloques COMPLETOS anteriores a B0. Trend requiere tres transiciones
-# consecutivas B3→B2→B1→B0; uno/dos bloques extremos se tratan como transitorio.
-LEAF_REGIME_HISTORY_BLOCKS: int = 5
-LEAF_REGIME_MIN_HISTORY_BLOCKS: int = 4
-LEAF_REGIME_TREND_UP_RATIO: float = 1.05
-LEAF_REGIME_TREND_DOWN_RATIO: float = 0.95
-LEAF_REGIME_TREND_MAX_STEP_RATIO: float = 2.00
-LEAF_REGIME_TRANSIENT_RATIO: float = 1.75
-LEAF_REGIME_EPS: float = 1e-9
-LEAF_RESET_TRANSIENT: bool = True
-LEAF_TRANSIENT_DOWN_ALPHA: float = 0.20
-
-# RLS obligatorio: sección o tienda, nunca "none", siempre con efecto completo.
-LEAF_PARENT_CANDIDATES: tuple[str, str] = ("store", "section")
 LEAF_PARENT_DEFAULT: str = "store"
-LEAF_PARENT_DRIVER_STRENGTH: float = 1.00
+# Transferencia RLS→hoja estable e identificable (v13.2.10).
+# El SES es dueño del nivel leaf. El parent RLS aporta SOLO movimiento relativo:
+# forecast_parent / nivel_parent_causal. El nivel parent causal se calcula con
+# actuals positivos de bloques cerrados previos, por lo que no existe leakage.
+# Esto evita usar la descomposición no-intercepto de coeficientes RLS, que no es
+# identificable bajo colinealidad y podía explotar en 1d aunque el forecast parent
+# agregado fuese razonable. Además, el cociente identificable se centra contra
+# su referencia causal reciente; si TODO un bloque cambia de offset >1.5x, ese
+# salto persistente se trata como cambio de nivel del parent (propiedad del SES)
+# y no como driver leaf. La variación diaria dentro del bloque sí se conserva.
+LEAF_DRIVER_EFFECT_LIMIT: float = 20.0  # guard numérico de trazabilidad del coeficiente bruto
+LEAF_DRIVER_REFERENCE_DAYS: int = 28
+LEAF_DRIVER_REFERENCE_MIN_POINTS: int = 7
+LEAF_DRIVER_REFERENCE_SHIFT_FACTOR: float = 1.50
+LEAF_DRIVER_FACTOR_MIN: float = 0.50
+LEAF_DRIVER_FACTOR_MAX: float = 2.00
 
-# v11.5: para cada padre compiten causalmente dos interpretaciones del RLS:
-# - shape_only: forma diaria con media 1 (comportamiento v11.4);
-# - level_shape: misma forma + cambio de nivel del bloque que anticipa el RLS
-#   frente al nivel real del bloque inmediatamente anterior.
-# La selección usa exclusivamente errores de bloques ya cerrados.
-LEAF_PARENT_DRIVER_MODES: tuple[str, str] = ("shape_only", "level_shape")
-# v11.6: v11.5 showed that parent level_shape reduced BIAS but worsened wMAPE
-# materially (and produced store-level overshoot). Keep the implementation for
-# audit/A-B work, but production selection uses parent shape only.
-LEAF_PARENT_LEVEL_SHAPE_SELECTABLE: bool = False
-LEAF_PARENT_DEFAULT_DRIVER_MODE: str = "shape_only"
+# v13.2.10: robustez causal del estado SES leaf. Cada observación positiva
+# desestacionalizada puede mover el estado solo dentro de un rango relativo al
+# estado disponible al origen; no usa información futura ni cambia la familia SES.
+LEAF_SES_UPDATE_FACTOR_MIN: float = 0.50
+LEAF_SES_UPDATE_FACTOR_MAX: float = 2.00
 
-# SKU-specific annual seasonality: 13 x 28 days = 364 days, aligned by weekday.
-# The factor is calculated from SKU aggregate sales across stores and selected
-# causally against the existing forecast on the preceding validation block.
-LEAF_SKU_SEASONAL_ENABLED: bool = True
-LEAF_SKU_SEASONAL_LAG_BLOCKS: int = 13
-LEAF_SKU_SEASONAL_MIN_POSITIVE_OBS: int = 14
-LEAF_SKU_SEASONAL_FULL_WEIGHT_OBS: int = 56
-LEAF_SKU_SEASONAL_FACTOR_CLIP: tuple[float, float] = (0.50, 2.50)
 
-# La forma diaria se acota con una única escala alrededor de 1. El multiplicador
-# de nivel de level_shape usa el mismo límite causal de salto de régimen definido
-# por LEAF_REGIME_TREND_MAX_STEP_RATIO.
-FAST_LEAF_DRIVER_FACTOR_CLIP: tuple[float, float] = (0.20, 5.00)
-LEAF_DRIVER_MEAN_TOLERANCE: float = 1e-6
-LEAF_REQUIRE_PARENT_DRIVERS: bool = True
+# v13.2.15: gap observability never mutates the SES state. A bounded staleness
+# factor is computed from information available at the block origin; at the OOS
+# boundary it is snapshotted once and then frozen for the complete OOS/FO run.
+# Thus all cadences start from the same gap adjustment and cannot compound it.
+LEAF_GAP_AWARE_ENABLED: bool = True
+LEAF_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 1
+# Para gaps de 1..83 días se usa un ajuste de staleness acotado al origen;
+# para >=84 días entra el estado de dormancia definido abajo. Nunca muta SES.
+LEAF_GAP_DECAY_ALPHA_FLOOR: float = 0.025
+LEAF_GAP_DECAY_MAX_OBSERVABLE_DAYS: int = 84
+LEAF_GAP_DECAY_MIN_FACTOR: float = 0.10
+LEAF_GAP_REACTIVATION_ROBUST_BYPASS_DAYS: int = 28
+LEAF_GAP_REACTIVATION_ALPHA_MAX: float = 0.20
+# On the first closed positive after a long gap, the stale state is clamped
+# around that observed deseasonalized magnitude before the normal SES update.
+# This affects only subsequent blocks and prevents both stale-high and stale-low
+# levels from dominating a reactivated series.
+LEAF_GAP_REACTIVATION_STATE_FACTOR: float = 2.00
 
-LEAF_ZERO_FILL_MISSING_CALENDAR_DAYS: bool = True
-LEAF_FORECAST_LEVEL_MEAN_TOLERANCE: float = 0.02
-LEAF_LEVEL_REFERENCE_WARN_RATIO: float = 4.0
-LEAF_DIAGNOSTIC_TOP_N: int = 10
-LEAF_DIAGNOSTIC_LEVEL_RATIO: float = 3.0
-LEAF_DIAGNOSTIC_FORECAST_RATIO: float = 3.0
+# v13.2.15: una hoja con >=84 días observables sin venta se trata como
+# dormante en el forecast hasta que una venta positiva real cierre el bloque.
+# Se usa epsilon >0 (no cero exacto) para preservar la identidad log/validator.
+LEAF_GAP_DORMANT_OBSERVABLE_DAYS: int = 28
+LEAF_GAP_DORMANT_FACTOR: float = 1e-12
 
-# v11.2: OOS siempre es el último bloque observado de 28 días. No puede haber
-# actuals posteriores a OOS; forecast-only empieza exactamente al día siguiente.
-OOS_USE_LAST_28_ACTUAL_DAYS: bool = True
+# Guard causal de magnitud del forecast leaf. Se activa solo después de contar
+# suficientes positivos ya cerrados y limita el forecast a un múltiplo del
+# máximo positivo observado ANTES del bloque. El valor 2.0 coincide con el gate
+# de no-regresión y deja margen amplio para crecimiento real.
+LEAF_FORECAST_HISTORY_MAX_MULTIPLIER: float = 2.00
+# v13.2.15: segundo guard robusto por escala media positiva cerrada. El cap
+# productivo es el mínimo entre 2x máximo histórico y 4x media positiva; tras
+# gaps largos usa 2x media para evitar arrastrar un nivel pre-gap obsoleto.
+LEAF_FORECAST_HISTORY_MEAN_MULTIPLIER: float = 4.00
+LEAF_LONG_GAP_FORECAST_MEAN_MULTIPLIER: float = 2.00
+LEAF_FORECAST_GUARD_MIN_POSITIVE_POINTS: int = 7
 
-# Fallbacks causales para hojas de alto error. El trigger usa únicamente error
-# histórico anterior al bloque objetivo. Nunca se selecciona un modelo mirando
-# los actuals del propio OOS.
-LEAF_FALLBACK_ENABLED: bool = True
-LEAF_FALLBACK_ENGINE: str = "vectorized_sparse"
-LEAF_FALLBACK_TRIGGER_WMAPE: float = 0.60
-LEAF_FALLBACK_MIN_IMPROVEMENT: float = 0.02
-LEAF_FALLBACK_BIAS_WEIGHT: float = 0.20
-LEAF_FALLBACK_MIN_HISTORY_DAYS: int = 84
-LEAF_FALLBACK_MIN_POSITIVE_HISTORY: int = 14
-# Fallbacks are selected only from validation blocks with enough observed
-# sales days to be statistically defensible and consistent with Active OOS.
-# v11.5 preserves fallback level conditional on actual>0 because the official
-# client wMAPE/BIAS uses exactly that same support. Zero-demand impact remains
-# reported separately and is not hidden from acceptance.
-LEAF_FALLBACK_MIN_VALIDATION_SALES: int = 7
-LEAF_FALLBACK_PEAK_MAD_MULTIPLIER: float = 4.0
-LEAF_FALLBACK_PEAK_MEDIAN_MULTIPLIER: float = 3.0
+# Contrato v13: OOS no participa en tuning, pero los actuals de un bloque OOS
+# cerrado SÍ pueden actualizar el estado operativo para el siguiente origen de
+# esa misma cadencia. La envolvente evita drift explosivo sin congelar el estado.
+LEAF_OOS_STATE_ANCHOR_MIN_FACTOR: float = 0.75
+LEAF_OOS_STATE_ANCHOR_MAX_FACTOR: float = 1.25
 
-# Diagnóstico detallado se deja fuera del hot path. Las invariantes de producción
-# siguen activas; el análisis exhaustivo queda en validate_v11/diagnose_leaf.
-LEAF_RUNTIME_DETAILED_DIAGNOSTICS: bool = False
-LEAF_SORT_OUTPUT: bool = False
+# v13.2.16: robustez del nivel al origen OOS. Si el SES quedó elevado por
+# picos recientes, se limita solo hacia arriba usando la mediana causal de las
+# últimas ventas positivas desestacionalizadas. No cambia alpha ni drivers.
+LEAF_OOS_RECENT_POSITIVE_WINDOW: int = 28
+LEAF_OOS_RECENT_MEDIAN_MIN_POINTS: int = 7
+LEAF_OOS_RECENT_MEDIAN_MAX_FACTOR: float = 1.50
 
-# --------------------------------------------------------------------------- #
-# v12 challenger: SKU total diario + occurrence/store-share allocation
-# --------------------------------------------------------------------------- #
-# v11.6.1 remains the incumbent. v12 is selected per leaf/target only from
-# strictly CLOSED 28-day blocks. No actual from the target block is used.
-V12_LEAF_CHALLENGER_ENABLED: bool = True
-V12_HISTORY_DAYS: int = 84
-V12_MIN_HISTORY_DAYS: int = 56
-V12_MIN_VALIDATION_SALES: int = 7
-V12_MIN_IMPROVEMENT: float = 0.02
-# Historical closed-block scoring pool. v12.9 materializes 5 blocks so Value
-# can form 3 walk-forward pseudo-OOS folds. Quantity explicitly slices back to
-# the first 4 blocks, preserving the v12.8.6 policy.
-V12_BIAS_WEIGHT: float = 0.00  # retained only for backwards config compatibility
-V12_SELECTION_BLOCKS: int = 5
-V12_SELECTION_MIN_BLOCKS: int = 2
-V12_SELECTION_MIN_WINS: int = 2
-V12_REQUIRE_RECENT_WIN: bool = True
-V12_RECENT_MIN_IMPROVEMENT: float = 0.02
-# v12.8: occurrence/share remains shared because quantity and value describe
-# the same retail event, but the FINAL magnitude family is target-specific.
-# The v12.7 OOS oracle showed that forcing Qty/Valor to switch together can
-# improve one target while degrading the other.
-V12_REQUIRE_JOINT_TARGET_WIN: bool = False
-V12_MAX_BLOCK_DEGRADATION: float = 0.08
-V12_MAX_ABS_BIAS_WORSEN: float = 0.10
-V12_SECTION_MIN_IMPROVEMENT: float = 0.005
-V12_SECTION_MIN_WINS: int = 2
-V12_SECTION_REQUIRE_RECENT_WIN: bool = True
-
-# v12.7: selector utility = wMAPE + lambda*|BIAS|, with an explicit
-# stability penalty across closed discovery blocks. wMAPE remains the primary
-# objective and the section portfolio gate still requires non-negative wMAPE
-# improvement; these knobs only make leaf selection less brittle to one lucky
-# block while preserving causal validation.
-V12_SELECTOR_BIAS_WEIGHT: float = 0.25
-V12_SELECTOR_STABILITY_WEIGHT: float = 0.10
-V12_SELECTOR_MIN_UTILITY_IMPROVEMENT: float = 0.0025
-V12_SELECTOR_MIN_WMAPE_IMPROVEMENT: float = 0.02
-
-# v12.8 causal meta-selector.  One pooled regularized logistic model per
-# section/target learns whether v12 beats v11 in the NEXT closed 28-day block.
-# Training labels come from the latest closed block and features come only from
-# older blocks; the target forecast is scored from its own closed history.
-V12_META_SELECTOR_ENABLED: bool = True
-V12_META_SELECTOR_THRESHOLD: float = 0.55
-V12_META_SELECTOR_THRESHOLDS: tuple[float, ...] = (0.45, 0.50, 0.55, 0.60, 0.65)
-V12_META_SELECTOR_L2: float = 1.00
-V12_META_SELECTOR_MAX_ITER: int = 30
-V12_META_SELECTOR_MIN_TRAIN_ROWS: int = 500
-V12_META_SELECTOR_MIN_FEATURE_BLOCKS: int = 2
-V12_META_SELECTOR_RECENCY_WEIGHTS: tuple[float, float, float] = (0.55, 0.30, 0.15)
-V12_META_SELECTOR_MAX_RECENT_DEGRADATION: float = 0.08
-# v12.8.2: the leaf selector no longer depends on the legacy section gate.
-# A temporally older meta-model scores the latest CLOSED validation block;
-# that block then selects both the probability threshold and the causal
-# portfolio mode (v11_all / v12_all / meta_leaf).  The production meta-model
-# is shifted one block forward and never sees target actuals.
-V12_META_SELECTOR_ADAPTIVE_POLICY: bool = True
-V12_META_SELECTOR_BIAS_GUARD_TOLERANCE: float = 0.03
-V12_META_PORTFOLIO_BIAS_GUARD_TOLERANCE: float = 0.03
-V12_META_PORTFOLIO_MIN_UTILITY_GAIN: float = 0.0025
-
-# v12.8.3 Value Portfolio Safety. Quantity keeps the v12.8.2 policy unchanged.
-# Value applies a second, strictly causal safety layer before an all-portfolio
-# switch is authorized.  All checks are calibrated/evaluated on CLOSED blocks.
-V12_VALUE_PORTFOLIO_SAFETY_ENABLED: bool = True
-V12_VALUE_ALL_MIN_RECENT_CONFIRMATIONS: int = 2
-V12_VALUE_ALL_BIAS_COVERAGE_GRID: tuple[float, ...] = (0.50, 0.55, 0.60, 0.65)
-V12_VALUE_META_LEAF_MIN_UTILITY_GAIN: float = 0.0025
-V12_VALUE_SAFETY_MIN_CLOSED_LEAVES: int = 100
-
-# v12.9.2: walk-forward portfolio selector for Value ($). Quantity remains
-# frozen on the v12.8.6 four-block policy.  Value uses three strictly closed
-# pseudo-OOS folds and bottom-up volume-weighted portfolio statistics before a
-# full-family switch is promoted.
-V129_VALUE_WALK_FORWARD_ENABLED: bool = True
-V129_VALUE_WF_FOLDS: int = 3
-V129_VALUE_WF_MIN_FOLDS: int = 3
-V129_VALUE_WF_MIN_WIN_RATE: float = 2.0 / 3.0
-V129_VALUE_WF_MIN_MEDIAN_WMAPE_GAIN: float = 0.0025
-V129_VALUE_WF_MAX_WORST_WMAPE_DEGRADATION: float = 0.04
-V129_VALUE_WF_MAX_ABS_BIAS_WORSEN: float = 0.02
-V129_VALUE_WF_MIN_PROMOTION_UTILITY_GAIN: float = 0.0030
-V129_VALUE_WF_META_MIN_FOLDS: int = 2
-V129_VALUE_WF_META_MARGIN_OVER_ALL: float = 0.0025
-V129_QTY_FROZEN_SELECTION_BLOCKS: int = 4
-
-# v12.9.2: selector leaf de Valor basado en expected gain causal.
-# Se entrena con pseudo-OOS cerrados y sample_weight proporcional al denominador
-# de wMAPE.  Un margen conservador + estabilidad histórica decide cuándo v12
-# merece desplazar al incumbente v11.
-V1291_VALUE_EXPECTED_GAIN_ENABLED: bool = True
-V1291_VALUE_EXPECTED_GAIN_LABEL_BLOCKS: tuple[int, ...] = (1, 2, 3)
-V1291_VALUE_EXPECTED_GAIN_FEATURE_BLOCKS: int = 3
-V1291_VALUE_EXPECTED_GAIN_L2: float = 2.0
-V1291_VALUE_EXPECTED_GAIN_MIN_TRAIN_ROWS: int = 1000
-V1291_VALUE_EXPECTED_GAIN_MIN_GAIN: float = 0.0050
-V1291_VALUE_EXPECTED_GAIN_MIN_CONFIDENCE: float = 0.10
-V1291_VALUE_EXPECTED_GAIN_MAX_GAIN_RANGE: float = 1.00
-V1291_VALUE_EXPECTED_GAIN_MAX_RECENT_DEGRADATION: float = 0.08
-V1291_VALUE_EXPECTED_GAIN_PORTFOLIO_MIN_EXPECTED_GAIN: float = 0.0025
-V1291_VALUE_EXPECTED_GAIN_PORTFOLIO_MAX_SHARE: float = 0.80
-
-# v12.9.2: calibrated expected-impact selector. Raw ridge magnitude is mapped
-# through strictly-temporal OOF buckets; large-impact leaves face asymmetric
-# downside guards and the final portfolio has a capped volume budget.
-V1292_VALUE_EXPECTED_IMPACT_ENABLED: bool = True
-V1292_VALUE_MIN_CALIBRATION_ROWS: int = 1000
-V1292_VALUE_MIN_CALIBRATED_GAIN: float = 0.0040
-V1292_VALUE_MIN_CONFIDENCE: float = 0.15
-V1292_VALUE_MAX_BUCKET_LOSS_RATE: float = 0.55
-V1292_VALUE_MAX_LEAF_LOSS_RATE: float = 0.67
-V1292_VALUE_MIN_P10_GAIN: float = -0.08
-V1292_VALUE_TOP10_MIN_GAIN: float = 0.0080
-V1292_VALUE_TOP10_MIN_CONFIDENCE: float = 0.25
-V1292_VALUE_TOP10_MAX_LEAF_LOSS_RATE: float = 0.50
-V1292_VALUE_TOP10_MIN_P10_GAIN: float = -0.04
-V1292_VALUE_TOP02_MIN_GAIN: float = 0.0150
-V1292_VALUE_TOP02_MIN_CONFIDENCE: float = 0.35
-V1292_VALUE_TOP02_MAX_LEAF_LOSS_RATE: float = 0.34
-V1292_VALUE_TOP02_MIN_P10_GAIN: float = -0.02
-V1292_VALUE_PORTFOLIO_MIN_EXPECTED_GAIN: float = 0.0025
-V1292_VALUE_PORTFOLIO_MAX_VOLUME_SHARE: float = 0.45
-
-# v12.9.3: hierarchical, interpretable segment walk-forward selector for Value ($).
-# Productive only for the canonical 28-day update cadence. The v12.9.1/2 ridge
-# expected-impact layer remains diagnostic and never authorizes production.
-V1293_VALUE_SEGMENT_SELECTOR_ENABLED: bool = True
-V1293_VALUE_SEGMENT_FOLDS: int = 3
-V1293_VALUE_SEGMENT_MAX_VOLUME_SHARE: float = 0.45
-V1293_VALUE_SECTION_STRONG_GAIN: float = 0.030
-V1293_VALUE_L4_MIN_LEAVES: int = 20
-V1293_VALUE_L3_MIN_LEAVES: int = 40
-V1293_VALUE_L2_MIN_LEAVES: int = 80
-V1293_VALUE_L1_MIN_LEAVES: int = 500
-
-# v12.9.4: freeze Sec.1 and add strict volume-risk control only for Value Sec.23.
-V1294_VALUE_SEC23_MAX_VOLUME_SHARE: float = 0.25
-V1294_VALUE_SEC23_MAX_SEGMENT_VOLUME_SHARE: float = 0.08
-V1294_VALUE_TOP01_PERCENTILE: float = 0.99
-V1294_VALUE_TOP05_PERCENTILE: float = 0.95
-V1294_VALUE_TOP01_MIN_WEIGHTED_GAIN: float = 0.040
-V1294_VALUE_TOP01_MIN_WORST_GAIN: float = 0.020
-V1294_VALUE_TOP05_MIN_WEIGHTED_GAIN: float = 0.025
-V1294_VALUE_TOP05_MIN_WORST_GAIN: float = 0.010
-V1294_VALUE_TOP01_MAX_BIAS_WORSEN: float = 0.000
-V1294_VALUE_TOP05_MAX_BIAS_WORSEN: float = 0.010
-V1294_VALUE_SEGMENT_DOWNSIDE_WEIGHT: float = 5.0
-
-# v12.9.5: long-horizon segment stress test. Diagnostic only: it must never
-# authorize a production v12 switch. We materialize up to 12 historical closed
-# 28-day blocks while the productive v12.9.4 selector continues to use its
-# original five-block pool / three-fold segment policy.
-V1295_STRESS_TEST_ENABLED: bool = True
-V1295_STRESS_TEST_BLOCKS: int = 12
-V1295_STRESS_TEST_MIN_FOLDS: int = 8
-V1295_STRESS_MIN_WIN_RATE: float = 0.75
-V1295_STRESS_MIN_MEDIAN_GAIN: float = 0.0
-V1295_STRESS_MIN_P25_GAIN: float = 0.0
-V1295_STRESS_MIN_P10_GAIN: float = -0.03
-V1295_STRESS_MAX_BIAS_P90_WORSEN: float = 0.02
-V1295_STRESS_MAX_CONSECUTIVE_LOSSES: int = 2
-
-# v12.9.6: Sec23 Value long-horizon stress-gated production selector.
-# Sec1 remains frozen on the v12.9.3/5 policy; Sec23 starts from v11 and only
-# promotes sufficiently specific L4 (or evidence-insufficient L3 backoff) segments.
-V1296_SEC23_STRESS_GATE_ENABLED: bool = True
-V1296_SEC23_MIN_FOLDS: int = 8
-V1296_SEC23_MIN_WIN_RATE: float = 0.75
-V1296_SEC23_MIN_MEDIAN_GAIN: float = 0.0
-V1296_SEC23_MIN_P25_GAIN: float = 0.0
-V1296_SEC23_MIN_P10_GAIN: float = -0.01
-V1296_SEC23_MAX_BIAS_P90_WORSEN: float = 0.015
-V1296_SEC23_MAX_CONSECUTIVE_LOSSES: int = 2
-V1296_SEC23_ALLOW_L3_BACKOFF: bool = True
-V1296_SEC23_MAX_VOLUME_SHARE: float = 0.15
-V1296_SEC23_TOP05_PERCENTILE: float = 0.95
-V1296_SEC23_TOP01_PERCENTILE: float = 0.99
-V1296_SEC23_HIGH_IMPACT_MIN_P10_GAIN: float = 0.0
-
-# v12.9.7: multi-cutoff temporal robustness replay. Diagnostic only.
-# Replays the promoted Sec23 Value policy on historical pseudo-OOS cutoffs,
-# training each cutoff strictly on older 28-day blocks. Production remains
-# frozen on the v12.9.6 L4 long-horizon stress gate.
-V1297_TEMPORAL_REPLAY_ENABLED: bool = True
-V1297_TEMPORAL_REPLAY_MAX_CUTOFFS: int = 4
-V1297_TEMPORAL_REPLAY_MIN_TRAIN_FOLDS: int = 8
-V1297_TEMPORAL_REPLAY_MIN_WIN_RATE: float = 0.75
-V1297_TEMPORAL_REPLAY_MIN_MEDIAN_GAIN: float = 0.0
-V1297_TEMPORAL_REPLAY_MIN_WORST_GAIN: float = -0.005
-V1297_TEMPORAL_REPLAY_MAX_BIAS_WORSEN: float = 0.01
-
-# v12.9.8: causal sparse-demand bias rescue challenger.  Diagnostic only in
-# this version: it estimates a conservative multiplicative uplift for leaves
-# whose latest CLOSED 28d block had only 7-13 positive-sales days.  The factor
-# is learned exclusively from older closed blocks and is scored on current OOS
-# only in the acceptance report.  Production forecasts remain v12.9.7.
-V1298_SPARSE_BIAS_DIAGNOSTIC_ENABLED: bool = True
-V1298_SPARSE_BIAS_MIN_FOLDS: int = 8
-V1298_SPARSE_BIAS_BUCKETS: tuple[str, ...] = ("07-09", "10-13")
-V1298_SPARSE_BIAS_MIN_MEDIAN_RATIO: float = 1.05
-V1298_SPARSE_BIAS_MIN_P25_RATIO: float = 1.00
-V1298_SPARSE_BIAS_MIN_WORST_RATIO: float = 0.90
-V1298_SPARSE_BIAS_SHRINK: float = 0.50
-V1298_SPARSE_BIAS_FACTOR_CLIP: tuple[float, float] = (1.00, 1.15)
-
-# v12.9.9 — Value-only segmented sparse-bias rescue (diagnostic, non-productive).
-# The v12.9.7 productive selector remains frozen.  Factors are selected from
-# exact positive-day wMAPE on CLOSED blocks and must pass a long-horizon gate.
-V1299_VALUE_SPARSE_DIAGNOSTIC_ENABLED: bool = True
-V1299_VALUE_SPARSE_BUCKETS: tuple[str, ...] = ("07-09", "10-13")
-V1299_VALUE_SPARSE_FACTOR_GRID: tuple[float, ...] = (
-    1.00, 1.025, 1.05, 1.075, 1.10, 1.125, 1.15
+# Gate end-to-end obligatorio para declarar los cuatro escenarios listos.
+# No altera forecasts; bloquea una release con spikes/cambios de escala absurdos.
+RELEASE_GATE_MAX_FORECAST_TO_POSITIVE_MEDIAN: float = 8.0
+RELEASE_GATE_MAX_FORECAST_TO_OBSERVED_MAX: float = 2.0
+RELEASE_GATE_MAX_CROSS_CADENCE_MEDIAN_RATIO: float = 4.0
+RELEASE_GATE_MIN_CROSS_CADENCE_SCALED_GAP: float = 2.0
+RELEASE_GATE_LONG_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 28
+RELEASE_GATE_LONG_GAP_MAX_FACTOR_ERROR: float = 4.0
+RELEASE_GATE_SENTINEL_MAX_IN_SAMPLE_WMAPE: float = 3.0
+RELEASE_GATE_SENTINEL_MAX_OOS_ABS_BIAS: float = 1.00
+RELEASE_GATE_SENTINELS: tuple[tuple[str, str, str, str], ...] = (
+    ("1", "00154", "455436", "Valor ($)"),
+    ("1", "00003", "478160", "Valor ($)"),
 )
-V1299_VALUE_SPARSE_MIN_FOLDS: int = 8
-V1299_VALUE_SPARSE_MIN_LEAVES_PER_FOLD: int = 20
-V1299_VALUE_SPARSE_MIN_WIN_RATE: float = 0.75
-V1299_VALUE_SPARSE_MIN_MEDIAN_GAIN: float = 0.0
-V1299_VALUE_SPARSE_MIN_WORST_GAIN: float = -0.005
-V1299_VALUE_SPARSE_MAX_BIAS_WORSEN: float = 0.01
-V1299_VALUE_SPARSE_REPLAY_CUTOFFS: int = 4
 
-# v12.9.10 — Productive Value sparse-rescue promotion gate.
-# The factor/segments still come from v12.9.9 closed-block learning, but a
-# section is allowed to write back to valuehat only when the official ACTIVE
-# cohort passes an independent causal multi-cutoff replay.  Current OOS actuals
-# are never used for promotion.
-V12910_VALUE_SPARSE_PROMOTION_ENABLED: bool = True
-V12910_VALUE_SPARSE_ACTIVE_MIN_NONZERO_DAYS: int = 7
-V12910_VALUE_SPARSE_MIN_REPLAY_CUTOFFS: int = 4
-V12910_VALUE_SPARSE_MIN_REPLAY_WIN_RATE: float = 1.00
-V12910_VALUE_SPARSE_MIN_REPLAY_MEDIAN_GAIN: float = 0.0025
-V12910_VALUE_SPARSE_MIN_REPLAY_WORST_GAIN: float = 0.0
-V12910_VALUE_SPARSE_MIN_REPLAY_WEIGHTED_GAIN: float = 0.0025
-V12910_VALUE_SPARSE_MAX_REPLAY_BIAS_WORSEN: float = 0.0
-V12910_VALUE_SPARSE_MAX_SELECTED_VOLUME_SHARE: float = 0.30
+# Optimización estadística v13.x dentro de la MISMA familia SES+RLS.
+# v13.2.12 mantiene restaurada la configuración productiva estadística de v13.1.1.
+# Corrige la contaminación del holdout: alpha/lambda/dynamics/parent se eligen
+# exclusivamente con historia in-sample cerrada. OOS puede actualizar el estado
+# operativo para la cadencia siguiente, pero nunca cambia una selección/tuning.
+# Las extensiones posteriores permanecen solo como diagnóstico hasta superar
+# un gate de regresión completo en 1d/7d/14d/28d. El OOS actual no hace tuning.
+STAT_OPTIMIZATION_ENABLED: bool = True
+STAT_OPTIMIZATION_PROMOTE_AUTOMATICALLY: bool = False
+# Phase 2/3/4 mantiene un espacio diagnóstico alrededor del productivo.
+# alpha=0.30 y lambda=0.990/0.9975 permanecen SOLO diagnóstico.
+# Ninguno participa en producción hasta demostrar no-regresión end-to-end.
+STAT_OPT_SES_EXTRA_ALPHAS: tuple[float, ...] = (0.0025, 0.0075, 0.30, 0.50)
+STAT_OPT_RLS_EXTRA_LAMBDAS: tuple[float, ...] = (0.990, 0.9975, 1.0)
+# Refit exacto sobre el mismo RLS. No crea drivers nuevos.
+STAT_OPT_REFIT_DRIVER_GROUPS: tuple[str, ...] = (
+    "weekday", "month", "holiday_other", "price"
+)
+# Máximo de filas de detalle residual persistidas. Los resúmenes se calculan
+# sobre todos los puntos; este límite solo evita un artefacto de detalle excesivo.
+STAT_OPT_RESIDUAL_HISTORY_DAYS: int = 168
+STAT_OPT_MAX_RESIDUAL_EXTREMES: int = 50_000
+# Phase 4: calibración diagnóstica de la intensidad del efecto RLS en hojas.
+# gamma=1.0 reproduce exactamente producción; el resto solo se evalúa sobre
+# forecasts causales ya emitidos y nunca se promueve automáticamente.
+STAT_OPT_DRIVER_STRENGTH_CANDIDATES: tuple[float, ...] = (
+    0.0, 0.25, 0.50, 0.75, 0.90, 1.0, 1.10, 1.25, 1.50
+)
+STAT_OPT_DRIVER_STRENGTH_MIN_FOLDS: int = 4
 
-
-# v12.9.11 — Sec23 Value residual selector-gap challenger (diagnostic only).
-# Searches for leaves that the productive v12.9.10 baseline still leaves on v11
-# but whose own long closed-block history supports v12.  Selection is strictly
-# causal and volume-limited; current OOS is audit-only and never authorizes a
-# switch.  v12.9.10 remains the productive forecast policy in this version.
-V12911_SEC23_VALUE_RESIDUAL_ENABLED: bool = True
-V12911_SEC23_VALUE_MIN_FOLDS: int = 8
-V12911_SEC23_VALUE_MIN_WIN_RATE: float = 0.75
-V12911_SEC23_VALUE_MIN_MEDIAN_GAIN: float = 0.0
-V12911_SEC23_VALUE_MIN_P25_GAIN: float = -0.005
-V12911_SEC23_VALUE_MIN_WEIGHTED_GAIN: float = 0.005
-V12911_SEC23_VALUE_MIN_RECENT_GAIN: float = 0.0
-V12911_SEC23_VALUE_MIN_WORST_GAIN: float = -0.10
-V12911_SEC23_VALUE_MAX_BIAS_WORSEN: float = 0.05
-V12911_SEC23_VALUE_MAX_VOLUME_SHARE: float = 0.10
-V12911_SEC23_VALUE_TOP05_PERCENTILE: float = 0.95
-V12911_SEC23_VALUE_TOP01_PERCENTILE: float = 0.99
-V12911_SEC23_VALUE_REPLAY_CUTOFFS: int = 4
-V12911_SEC23_VALUE_REPLAY_MIN_WIN_RATE: float = 0.75
-V12911_SEC23_VALUE_REPLAY_MIN_MEDIAN_GAIN: float = 0.0
-V12911_SEC23_VALUE_REPLAY_MIN_WORST_GAIN: float = -0.0025
-V12911_SEC23_VALUE_REPLAY_MAX_BIAS_WORSEN: float = 0.01
-
-
-# v12.9.12 — ultra-stable Sec23 Value residual diagnostic (NO promotion).
-# Reuses the v12.9.11 residual candidate metadata but applies a much stricter
-# evidence gate before a leaf is considered statistically actionable.  This
-# version remains diagnostic-only: productive forecasts stay on v12.9.10 policy.
-V12912_ULTRA_STABLE_ENABLED: bool = True
-V12912_ULTRA_MIN_WIN_RATE: float = 1.00
-V12912_ULTRA_MIN_MEDIAN_GAIN: float = 0.0010
-V12912_ULTRA_MIN_P25_GAIN: float = 0.0005
-V12912_ULTRA_MIN_WORST_GAIN: float = 0.0
-V12912_ULTRA_MIN_WEIGHTED_GAIN: float = 0.0010
-V12912_ULTRA_MIN_RECENT_GAIN: float = 0.0
-V12912_ULTRA_MAX_BIAS_WORSEN: float = 0.0
-V12912_ULTRA_MAX_VOLUME_SHARE: float = 0.03
-
-
-# SKU-total model: recent 84-day daily level × weekday profile, blended with
-# a scaled 364-day path when a valid prior-year reference exists.
-V12_SKU_RECENT28_WEIGHT: float = 0.60
-V12_SKU_WEEKDAY_FACTOR_CLIP: tuple[float, float] = (0.40, 2.50)
-V12_SKU_ANNUAL_LAG_DAYS: int = 364
-V12_SKU_ANNUAL_WEIGHT: float = 0.50
-V12_SKU_ANNUAL_SCALE_CLIP: tuple[float, float] = (0.50, 2.00)
-# v12.4: causal SKU-total ensemble. The previous fixed blend is no longer the
-# only SKU magnitude model. Each 28-day target selects among the incumbent SKU
-# sum, recent weekday level, recent same-weekday average, lag-28 seasonal naive,
-# and the scaled annual blend using only closed blocks before the target origin.
-V12_SKU_SELECTION_BLOCKS: int = 3
-V12_SKU_SELECTION_MIN_BLOCKS: int = 2
-V12_SKU_SELECTION_MIN_POSITIVE_DAYS: int = 7
-V12_SKU_RECENT_SCORE_WEIGHT: float = 0.25
-
-# v12.7 calibration formula is retained in v12.8 only as a diagnostic
-# challenger.  The factor is causal (closed blocks only), robust, shrunk and
-# clipped, but production reverts to the uncalibrated v12.6 SKU-total baseline
-# unless V12_SKU_LEVEL_CALIBRATION_USE_CHALLENGER is explicitly enabled.
-V12_SKU_LEVEL_CALIBRATION_ENABLED: bool = True
-# v12.8: calculate the calibrated path as a diagnostic challenger, but do NOT
-# replace the v12.6 uncalibrated SKU-total baseline unless explicitly enabled.
-V12_SKU_LEVEL_CALIBRATION_USE_CHALLENGER: bool = False
-V12_SKU_LEVEL_CALIBRATION_RECENT_WEIGHT: float = 0.50
-V12_SKU_LEVEL_CALIBRATION_PRIOR_BLOCKS: float = 1.50
-V12_SKU_LEVEL_CALIBRATION_CLIP: tuple[float, float] = (0.60, 2.00)
-V12_SKU_LEVEL_CALIBRATION_MIN_BLOCKS: int = 2
-
-# Allocation model. v12.5 keeps the v12.3 shared true-hurdle occurrence gate,
-# but replaces the noisy weekday store-share with the robust rolling winner:
-# 70% of the overall SKU×store share from the last 28 days + 30% from the last
-# 84 days. The blend is normalized only inside the productive support.
-V12_SHARE_RECENT_DAYS: int = 28
-V12_SHARE_STABLE_DAYS: int = 84
-V12_SHARE_RECENT_WEIGHT: float = 0.70
-V12_ALLOCATION_FULL_WEIGHT_POSITIVE_DAYS: int = 14
-V12_OCCURRENCE_GATE: float = 0.10
-# Deprecated compatibility knob: kept so existing local configs do not fail.
-# It is no longer used by the v12.3 allocation formula.
-V12_OCCURRENCE_WEIGHT_FLOOR: float = 0.05
-
-# v12.6: pooled LightGBM at SKU aggregate, SHAPE ONLY.  Hyperparameters and
-# gamma are frozen from the 12-block PRE-OOS rolling backtest.  The model is
-# fitted separately by section/target on older closed 28-day blocks and its
-# output is renormalized to preserve the existing SKU 28-day total exactly.
-V12_SKU_SHAPE_LGBM_ENABLED: bool = True
-V12_SKU_SHAPE_LGBM_HISTORY_BLOCKS: int = 16
-V12_SKU_SHAPE_LGBM_GAMMA: float = 1.00
-V12_SKU_SHAPE_LGBM_SMOOTH_FRAC: float = 0.02
-V12_SKU_SHAPE_LGBM_Z_CLIP: float = 1.50
-V12_SKU_SHAPE_LGBM_ROUNDS: int = 160
-V12_SKU_SHAPE_LGBM_SEED: int = 20260831
-V12_SKU_SHAPE_LGBM_LEARNING_RATE: float = 0.035
-V12_SKU_SHAPE_LGBM_NUM_LEAVES: int = 15
-V12_SKU_SHAPE_LGBM_MAX_DEPTH: int = 4
-V12_SKU_SHAPE_LGBM_MIN_DATA_IN_LEAF: int = 500
-V12_SKU_SHAPE_LGBM_BAGGING_FRACTION: float = 0.85
-V12_SKU_SHAPE_LGBM_FEATURE_FRACTION: float = 0.85
-V12_SKU_SHAPE_LGBM_L1: float = 0.20
-V12_SKU_SHAPE_LGBM_L2: float = 8.0
-V12_SKU_SHAPE_LGBM_MAX_BIN: int = 127
-V12_SKU_SHAPE_LGBM_TOTAL_TOLERANCE: float = 1e-9
-
-# Métricas oficiales: siempre bottom-up desde SKU+tienda y desde el día 29.
-METRICS_START_DAY: int = 29
+# Phase 5: selección diagnóstica del parent RLS en contexto SKU+Tienda.
+# Sigue siendo la MISMA composición SES + RLS; la alternativa solo cambia
+# qué parent ya existente (Sección o Tienda) aporta el efecto al mismo nivel SES.
+# La historia cerrada crea candidatos y el OOS actual únicamente valida/veta.
+STAT_OPT_PARENT_MIN_FOLDS: int = 4
+STAT_OPT_PARENT_MIN_WMAPE_IMPROVEMENT: float = 0.010
+STAT_OPT_PARENT_MIN_POSITIVE_FOLD_SHARE: float = 0.60
+STAT_OPT_PARENT_MAX_HISTORY_ABS_BIAS_DETERIORATION: float = 0.010
+STAT_OPT_PARENT_HOLDOUT_VALIDATE_MAX_ABS_BIAS_DETERIORATION: float = 0.005
+STAT_OPT_PARENT_HOLDOUT_VETO_ABS_BIAS_DETERIORATION: float = 0.010
 
 # Ranking SKU: mínimo de días con actual distinto de cero.
 RANKING_SKU_MIN_NONZERO_POINTS: int = 15
 OOS_METRIC_MODE: str = "active"  # active | all
 OOS_ACTIVE_MIN_NONZERO_DAYS: int = 7
-OOS_ZERO_DEMAND_POLICY: str = "separate"
-SHOW_WMAPE_ALL: bool = True
-SHOW_ZERO_DEMAND_IMPACT: bool = True
 DASHBOARD_METRIC_IDENTITY_TOLERANCE: float = 1e-9
 
 FECHAS_TRAIN = (dt.date(2024, 5, 1), dt.date(2025, 10, 26))
-FECHAS_TEST = (TEST_START, TEST_END)
 
 # --------------------------------------------------------------------------- #
 # Secciones y locales (tablas del cliente)
 # --------------------------------------------------------------------------- #
-# Las fechas test/forecast dentro de cada sección son referencias legacy para
-# compatibilidad. v11.2 deriva OOS/forecast desde last_actual y NO las usa para
-# desplazar el OOS operativo.
+# Las fechas test/forecast dentro de cada sección son referencias de respaldo.
+# El horizonte operativo se deriva de los datos disponibles y mantiene OOS=28d.
 SECCIONES = {
     "1": {
         "test_start": dt.date(2026, 3, 29),
@@ -634,14 +318,11 @@ AGGREGATION_LEVELS = {
     "SKU_ID": "sku",
 }
 
-FORECAST_LEVELS = ["seccion", "store", "sku"]
-NOMBRES_NIVELES = ["seccion", "store", "sku"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parámetros del modelo RLS
 # ─────────────────────────────────────────────────────────────────────────────
 RMSE_ERROR = 0.2
-CORRECTION_FACTOR = False
 FORGETTING_FACTOR = 0.995
 RLS_FORGETTING_FACTOR_CANDIDATES: tuple[float, ...] = (0.970, 0.985, 0.995)
 RLS_AUTOREGRESSIVE_DRIVERS: bool = True
@@ -649,8 +330,25 @@ RLS_AUTOREGRESSIVE_DRIVERS: bool = True
 # usando exclusivamente el wMAPE acumulado de bloques anteriores.
 RLS_DYNAMICS_CANDIDATES: tuple[str, ...] = ("base", "ar")
 RLS_DEFAULT_DYNAMICS: str = "base"
-RLS_AR_LAGS: tuple[int, ...] = (7, 28)
-RLS_AR_ROLLING_WINDOWS: tuple[int, ...] = (7, 28)
+# Valor($) vuelve al diseño productivo estable v13.1.1 sin asp/edp/discount.
+# Las pruebas con price continúan disponibles exclusivamente en diagnóstico.
+RLS_VALUE_PRICE_NODE_IDS: tuple[str, ...] = ()
+# v13.2.11 mantiene desactivadas las exclusiones productivas promovidas en v13.2.2.
+# Permanecen como evidencia experimental, no como configuración productiva.
+RLS_DRIVER_GROUP_EXCLUSIONS: dict[str, dict[str, tuple[str, ...]]] = {}
+
+# Historial de promociones v13.2.2 para reauditoría diagnóstica.
+# NO participa en la configuración productiva ni altera el forecast: producción
+# sigue leyendo exclusivamente RLS_DRIVER_GROUP_EXCLUSIONS.
+RLS_DRIVER_GROUP_EXCLUSION_AUDIT_HISTORY: dict[str, dict[str, tuple[str, ...]]] = {
+    "1||T:00211": {
+        "Unidades": ("month",),
+        "Valor ($)": ("month",),
+    },
+    "23||T:00006": {
+        "Unidades": ("price",),
+    },
+}
 # Los drivers AR del bloque objetivo se construyen recursivamente: nunca usan
 # actuals del propio bloque que todavía no eran conocidos al emitir el forecast.
 MIN_Y_TO_UPDATE = 1.0  # actualiza RLS solo cuando y supera este umbral
@@ -847,16 +545,11 @@ def section_horizons(
 ) -> dict:
     """Resolve the production train/OOS/forecast-only windows.
 
-    v11.2 contract:
-    - OOS is ALWAYS the latest 28 calendar days with actuals;
-    - therefore no actual can exist after OOS;
-    - forecast-only starts at ``last_actual + 1`` and lasts 28 days;
-    - train is aligned backwards from OOS so every expanding block is exactly
-      28 days. Up to 27 earliest calendar days may be discarded to preserve
-      the 28x28 contract without moving OOS away from the latest actuals.
-
-    The old configured ``test_start/test_end`` values remain metadata only and
-    are not allowed to create an observed tail after OOS.
+    Contrato operativo:
+    - OOS son siempre los últimos 28 días calendario con actuals;
+    - forecast-only empieza al día siguiente y dura 28 días;
+    - las cuatro cadencias comparten exactamente la misma historia previa al OOS;
+    - in-sample, OOS y forecast-only usan la misma familia de modelo.
     """
     cfg = SECCIONES[seccion]
     update_days = int(RLS_BLOCK_DAYS)
@@ -867,7 +560,7 @@ def section_horizons(
     if last_actual is None:
         # Compatibility fallback when no data frame is available. In the real
         # pipeline last_actual is always read from the section data.
-        last_actual = cfg.get("test_end") or TEST_END
+        last_actual = cfg["test_end"]
 
     if last_actual < first_data:
         raise ValueError(
@@ -884,26 +577,36 @@ def section_horizons(
             f"({first_data} → {last_actual})."
         )
 
-    # El histórico previo al OOS se alinea a la cadencia seleccionada. Durante
-    # los 28 días OOS se emiten forecasts secuenciales en bloques de update_days
-    # y, al cerrarse cada bloque, sus actuals pasan al siguiente ajuste.
-    delta_days = (oos_start - first_data).days
-    offset = delta_days % update_days
-    train_start = first_data + dt.timedelta(days=offset)
+    # v13.2.11: el histórico al origen OOS es IDÉNTICO para 1d/7d/14d/28d.
+    # Antes se desplazaba train_start según update_days (p.ej. 1d podía ver 2–4
+    # días adicionales), contaminando la comparación de cadencias. Elegimos la
+    # mayor ventana completa cuyo largo sea múltiplo del bloque canónico de 28d;
+    # como 1/7/14/28 dividen 28, la misma ventana queda alineada para todos.
     train_end = oos_start - dt.timedelta(days=1)
-    train_days = (train_end - train_start).days + 1
-    if train_days < update_days or train_days % update_days != 0:
+    available_days = (train_end - first_data).days + 1
+    canonical_block = int(CANONICAL_HISTORY_BLOCK_DAYS)
+    if canonical_block <= 0:
+        raise ValueError("CANONICAL_HISTORY_BLOCK_DAYS debe ser positivo")
+    canonical_days = (available_days // canonical_block) * canonical_block
+    if canonical_days < max(UPDATE_BLOCK_OPTIONS):
         raise ValueError(
-            f"Sección {seccion}: train no queda alineado a bloques de "
-            f"{update_days} días ({train_start} → {train_end}, {train_days})."
+            f"Sección {seccion}: historia insuficiente para una ventana canónica "
+            f"de {canonical_block} días ({first_data} → {train_end})."
+        )
+    train_start = train_end - dt.timedelta(days=canonical_days - 1)
+    train_days = canonical_days
+    if train_days % update_days != 0:
+        raise ValueError(
+            f"Sección {seccion}: ventana canónica {train_days}d no divisible por "
+            f"cadencia {update_days}d."
         )
 
     forecast_start = oos_end + dt.timedelta(days=1)
     forecast_end = forecast_start + dt.timedelta(days=metric_days - 1)
 
     return {
-        # ``first_monday`` is kept only for backward compatibility with code
-        # that still reads this key. In v11.2 it is the aligned model start and
+        # Ancla informativa de la cadencia de actualización.
+        # that still reads this key. It is the aligned model start and
         # is not required to be Monday.
         "first_monday": train_start,
         "model_start": train_start,

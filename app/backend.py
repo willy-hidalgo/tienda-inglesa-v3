@@ -14,51 +14,15 @@ import polars as pl
 import settings
 
 DETAIL_COLUMNS = [
-    "unique_id",
-    "ds",
-    "y",
-    "yhat",
-    "yhat28",
-    "value",
-    "valuehat",
-    "valuehat28",
-    "period_type",
-    "driver_effect",
-    "driver_effect_value",
-    "sku_desc",
-    "store_name",
-    "seccion",
-    "abs_error",
-    "_compare_v11",
-    "_compare_v12",
-    "_v12_selected",
-    "_model_family",
-    "_cal_factor",
-    "_cal_blocks",
-    "_shape_applied",
-    "_cal_applied",
-    "_meta_probability",
-    "_meta_available",
-    "_meta_training_rows",
-    "_meta_recent_gain",
-    "_meta_weighted_gain",
-    "_meta_win_rate",
-    "_meta_top_driver",
-    "_meta_threshold",
-    "_meta_portfolio_mode",
-    "_meta_bias_guard_pass",
-    "_meta_policy_available",
-    "_meta_policy_utility_gain",
-    "_value_safety_dominance_pass",
-    "_value_safety_recent_confirmations",
-    "_value_safety_recent_blocks",
-    "_value_safety_bias_coverage",
-    "_value_safety_bias_coverage_threshold",
-    "_value_safety_bias_coverage_pass",
-    "_value_safety_meta_margin_pass",
-    "_value_safety_best_all_mode",
-    "_value_safety_reason",
+    "unique_id", "ds", "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
+    "period_type", "initial_level_y", "initial_level_value",
+    "ses_level_y", "ses_level_value", "ses_alpha_y", "ses_alpha_value",
+    "driver_effect", "driver_effect_value", "driver_factor_y", "driver_factor_value",
+    "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
+    "parent_driver_mode_y", "parent_driver_mode_value", "modelo_seleccionado",
+    "rls_block", "rls_train_days", "sku_desc", "store_name", "seccion", "abs_error",
 ]
+
 
 HORIZON_COLUMNS = {
     "train_start",
@@ -98,77 +62,37 @@ def load_forecast_bytes(data: bytes, name: str) -> pl.DataFrame:
 # Unidad / agregación / serie
 # ─────────────────────────────────────────────────────────────────────────────
 def prepare_unit_df(df: pl.DataFrame, unidad: str, has_value: bool) -> pl.DataFrame:
-    """Normaliza la unidad y expone aliases genéricos de diagnóstico v12.8.
+    """Normalize the selected business unit using Polars only.
 
-    Los aliases permiten que dashboard/backend no dupliquen lógica para Qty/Valor.
-    Si el parquet es anterior a v12.8 simplemente no se crean.
+    For Valor ($), generic ``y/yhat`` aliases point to ``value/valuehat``.
+    The only additional aliases are the precomputed bottom-up daily metric
+    contributions used by the explanatory chart.
     """
     is_value = unidad.startswith("Valor") and has_value
     exprs: list[pl.Expr] = []
+    # Preserve raw business columns before generic y/yhat aliases are replaced.
+    # These aliases support leaf EDP diagnostics and detailed audit exports.
+    if "y" in df.columns:
+        exprs.append(pl.col("y").alias("units_actual"))
+    if "yhat" in df.columns:
+        exprs.append(pl.col("yhat").alias("units_forecast"))
+    if "value" in df.columns:
+        exprs.append(pl.col("value").alias("sales_value_actual"))
+    if "valuehat" in df.columns:
+        exprs.append(pl.col("valuehat").alias("sales_value_forecast"))
     if is_value:
         exprs.extend([pl.col("value").alias("y"), pl.col("valuehat").alias("yhat")])
         if "valuehat28" in df.columns:
             exprs.append(pl.col("valuehat28").alias("yhat28"))
-
     mapping = {
-        # Existing official bottom-up metric components, exposed for the chart
-        # diagnostic without changing metric semantics.
         "_bu_abs_error_daily": "bu_abs_error_daily_value" if is_value else "bu_abs_error_daily_y",
         "_bu_abs_y_daily": "bu_abs_y_daily_value" if is_value else "bu_abs_y_daily_y",
         "_bu_signed_error_daily": "bu_signed_error_daily_value" if is_value else "bu_signed_error_daily_y",
-        "_compare_v11": "v11_valuehat_raw_before_v12" if is_value else "v11_yhat_raw_before_v12",
-        "_compare_v12": "v12_candidate_valuehat_raw" if is_value else "v12_candidate_yhat_raw",
-        "_v12_selected": "v12_selected_value" if is_value else "v12_selected_y",
-        "_model_family": "leaf_model_family_value" if is_value else "leaf_model_family_y",
-        "_cal_factor": "v12_sku_level_calibration_factor_value" if is_value else "v12_sku_level_calibration_factor_y",
-        "_cal_blocks": "v12_sku_level_calibration_blocks_value" if is_value else "v12_sku_level_calibration_blocks_y",
-        "_shape_applied": "v12_sku_shape_applied_value" if is_value else "v12_sku_shape_applied_y",
-        "_cal_applied": "v12_sku_level_calibration_applied_value" if is_value else "v12_sku_level_calibration_applied_y",
-        "_meta_probability": "v12_meta_probability_value" if is_value else "v12_meta_probability_y",
-        "_meta_available": "v12_meta_model_available_value" if is_value else "v12_meta_model_available_y",
-        "_meta_training_rows": "v12_meta_training_rows_value" if is_value else "v12_meta_training_rows_y",
-        "_meta_recent_gain": "v12_meta_recent_gain_value" if is_value else "v12_meta_recent_gain_y",
-        "_meta_weighted_gain": "v12_meta_weighted_gain_value" if is_value else "v12_meta_weighted_gain_y",
-        "_meta_win_rate": "v12_meta_win_rate_value" if is_value else "v12_meta_win_rate_y",
-        "_meta_top_driver": "v12_meta_top_driver_value" if is_value else "v12_meta_top_driver_y",
-        "_meta_threshold": "v12_meta_threshold_value" if is_value else "v12_meta_threshold_y",
-        "_meta_portfolio_mode": "v12_meta_portfolio_mode_value" if is_value else "v12_meta_portfolio_mode_y",
-        "_meta_bias_guard_pass": "v12_meta_bias_guard_pass_value" if is_value else "v12_meta_bias_guard_pass_y",
-        "_meta_policy_available": "v12_meta_policy_available_value" if is_value else "v12_meta_policy_available_y",
-        "_meta_policy_utility_gain": "v12_meta_policy_utility_gain_value" if is_value else "v12_meta_policy_utility_gain_y",
     }
-    if is_value:
-        mapping.update({
-            "_value_safety_dominance_pass": "v12_value_safety_dominance_pass",
-            "_value_safety_recent_confirmations": "v12_value_safety_recent_confirmations",
-            "_value_safety_recent_blocks": "v12_value_safety_recent_blocks",
-            "_value_safety_bias_coverage": "v12_value_safety_bias_coverage",
-            "_value_safety_bias_coverage_threshold": "v12_value_safety_bias_coverage_threshold",
-            "_value_safety_bias_coverage_pass": "v12_value_safety_bias_coverage_pass",
-            "_value_safety_meta_margin_pass": "v12_value_safety_meta_margin_pass",
-            "_value_safety_best_all_mode": "v12_value_safety_best_all_mode",
-            "_value_safety_reason": "v12_value_safety_reason",
-            "_v129_wf_enabled": "v129_value_wf_enabled",
-            "_v129_wf_available": "v129_value_wf_available",
-            "_v129_wf_folds": "v129_value_wf_folds",
-            "_v129_wf_win_rate": "v129_value_wf_win_rate",
-            "_v129_wf_median_gain": "v129_value_wf_median_gain",
-            "_v129_wf_worst_gain": "v129_value_wf_worst_gain",
-            "_v129_wf_weighted_gain": "v129_value_wf_weighted_gain",
-            "_v129_wf_weighted_utility_gain": "v129_value_wf_weighted_utility_gain",
-            "_v129_wf_bias_worsen_max": "v129_value_wf_bias_worsen_max",
-            "_v129_wf_meta_folds": "v129_value_wf_meta_folds",
-            "_v129_wf_reason": "v129_value_wf_reason",
-        })
     for alias, source in mapping.items():
         if source in df.columns:
-            expr = pl.col(source)
-            if alias in {"_compare_v11", "_compare_v12"}:
-                expr = expr.round(2 if is_value else 0)
-            exprs.append(expr.alias(alias))
+            exprs.append(pl.col(source).alias(alias))
     return df.with_columns(exprs) if exprs else df
-
-
 def aggregate_temporal(df: pl.DataFrame, freq: str) -> pl.DataFrame:
     if freq == "Diario" or df.height == 0:
         out = df
@@ -191,17 +115,16 @@ def aggregate_temporal(df: pl.DataFrame, freq: str) -> pl.DataFrame:
         aggs.append(pl.col("value").sum())
     if "valuehat" in df.columns:
         aggs.append(pl.col("valuehat").sum())
-    # Forecasts comparables se agregan igual que yhat. Metadatos diagnósticos
-    # usan first/max para conservar contexto sin alterar totales.
-    for col in ("_compare_v11", "_compare_v12", "_bu_abs_error_daily", "_bu_abs_y_daily", "_bu_signed_error_daily"):
+    # Diagnostic leaf price state: robust period summary on secondary axis.
+    for col in ("asp_observed", "edp_observed", "discount_observed"):
+        if col in df.columns:
+            aggs.append(pl.col(col).median().alias(col))
+    if "edp_source" in df.columns:
+        aggs.append(pl.col("edp_source").last().alias("edp_source"))
+    # Bottom-up explanatory contributions are additive over time.
+    for col in ("_bu_abs_error_daily", "_bu_abs_y_daily", "_bu_signed_error_daily"):
         if col in df.columns:
             aggs.append(pl.col(col).sum())
-    for col in ("_v12_selected", "_shape_applied", "_cal_applied", "_meta_available", "_meta_bias_guard_pass", "_meta_policy_available", "_value_safety_dominance_pass", "_value_safety_bias_coverage_pass", "_value_safety_meta_margin_pass"):
-        if col in df.columns:
-            aggs.append(pl.col(col).max())
-    for col in ("_model_family", "_cal_factor", "_cal_blocks", "_meta_probability", "_meta_training_rows", "_meta_recent_gain", "_meta_weighted_gain", "_meta_win_rate", "_meta_top_driver", "_meta_threshold", "_meta_portfolio_mode", "_meta_policy_utility_gain", "_value_safety_recent_confirmations", "_value_safety_recent_blocks", "_value_safety_bias_coverage", "_value_safety_bias_coverage_threshold", "_value_safety_best_all_mode", "_value_safety_reason"):
-        if col in df.columns:
-            aggs.append(pl.col(col).first())
     # Nunca mezclar periodos semánticos dentro de un bucket semanal/mensual.
     # Un group_by solo por ds truncado podía sumar días in_sample + out_sample
     # (o out_sample + forecast_only) cuando el corte caía dentro de la semana/mes.
@@ -415,6 +338,11 @@ def wmape_bottom_up(
         "sum_abs_y": pl.Float64,
         "sum_abs_error": pl.Float64,
         "sum_signed_error": pl.Float64,
+        "sum_abs_y_all_points": pl.Float64,
+        "sum_abs_error_all_points": pl.Float64,
+        "sum_signed_error_all_points": pl.Float64,
+        "wmape_all_points": pl.Float64,
+        "bias_all_points": pl.Float64,
         "n_points": pl.UInt32,
         "n_with_sales": pl.UInt32,
         "metric_cohort": pl.Utf8,
@@ -478,7 +406,9 @@ def wmape_bottom_up(
             pl.when(pl.col("y") != 0).then(pl.col("yhat")).otherwise(0.0)
             .sum().alias("sum_yhat"),
             pl.col("yhat").sum().alias("_sum_yhat_all"),
-            pl.col("_abs_error").sum().alias("_sum_abs_error_all"),
+            pl.col("_abs_y").sum().alias("sum_abs_y_all_points"),
+            pl.col("_abs_error").sum().alias("sum_abs_error_all_points"),
+            pl.col("_signed_error").sum().alias("sum_signed_error_all_points"),
             n_sales_expr,
             pl.col("_store_uid").first().alias("_store_uid"),
             pl.col("_seccion").first().alias("_seccion"),
@@ -502,13 +432,21 @@ def wmape_bottom_up(
             .then(pl.col("sum_signed_error") / pl.col("sum_abs_y"))
             .otherwise(None)
             .alias("bias"),
+            pl.when(pl.col("sum_abs_y_all_points") > 0)
+            .then(pl.col("sum_abs_error_all_points") / pl.col("sum_abs_y_all_points"))
+            .otherwise(None)
+            .alias("wmape_all_points"),
+            pl.when(pl.col("sum_abs_y_all_points") > 0)
+            .then(pl.col("sum_signed_error_all_points") / pl.col("sum_abs_y_all_points"))
+            .otherwise(None)
+            .alias("bias_all_points"),
             n_spine_lit.alias("n_points"),
             pl.when(pl.col("metric_cohort") == "zero")
             .then(pl.col("_sum_yhat_all").clip(lower_bound=0.0))
             .otherwise(0.0)
             .alias("zero_forecast_sum"),
             pl.when(pl.col("metric_cohort") == "zero")
-            .then(pl.col("_sum_abs_error_all"))
+            .then(pl.col("sum_abs_error_all_points"))
             .otherwise(0.0)
             .alias("zero_abs_error_sum"),
         )
@@ -538,19 +476,28 @@ def wmape_bottom_up(
         .select(
             "unique_id", "wmape", "bias", "sum_y", "sum_yhat",
             "sum_abs_y", "sum_abs_error", "sum_signed_error",
+            "sum_abs_y_all_points", "sum_abs_error_all_points", "sum_signed_error_all_points",
+            "wmape_all_points", "bias_all_points",
             "n_points", "n_with_sales", "metric_cohort", "metric_active",
             "n_leaf_active", "n_leaf_sparse", "n_leaf_zero",
             "zero_forecast_sum", "zero_abs_error_sum",
         )
     )
 
-    eligible_ids = (
-        leaf_base.filter(pl.col("metric_active"))
-        .select("unique_id")
-        if cohort_mode == "active"
-        else leaf_base.select("unique_id")
+    # Un solo panel para ambas métricas: la oficial usa únicamente las hojas
+    # del cohort contractual (Active en OOS); la prueba ácida usa TODOS los
+    # puntos del alcance, incluidas hojas sparse/zero y días con y==0.
+    scope_flags = leaf_base.select(
+        "unique_id",
+        (
+            pl.col("metric_active")
+            if cohort_mode == "active"
+            else pl.lit(True)
+        ).alias("_metric_scope")
     )
-    parent_rows = leaves.join(eligible_ids, on="unique_id", how="semi")
+    parent_rows = leaves.join(scope_flags, on="unique_id", how="left").with_columns(
+        pl.col("_metric_scope").fill_null(False)
+    )
 
     def _agg_parent(group_key: str) -> pl.DataFrame:
         # Si no hay hojas activas en el alcance, el nodo queda presente con
@@ -560,16 +507,30 @@ def wmape_bottom_up(
             agg = (
                 parent_rows.group_by(group_key)
                 .agg(
-                    pl.when(pl.col("y") != 0).then(pl.col("_abs_error")).otherwise(0.0)
+                    pl.when(pl.col("_metric_scope") & (pl.col("y") != 0))
+                    .then(pl.col("_abs_error")).otherwise(0.0)
                     .sum().alias("sum_abs_error"),
-                    pl.when(pl.col("y") != 0).then(pl.col("_abs_y")).otherwise(0.0)
+                    pl.when(pl.col("_metric_scope") & (pl.col("y") != 0))
+                    .then(pl.col("_abs_y")).otherwise(0.0)
                     .sum().alias("sum_abs_y"),
-                    pl.when(pl.col("y") != 0).then(pl.col("_signed_error")).otherwise(0.0)
+                    pl.when(pl.col("_metric_scope") & (pl.col("y") != 0))
+                    .then(pl.col("_signed_error")).otherwise(0.0)
                     .sum().alias("sum_signed_error"),
-                    pl.col("y").sum().alias("sum_y"),
-                    pl.when(pl.col("y") != 0).then(pl.col("yhat")).otherwise(0.0)
+                    pl.col("_abs_y").sum().alias("sum_abs_y_all_points"),
+                    pl.col("_abs_error").sum().alias("sum_abs_error_all_points"),
+                    pl.col("_signed_error").sum().alias("sum_signed_error_all_points"),
+                    pl.when(pl.col("_metric_scope")).then(pl.col("y")).otherwise(0.0)
+                    .sum().alias("sum_y"),
+                    pl.when(pl.col("_metric_scope") & (pl.col("y") != 0))
+                    .then(pl.col("yhat")).otherwise(0.0)
                     .sum().alias("sum_yhat"),
-                    n_sales_expr,
+                    (
+                        pl.col("ds")
+                        .filter(pl.col("_metric_scope") & (pl.col("y") != 0))
+                        .n_unique().cast(pl.UInt32).alias("n_with_sales")
+                        if "ds" in parent_rows.columns
+                        else (pl.col("_metric_scope") & (pl.col("y") != 0)).sum().cast(pl.UInt32).alias("n_with_sales")
+                    ),
                 )
             )
         else:
@@ -583,6 +544,9 @@ def wmape_bottom_up(
                 pl.lit(None).cast(pl.Float64).alias("sum_abs_error"),
                 pl.lit(None).cast(pl.Float64).alias("sum_abs_y"),
                 pl.lit(None).cast(pl.Float64).alias("sum_signed_error"),
+                pl.lit(None).cast(pl.Float64).alias("sum_abs_y_all_points"),
+                pl.lit(None).cast(pl.Float64).alias("sum_abs_error_all_points"),
+                pl.lit(None).cast(pl.Float64).alias("sum_signed_error_all_points"),
                 pl.lit(None).cast(pl.Float64).alias("sum_y"),
                 pl.lit(None).cast(pl.Float64).alias("sum_yhat"),
                 pl.lit(None).cast(pl.UInt32).alias("n_with_sales"),
@@ -593,6 +557,9 @@ def wmape_bottom_up(
                 pl.col("sum_abs_error").fill_null(0.0),
                 pl.col("sum_abs_y").fill_null(0.0),
                 pl.col("sum_signed_error").fill_null(0.0),
+                pl.col("sum_abs_y_all_points").fill_null(0.0),
+                pl.col("sum_abs_error_all_points").fill_null(0.0),
+                pl.col("sum_signed_error_all_points").fill_null(0.0),
                 pl.col("sum_y").fill_null(0.0),
                 pl.col("sum_yhat").fill_null(0.0),
                 pl.col("n_with_sales").fill_null(0).cast(pl.UInt32),
@@ -606,6 +573,14 @@ def wmape_bottom_up(
                 .then(pl.col("sum_signed_error") / pl.col("sum_abs_y"))
                 .otherwise(None)
                 .alias("bias"),
+                pl.when(pl.col("sum_abs_y_all_points") > 0)
+                .then(pl.col("sum_abs_error_all_points") / pl.col("sum_abs_y_all_points"))
+                .otherwise(None)
+                .alias("wmape_all_points"),
+                pl.when(pl.col("sum_abs_y_all_points") > 0)
+                .then(pl.col("sum_signed_error_all_points") / pl.col("sum_abs_y_all_points"))
+                .otherwise(None)
+                .alias("bias_all_points"),
                 n_spine_lit.alias("n_points"),
                 pl.lit("active" if cohort_mode == "active" else "all")
                 .alias("metric_cohort"),
@@ -617,6 +592,8 @@ def wmape_bottom_up(
         return out.select(
             "unique_id", "wmape", "bias", "sum_y", "sum_yhat",
             "sum_abs_y", "sum_abs_error", "sum_signed_error",
+            "sum_abs_y_all_points", "sum_abs_error_all_points", "sum_signed_error_all_points",
+            "wmape_all_points", "bias_all_points",
             "n_points", "n_with_sales", "metric_cohort", "metric_active",
             "n_leaf_active", "n_leaf_sparse", "n_leaf_zero",
             "zero_forecast_sum", "zero_abs_error_sum",
@@ -656,6 +633,11 @@ def wmape_por_id(
         "sum_abs_y": pl.Float64,
         "sum_abs_error": pl.Float64,
         "sum_signed_error": pl.Float64,
+        "sum_abs_y_all_points": pl.Float64,
+        "sum_abs_error_all_points": pl.Float64,
+        "sum_signed_error_all_points": pl.Float64,
+        "wmape_all_points": pl.Float64,
+        "bias_all_points": pl.Float64,
         "n_points": pl.UInt32,
         "n_with_sales": pl.UInt32,
         "metric_cohort": pl.Utf8,
@@ -724,6 +706,9 @@ def wmape_por_id(
                     pl.when(pl.col("y") != 0)
                     .then(pl.col("yhat") - pl.col("y"))
                     .otherwise(0.0).sum().alias("sum_signed_error"),
+                    pl.col("y").abs().sum().alias("sum_abs_y_all_points"),
+                    (pl.col("y") - pl.col("yhat")).abs().sum().alias("sum_abs_error_all_points"),
+                    (pl.col("yhat") - pl.col("y")).sum().alias("sum_signed_error_all_points"),
                     pl.col("y").sum().alias("sum_y"),
                     pl.when(pl.col("y") != 0)
                     .then(pl.col("yhat"))
@@ -737,6 +722,12 @@ def wmape_por_id(
                     pl.when(pl.col("sum_abs_y") > 0)
                     .then(pl.col("sum_signed_error") / pl.col("sum_abs_y"))
                     .otherwise(None).alias("bias"),
+                    pl.when(pl.col("sum_abs_y_all_points") > 0)
+                    .then(pl.col("sum_abs_error_all_points") / pl.col("sum_abs_y_all_points"))
+                    .otherwise(None).alias("wmape_all_points"),
+                    pl.when(pl.col("sum_abs_y_all_points") > 0)
+                    .then(pl.col("sum_signed_error_all_points") / pl.col("sum_abs_y_all_points"))
+                    .otherwise(None).alias("bias_all_points"),
                     pl.lit(n_spine).cast(pl.UInt32).alias("n_points"),
                     pl.lit("legacy").alias("metric_cohort"),
                     pl.lit(True).alias("metric_active"),
@@ -768,6 +759,11 @@ def wmape_por_id(
             pl.lit(0.0).alias("sum_abs_y"),
             pl.lit(0.0).alias("sum_abs_error"),
             pl.lit(0.0).alias("sum_signed_error"),
+            pl.lit(0.0).alias("sum_abs_y_all_points"),
+            pl.lit(0.0).alias("sum_abs_error_all_points"),
+            pl.lit(0.0).alias("sum_signed_error_all_points"),
+            pl.lit(None).cast(pl.Float64).alias("wmape_all_points"),
+            pl.lit(None).cast(pl.Float64).alias("bias_all_points"),
             n_spine_lit.alias("n_points"),
             pl.lit(0).cast(pl.UInt32).alias("n_with_sales"),
             pl.lit("zero").alias("metric_cohort"),
@@ -789,6 +785,11 @@ def wmape_por_id(
         pl.lit(0.0).alias("sum_abs_y"),
         pl.lit(0.0).alias("sum_abs_error"),
         pl.lit(0.0).alias("sum_signed_error"),
+        pl.lit(0.0).alias("sum_abs_y_all_points"),
+        pl.lit(0.0).alias("sum_abs_error_all_points"),
+        pl.lit(0.0).alias("sum_signed_error_all_points"),
+        pl.lit(None).cast(pl.Float64).alias("wmape_all_points"),
+        pl.lit(None).cast(pl.Float64).alias("bias_all_points"),
         n_spine_lit.alias("n_points"),
         pl.lit(0).cast(pl.UInt32).alias("n_with_sales"),
         pl.lit("zero").alias("metric_cohort"),
@@ -934,7 +935,7 @@ def ranking_table(
         pl.col("_sku").cast(pl.Utf8),
     )
     # Compatibilidad con tablas antiguas/tests que solo traen wmape+sum_y.
-    # El dashboard v11.0 usa siempre los componentes exactos materializados.
+    # El dashboard usa siempre los componentes exactos materializados.
     if "sum_abs_y" not in enriched.columns and "sum_y" in enriched.columns:
         enriched = enriched.with_columns(
             pl.col("sum_y").abs().alias("sum_abs_y")
@@ -1559,12 +1560,11 @@ def build_chart_series(
         return []
 
     return {
-        # Compatibilidad con dashboards/tests previos.
         "hist_ds": _col(hist, "ds"),
         "hist_y": _col(hist, "y"),
         "hist_yhat": _col(hist, "yhat"),
         "hist_yhat28": _col(hist, "yhat28"),
-        # Periodos explícitos v12.7.
+        # Períodos explícitos de la única familia productiva.
         "in_ds": _col(ins, "ds"),
         "in_y": _col(ins, "y"),
         "in_yhat": _col(ins, "yhat"),
@@ -1573,11 +1573,13 @@ def build_chart_series(
         "oos_y": _col(oos, "y"),
         "oos_yhat": _col(oos, "yhat"),
         "oos_yhat28": _col(oos, "yhat28"),
-        "oos_v11": _col(oos, "_compare_v11"),
-        "oos_v12": _col(oos, "_compare_v12"),
         "fcst_ds": _col(fcst, "ds"),
         "fcst_yhat": _col(fcst, "yhat"),
         "fcst_yhat28": _col(fcst, "yhat28"),
+        # Leaf EDP diagnostic (secondary axis).
+        "in_edp": _col(ins, "edp_observed"),
+        "oos_edp": _col(oos, "edp_observed"),
+        "fcst_edp": _col(fcst, "edp_observed"),
         # Exact daily components behind the existing bottom-up metric.
         "in_bu_abs_error": _col(ins, "_bu_abs_error_daily"),
         "in_bu_abs_y": _col(ins, "_bu_abs_y_daily"),
@@ -1611,41 +1613,13 @@ def ds_range(df: pl.DataFrame) -> tuple[dt.date | None, dt.date | None]:
 
 
 def format_detail_display(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Formatea columnas numéricas para la UI:
-      12345.2 → "12,345"  (entero con separador de miles)
-    El resto de columnas se deja igual.
-    """
-    if df.height == 0:
-        return df
-    num_cols = [
-        c
-        for c in (
-            "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
-            "driver_effect", "driver_effect_value", "abs_error",
-        )
-        if c in df.columns
-    ]
-    if not num_cols:
-        return df
+    """Conserva los dtypes numéricos del detalle para la UI.
 
-    def _fmt(v: float | None) -> str:
-        if v is None:
-            return ""
-        try:
-            if v != v:  # NaN
-                return ""
-            return f"{round(float(v)):,}"
-        except (TypeError, ValueError):
-            return ""
-
-    exprs = [
-        pl.col(c)
-        .map_elements(_fmt, return_dtype=pl.Utf8)
-        .alias(c)
-        for c in num_cols
-    ]
-    return df.with_columns(exprs)
+    El formato visual (incluido separador de miles) se aplica de forma central
+    en ``app.dashboard._dashboard_dataframe``. Convertir números a texto aquí
+    impediría que el contrato global de formato se aplique de manera uniforme.
+    """
+    return df
 
 
 def metrics_rolling28(df_view: pl.DataFrame) -> dict[str, float | int]:

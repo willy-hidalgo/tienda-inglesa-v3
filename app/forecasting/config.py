@@ -11,9 +11,7 @@ class ForecastConfig:
     selected_path: Path
     metric_horizon_days: int
     aggregation_levels: dict
-    forecast_levels: list
     rmse_error: float
-    correction_factor: bool
     forgetting_factor: float
     min_y_to_update: float
     out_dir: Path
@@ -34,9 +32,7 @@ class ForecastConfig:
             selected_path=Path(settings.SELECTED_PATH),
             metric_horizon_days=settings.METRIC_HORIZON_DAYS,
             aggregation_levels=settings.AGGREGATION_LEVELS,
-            forecast_levels=settings.FORECAST_LEVELS,
             rmse_error=settings.RMSE_ERROR,
-            correction_factor=settings.CORRECTION_FACTOR,
             forgetting_factor=getattr(settings, "FORGETTING_FACTOR", 0.995),
             min_y_to_update=getattr(settings, "MIN_Y_TO_UPDATE", 1.0),
             out_dir=Path(settings.OUT_DIR),
