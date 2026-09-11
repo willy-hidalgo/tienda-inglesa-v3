@@ -7,6 +7,16 @@ Herramienta de forecasting jerárquico para **Sección → Tienda → SKU+Tienda
 
 **Selección de datos:** no existe modo demo, whitelist ni ranking previo de SKU. La selección materializa todos los SKU+Tienda elegibles de las secciones 1 y 23 para los locales configurados; los filtros de ventas se limitan a la validez transaccional existente del pipeline.
 
+## Auditoría de continuidad in-sample → OOS
+
+Antes de cambiar nuevamente la política estadística, puede auditarse el salto de nivel usando los forecasts ya generados:
+
+```bash
+uv run python -m app.forecasting.oos_boundary_audit --update-block-days 1 --section 1 --target "Valor ($)"
+```
+
+La auditoría es de solo lectura y genera `oos_boundary_section_summary.parquet` y `oos_boundary_leaf_contributors.parquet`.
+
 ## Contrato productivo v13
 
 La arquitectura productiva se simplificó deliberadamente:

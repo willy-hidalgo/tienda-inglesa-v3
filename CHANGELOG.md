@@ -1,3 +1,10 @@
+## v13.2.17 diagnostic hotfix — OOS boundary continuity audit
+
+- Adds `app.forecasting.oos_boundary_audit`, a read-only diagnostic over existing 1d/7d/14d/28d forecasts.
+- Decomposes the in-sample → OOS boundary into leaf SES level, selected parent/RLS factor, uncapped forecast, cap and final forecast.
+- Produces section summaries and top leaf contributors without changing forecasts, metrics, `APP_VERSION` or `ARTIFACT_VERSION`.
+- Intended to identify the source of aggregate level jumps before another expensive forecasting iteration.
+
 ## 13.2.17 — contract lock + causal OOS recurrence
 
 - Revierte el fixed-origin global introducido en 13.2.16: OOS sigue siendo holdout para selección/tuning, pero un bloque OOS cerrado puede actualizar el estado SES/RLS para el siguiente origen de la misma cadencia, como exige el contrato expanding/walk-forward.
