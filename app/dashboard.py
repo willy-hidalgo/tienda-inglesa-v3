@@ -1632,7 +1632,7 @@ fig.update_layout(
     title=f"v{settings.APP_VERSION} · actual + in-sample + OOS + forecast-only — {view.label} ({view.freq.lower()}, {unidad_label}){_chart_source}",
     xaxis_title="Fecha",
     yaxis_title=f"{unidad_label} / {freq_label}",
-    yaxis2=(dict(title="EDP ($/unidad)", overlaying="y", side="right", showgrid=False) if _has_edp else None),
+    yaxis2=(dict(title="EDP ($/unidad)", overlaying="y", side="right", showgrid=False, rangemode="tozero") if _has_edp else None),
     legend_title_text="",
     hovermode="x unified",
     margin=dict(l=40, r=(85 if _has_edp else 40), t=50, b=40),

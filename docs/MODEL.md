@@ -1,4 +1,4 @@
-# Modelo productivo v13
+# Modelo productivo v13.3.3
 
 ## 1. RLS en Sección y Tienda
 
@@ -26,9 +26,23 @@ La mediana evita dos problemas:
 
 El warm-up es inicialización del mismo modelo SES+RLS; no una familia estadística distinta.
 
+### Transición estacional YoY causal de la hoja
+
+Desde v13.3.3 la hoja incorpora una corrección estacional simple para evitar que un nivel SES alto del mes inmediatamente anterior se prolongue mecánicamente cuando la propia hoja presenta una transición anual recurrente. Para un mes objetivo `M/Y`:
+
+```text
+same_LY = mediana positiva de la hoja en M/(Y-1)
+prev_LY = mediana positiva de la hoja en el mes anterior dentro de esa historia
+raw_yoy = same_LY / prev_LY
+reliability = min(1, min(n_same, n_prev) / 14)
+yoy = clip(1 + reliability * (raw_yoy - 1), 0.50, 1.50)
+```
+
+Se exigen al menos 7 positivos en ambos meses. Sin soporte suficiente `yoy=1`. Ejemplos: abril-2026 usa abril-2025/marzo-2025 y mayo-2026 usa mayo-2025/abril-2025. Por construcción no usa actuals del OOS ni del forecast-only objetivo y es independiente de la cadencia 1/7/14/28.
+
 ### Recurrencia
 
-Después del warm-up, el SES usa toda la historia disponible. En v13.2.17 los días sin fila SKU no mutan el estado SES. La observabilidad de la Sección+Tienda se usa para medir staleness; al origen OOS se congela un factor acotado de gap que ajusta el forecast sin componer decay entre cadencias. En v13.2.10 la hoja **no usa** la separación intercepto/no-intercepto de los coeficientes RLS, porque esa descomposición puede cambiar mucho bajo colinealidad aunque el forecast agregado del parent sea estable. La transferencia usa una magnitud identificable y centrada:
+Después del warm-up, el SES usa toda la historia disponible. Los días sin fila SKU no mutan el estado SES. La observabilidad de la Sección+Tienda mide staleness; el factor acotado de gap se recalcula en cada origen de bloque a partir del total de días observables desde la última venta positiva cerrada. El ajuste actúa solo sobre el forecast y nunca compone decay sobre el estado SES. En v13.2.10 la hoja **no usa** la separación intercepto/no-intercepto de los coeficientes RLS, porque esa descomposición puede cambiar mucho bajo colinealidad aunque el forecast agregado del parent sea estable. La transferencia usa una magnitud identificable y centrada:
 
 ```text
 nivel_parent_t = mediana de actuals positivos del parent en los 28 días previos cerrados
@@ -41,7 +55,8 @@ obs_ajustada   = expm1(log1p(actual_leaf) - efecto_leaf_t)
 obs_robusta    = clip(obs_ajustada, 0.50*L_{t-1}, 2.00*L_{t-1})
 L_t            = alpha * obs_robusta + (1-alpha) * L_{t-1}
 cap_t          = 2.00 * max(actual positivo en bloques cerrados previos)
-forecast_leaf  = min(max(expm1(log1p(L_t_origen)+efecto_leaf_t), 0), cap_t)
+factor_total_t = exp(efecto_leaf_t) * yoy_leaf_t
+forecast_leaf  = min(max(expm1(log1p(L_t_origen)+log(factor_total_t)), 0), cap_t)
 ```
 
 La referencia se fija al inicio de cada bloque de actualización. Por tanto, 1d puede incorporar el día cerrado anterior, 7d cada semana, etc.; ningún actual del bloque objetivo interviene en su propio forecast. Si un bloque completo cambia de offset por más de `LEAF_DRIVER_REFERENCE_SHIFT_FACTOR`, ese offset persistente se centra usando el propio path de forecasts conocido al origen y no se transfiere como nivel leaf. El coeficiente no-intercepto bruto se conserva únicamente como traza de auditoría.
@@ -74,7 +89,7 @@ driver_effect_raw       = log1p(forecast_RLS_parent)
 driver_effect_reference = log1p(nivel_parent_causal)
 driver_effect_center    = offset causal persistente del relativo identificable
 efecto_RLS_leaf         = clip(driver_effect_raw - driver_effect_reference - driver_effect_center, log(0.50), log(2.00))
-log(1 + forecast_leaf)  = log(1 + nivel_SES) + efecto_RLS_leaf
+log(1 + forecast_leaf)  = log(1 + nivel_SES) + log(factor_RLS_leaf * factor_YoY_leaf)
 ```
 
 `driver_effect_coef_raw` conserva la contribución no-intercepto original del RLS solo para auditoría y **no entra** en el forecast leaf.
@@ -83,12 +98,12 @@ por tanto:
 
 ```text
 forecast_leaf_raw = max(
-    expm1(log1p(nivel_SES) + efecto_RLS_leaf),
+    expm1(log1p(nivel_SES) + log(factor_RLS_leaf * factor_YoY_leaf)),
     0
 )
 ```
 
-El guard equivale a un factor RLS transferido dentro de `[0.50, 2.00]`. Su función es impedir que un offset arbitrario o una explosión de coeficientes del parent destruya el nivel SES. El `max(..., 0)` sigue siendo la restricción física de soporte no negativo. La identidad es la misma en in-sample, OOS y forecast-only.
+El guard equivale a un factor RLS transferido dentro de `[0.50, 2.00]`. Su función es impedir que un offset arbitrario o una explosión de coeficientes del parent destruya el nivel SES. El `max(..., 0)` sigue siendo la restricción física de soporte no negativo. La identidad SES+RLS+YoY es la misma en in-sample, OOS y forecast-only cuando existe soporte YoY; donde no existe, el factor YoY es exactamente 1.0.
 
 ## 5. In-sample, OOS y forecast-only
 
@@ -238,4 +253,4 @@ La configuración productiva de parámetros permanece congelada en el baseline v
 - Valor ($) no incorpora price de forma productiva;
 - no hay exclusiones node-specific productivas.
 
-v13.2.17 conserva la observabilidad de gaps y la ventana histórica canónica. El staleness se calcula causalmente pero se congela al primer origen OOS para toda la corrida OOS/FO; nunca muta el estado SES. Además, el forecast leaf queda limitado por escala positiva histórica robusta y las actualizaciones OOS del estado se mantienen dentro de una envolvente respecto del estado común al origen. Las promociones históricas documentadas en v13.2.0/v13.2.2 permanecen como antecedentes experimentales, no como configuración vigente.
+v13.3.2 conserva la observabilidad de gaps y la ventana histórica canónica. El staleness se calcula causalmente en cada origen de bloque usando únicamente actuals cerrados; nunca muta el estado SES. Esto permite que 1d/7d/14d reaccionen a secuencias recientes sin venta y que forecast-only herede el estado de gap observado en OOS. Además, el forecast leaf queda limitado por escala positiva histórica robusta y las actualizaciones OOS del estado se mantienen dentro de una envolvente respecto del estado común al origen. Las promociones históricas documentadas en v13.2.0/v13.2.2 permanecen como antecedentes experimentales, no como configuración vigente.

@@ -1,4 +1,4 @@
-"""v13.2.17 contracts: common history + observable-gap-aware leaf SES."""
+"""v13.3.3 contracts: common history + observable-gap-aware leaf SES."""
 from __future__ import annotations
 
 import ast
@@ -31,7 +31,7 @@ def test_v13211_gap_settings_and_trace_are_explicit():
     settings_text = (ROOT / "settings.py").read_text(encoding="utf-8")
     leaf = (ROOT / "app/forecasting/leaf_ses_rls.py").read_text(encoding="utf-8")
     validator = (ROOT / "app/forecasting/validate_v13.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION: str = "13.2.17"' in settings_text
+    assert 'APP_VERSION: str = "13.3.3"' in settings_text
     assert "LEAF_GAP_AWARE_ENABLED: bool = True" in settings_text
     assert "LEAF_GAP_REACTIVATION_ROBUST_BYPASS_DAYS: int = 28" in settings_text
     assert "LEAF_GAP_DECAY_ALPHA_FLOOR: float = 0.025" in settings_text
@@ -69,7 +69,7 @@ def test_all_update_cadences_use_the_same_train_window():
 
 def test_observable_zero_gap_never_mutates_state_and_oos_factor_is_frozen():
     leaf = (ROOT / "app/forecasting/leaf_ses_rls.py").read_text(encoding="utf-8")
-    assert "frozen_gap_factor_y" in leaf and "frozen_gap_factor_v" in leaf
+    assert "frozen_gap_factor_y" not in leaf and "frozen_gap_factor_v" not in leaf
     assert "block_level_y = state_y[best_y] * selected_decay_y" in leaf
     assert "block_level_v = state_v[best_v] * selected_decay_v" in leaf
     assert "sy *= event_decay" not in leaf

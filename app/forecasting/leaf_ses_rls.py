@@ -12,7 +12,8 @@ Statistical contract (v13):
   This avoids transferring either a non-identifiable coefficient split or an
   identifiable-but-level-like parent shift to the leaf.
 * The leaf level is SES on positive observations deseasonalized with that
-  stable relative parent movement. The first state is the median of the first 28
+  stable relative parent movement and, when prior-year support is sufficient,
+  a causal leaf-specific YoY monthly transition factor. The first state is the median of the first 28
   positive observations' calendar window, which is robust to both zeros and
   peaks.
 * SES alpha, RLS dynamics/lambda and Section/Store parent are selected only from
@@ -69,6 +70,11 @@ class LeafModelConfig:
     gap_reactivation_state_factor: float
     gap_dormant_observable_days: int
     gap_dormant_factor: float
+    yoy_seasonal_enabled: bool
+    yoy_seasonal_min_positive_days: int
+    yoy_seasonal_full_reliability_days: int
+    yoy_seasonal_factor_min: float
+    yoy_seasonal_factor_max: float
     default_parent: str
 
     @classmethod
@@ -194,6 +200,27 @@ class LeafModelConfig:
         )
         if not (0.0 < gap_dormant_factor <= 1.0):
             raise ValueError("LEAF_GAP_DORMANT_FACTOR debe estar en (0,1]")
+        yoy_seasonal_enabled = bool(
+            getattr(settings, "LEAF_YOY_SEASONAL_ENABLED", True)
+        )
+        yoy_seasonal_min_positive_days = max(
+            int(getattr(settings, "LEAF_YOY_SEASONAL_MIN_POSITIVE_DAYS", 7)), 1
+        )
+        yoy_seasonal_full_reliability_days = max(
+            int(getattr(settings, "LEAF_YOY_SEASONAL_FULL_RELIABILITY_DAYS", 14)),
+            yoy_seasonal_min_positive_days,
+        )
+        yoy_seasonal_factor_min = float(
+            getattr(settings, "LEAF_YOY_SEASONAL_FACTOR_MIN", 0.50)
+        )
+        yoy_seasonal_factor_max = float(
+            getattr(settings, "LEAF_YOY_SEASONAL_FACTOR_MAX", 1.50)
+        )
+        if not (0.0 < yoy_seasonal_factor_min <= 1.0 <= yoy_seasonal_factor_max):
+            raise ValueError(
+                "LEAF_YOY_SEASONAL_FACTOR_MIN/MAX inválidos; "
+                "se requiere 0 < min <= 1 <= max"
+            )
         return cls(
             block_days=int(getattr(settings, "RLS_BLOCK_DAYS", 28)),
             warmup_days=int(getattr(settings, "LEAF_INITIAL_LEVEL_DAYS", 28)),
@@ -226,6 +253,11 @@ class LeafModelConfig:
             gap_reactivation_state_factor=gap_reactivation_state_factor,
             gap_dormant_observable_days=gap_dormant_observable_days,
             gap_dormant_factor=gap_dormant_factor,
+            yoy_seasonal_enabled=yoy_seasonal_enabled,
+            yoy_seasonal_min_positive_days=yoy_seasonal_min_positive_days,
+            yoy_seasonal_full_reliability_days=yoy_seasonal_full_reliability_days,
+            yoy_seasonal_factor_min=yoy_seasonal_factor_min,
+            yoy_seasonal_factor_max=yoy_seasonal_factor_max,
             default_parent=default_parent,
         )
 
@@ -320,6 +352,168 @@ def _positive_median_levels(
         pl.col("warmup_positive_days").fill_null(0),
     )
 
+
+
+def _attach_leaf_yoy_monthly_seasonality(
+    rows: pl.DataFrame,
+    train_obs: pl.DataFrame,
+    *,
+    enabled: bool,
+    min_positive_days: int,
+    full_reliability_days: int,
+    factor_min: float,
+    factor_max: float,
+) -> pl.DataFrame:
+    """Attach a causal leaf-specific YoY seasonal transition factor.
+
+    For each target month M in year Y, compare the robust positive-demand level
+    of M in Y-1 against the immediately preceding month in that historical
+    year. Example: Apr-2026 uses Apr-2025 / Mar-2025; May-2026 uses
+    May-2025 / Apr-2025. Therefore neither OOS nor forecast-only actuals from
+    the target year can enter the factor.
+
+    The raw median ratio is shrunk toward 1.0 using the smaller positive-day
+    count of the two historical months and then clipped conservatively. When
+    support is insufficient the factor is exactly 1.0. This keeps the feature
+    cheap, causal, interpretable and cadence-independent.
+    """
+    if (not enabled) or rows.height == 0 or train_obs.height == 0:
+        return rows.with_columns(
+            pl.lit(1.0).alias("leaf_yoy_factor_y"),
+            pl.lit(1.0).alias("leaf_yoy_factor_value"),
+            pl.lit(1.0).alias("leaf_yoy_raw_factor_y"),
+            pl.lit(1.0).alias("leaf_yoy_raw_factor_value"),
+            pl.lit(0.0).alias("leaf_yoy_reliability_y"),
+            pl.lit(0.0).alias("leaf_yoy_reliability_value"),
+        )
+
+    min_days = max(int(min_positive_days), 1)
+    full_days = max(int(full_reliability_days), min_days)
+
+    monthly = (
+        train_obs.with_columns(
+            pl.col("ds").cast(pl.Date),
+            pl.col("ds").dt.year().cast(pl.Int32).alias("_hist_year"),
+            pl.col("ds").dt.month().cast(pl.Int8).alias("_hist_month"),
+        )
+        .group_by(["unique_id", "_hist_year", "_hist_month"])
+        .agg(
+            pl.col("y")
+            .filter(pl.col("y").is_finite() & (pl.col("y") > 0))
+            .median()
+            .alias("_hist_level_y"),
+            pl.col("value")
+            .filter(
+                pl.col("y").is_finite()
+                & (pl.col("y") > 0)
+                & pl.col("value").is_finite()
+                & (pl.col("value") > 0)
+            )
+            .median()
+            .alias("_hist_level_value"),
+            (pl.col("y").is_finite() & (pl.col("y") > 0))
+            .sum()
+            .cast(pl.Int16)
+            .alias("_hist_n_y"),
+            (
+                pl.col("y").is_finite()
+                & (pl.col("y") > 0)
+                & pl.col("value").is_finite()
+                & (pl.col("value") > 0)
+            )
+            .sum()
+            .cast(pl.Int16)
+            .alias("_hist_n_value"),
+        )
+    )
+
+    same = monthly.rename(
+        {
+            "_hist_year": "_same_year",
+            "_hist_month": "_same_month",
+            "_hist_level_y": "_same_level_y",
+            "_hist_level_value": "_same_level_value",
+            "_hist_n_y": "_same_n_y",
+            "_hist_n_value": "_same_n_value",
+        }
+    )
+    prev = monthly.rename(
+        {
+            "_hist_year": "_prev_year",
+            "_hist_month": "_prev_month",
+            "_hist_level_y": "_prev_level_y",
+            "_hist_level_value": "_prev_level_value",
+            "_hist_n_y": "_prev_n_y",
+            "_hist_n_value": "_prev_n_value",
+        }
+    )
+
+    out = rows.with_columns(
+        (pl.col("ds").dt.year() - 1).cast(pl.Int32).alias("_same_year"),
+        pl.col("ds").dt.month().cast(pl.Int8).alias("_same_month"),
+        pl.when(pl.col("ds").dt.month() == 1)
+        .then(pl.col("ds").dt.year() - 2)
+        .otherwise(pl.col("ds").dt.year() - 1)
+        .cast(pl.Int32)
+        .alias("_prev_year"),
+        pl.when(pl.col("ds").dt.month() == 1)
+        .then(pl.lit(12))
+        .otherwise(pl.col("ds").dt.month() - 1)
+        .cast(pl.Int8)
+        .alias("_prev_month"),
+    )
+    out = out.join(
+        same,
+        on=["unique_id", "_same_year", "_same_month"],
+        how="left",
+    ).join(
+        prev,
+        on=["unique_id", "_prev_year", "_prev_month"],
+        how="left",
+    )
+
+    def _factor_expr(target: str) -> list[pl.Expr]:
+        same_level = pl.col(f"_same_level_{target}")
+        prev_level = pl.col(f"_prev_level_{target}")
+        same_n = pl.col(f"_same_n_{target}").fill_null(0)
+        prev_n = pl.col(f"_prev_n_{target}").fill_null(0)
+        support = pl.min_horizontal(same_n, prev_n)
+        reliability = (support.cast(pl.Float64) / float(full_days)).clip(0.0, 1.0)
+        valid = (
+            (same_n >= min_days)
+            & (prev_n >= min_days)
+            & same_level.is_finite()
+            & prev_level.is_finite()
+            & (same_level > 0)
+            & (prev_level > 0)
+        )
+        raw = same_level / prev_level
+        shrunk = (1.0 + reliability * (raw - 1.0)).clip(factor_min, factor_max)
+        public = "value" if target == "value" else "y"
+        return [
+            pl.when(valid).then(raw).otherwise(1.0).alias(f"leaf_yoy_raw_factor_{public}"),
+            pl.when(valid).then(reliability).otherwise(0.0).alias(f"leaf_yoy_reliability_{public}"),
+            pl.when(valid).then(shrunk).otherwise(1.0).alias(f"leaf_yoy_factor_{public}"),
+        ]
+
+    out = out.with_columns(*_factor_expr("y"), *_factor_expr("value"))
+    return out.drop(
+        [
+            "_same_year",
+            "_same_month",
+            "_prev_year",
+            "_prev_month",
+            "_same_level_y",
+            "_same_level_value",
+            "_same_n_y",
+            "_same_n_value",
+            "_prev_level_y",
+            "_prev_level_value",
+            "_prev_n_y",
+            "_prev_n_value",
+        ],
+        strict=False,
+    )
 
 
 def _store_observable_calendar(
@@ -1204,8 +1398,6 @@ def _ses_walkforward_kernel(
         # holdout boundary has not been reached yet.
         frozen_best_y = -1
         frozen_best_v = -1
-        frozen_gap_factor_y = -1.0
-        frozen_gap_factor_v = -1.0
 
         k = i
         while k < j:
@@ -1304,11 +1496,12 @@ def _ses_walkforward_kernel(
             if last_positive_seq_v >= 0:
                 gap_since_positive_v = max(origin_seq - last_positive_seq_v, 0)
 
-            # v13.2.15: bounded gap staleness is a FORECAST-ORIGIN adjustment,
-            # never a state mutation. In history it is recomputed causally per
-            # closed block. At the first OOS origin it is snapshotted and then
-            # frozen for the whole OOS/FO horizon, so 1d/7d/14d/28d cannot
-            # compound or progressively strengthen the same pre-OOS gap.
+            # v13.3.2 hotfix: bounded gap staleness is a FORECAST-ORIGIN
+            # adjustment and never mutates the SES state. It is recomputed at
+            # EVERY closed block origin from the total observable gap since the
+            # latest closed positive. This lets 1d/7d/14d react causally to new
+            # no-sale information and lets forecast-only inherit the gap state
+            # actually observed during OOS, without compounding state decay.
             candidate_decay_y = 1.0
             candidate_decay_v = 1.0
             if use_gap and gap_since_positive_y >= dormant_days:
@@ -1326,15 +1519,8 @@ def _ses_walkforward_kernel(
                     gap_factor_floor, (1.0 - gap_alpha_floor) ** decay_days_v
                 )
 
-            if block_period != 0:
-                if frozen_gap_factor_y < 0.0:
-                    frozen_gap_factor_y = candidate_decay_y
-                    frozen_gap_factor_v = candidate_decay_v
-                selected_decay_y = frozen_gap_factor_y
-                selected_decay_v = frozen_gap_factor_v
-            else:
-                selected_decay_y = candidate_decay_y
-                selected_decay_v = candidate_decay_v
+            selected_decay_y = candidate_decay_y
+            selected_decay_v = candidate_decay_v
 
             block_level_y = state_y[best_y] * selected_decay_y
             block_level_v = state_v[best_v] * selected_decay_v
@@ -1569,16 +1755,6 @@ def _ses_walkforward_kernel(
                 state_v[a] = max(sv, 0.0)
                 state_seq_y[a] = sy_seq
                 state_seq_v[a] = sv_seq
-
-            # A confirmed long-gap reactivation is available only after the
-            # block closes. From the NEXT block onward the leaf is no longer
-            # dormant; the pre-OOS staleness factor must not keep suppressing
-            # an already-reactivated series. Selection remains frozen.
-            if block_period == 1:
-                if block_reactivated_y == 1:
-                    frozen_gap_factor_y = 1.0
-                if block_reactivated_v == 1:
-                    frozen_gap_factor_v = 1.0
 
             # Update causal raw-scale history and last-positive pointers only
             # AFTER the block closes. Forecast-only never changes either.
@@ -1919,6 +2095,15 @@ def build_leaf_forecasts(
             pl.col("unique_id").str.replace(r"\|\|S:.*$", "").alias("_store_uid"),
         )
     )
+    rows = _attach_leaf_yoy_monthly_seasonality(
+        rows,
+        train_obs,
+        enabled=cfg.yoy_seasonal_enabled,
+        min_positive_days=cfg.yoy_seasonal_min_positive_days,
+        full_reliability_days=cfg.yoy_seasonal_full_reliability_days,
+        factor_min=cfg.yoy_seasonal_factor_min,
+        factor_max=cfg.yoy_seasonal_factor_max,
+    )
     rows, levels = _attach_gap_observability(
         rows, levels, observable_calendar, observable_origins
     )
@@ -1975,6 +2160,24 @@ def build_leaf_forecasts(
     )
     default_idx = int(np.argmin(np.abs(alphas - cfg.default_alpha)))
 
+    # Productive leaf factor = centered RLS parent movement × causal leaf YoY
+    # transition. The two traces remain separate in the output for auditability.
+    rows = rows.with_columns(
+        pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("leaf_yoy_factor_y")).alias("leaf_yoy_factor_y"),
+        pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("leaf_yoy_factor_value")).alias("leaf_yoy_factor_value"),
+        pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("leaf_yoy_raw_factor_y")).alias("leaf_yoy_raw_factor_y"),
+        pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("leaf_yoy_raw_factor_value")).alias("leaf_yoy_raw_factor_value"),
+        pl.when(pl.col("_warmup")).then(0.0).otherwise(pl.col("leaf_yoy_reliability_y")).alias("leaf_yoy_reliability_y"),
+        pl.when(pl.col("_warmup")).then(0.0).otherwise(pl.col("leaf_yoy_reliability_value")).alias("leaf_yoy_reliability_value"),
+    ).with_columns(
+        (pl.col("driver_factor_y").fill_null(1.0) * pl.col("leaf_yoy_factor_y").fill_null(1.0))
+        .clip(lower_bound=1e-9)
+        .alias("leaf_total_factor_y"),
+        (pl.col("driver_factor_value").fill_null(1.0) * pl.col("leaf_yoy_factor_value").fill_null(1.0))
+        .clip(lower_bound=1e-9)
+        .alias("leaf_total_factor_value"),
+    )
+
     (
         yhat, vhat, level_y, level_v, alpha_y, alpha_v,
         forecast_cap_y, forecast_cap_v,
@@ -1990,8 +2193,8 @@ def build_leaf_forecasts(
         rows["warmup_end_observable_seq"].cast(pl.Int64).fill_null(0).to_numpy(),
         rows["y"].cast(pl.Float64).fill_null(0.0).to_numpy(),
         rows["value"].cast(pl.Float64).fill_null(0.0).to_numpy(),
-        rows["driver_factor_y"].cast(pl.Float64).fill_null(1.0).to_numpy(),
-        rows["driver_factor_value"].cast(pl.Float64).fill_null(1.0).to_numpy(),
+        rows["leaf_total_factor_y"].cast(pl.Float64).fill_null(1.0).to_numpy(),
+        rows["leaf_total_factor_value"].cast(pl.Float64).fill_null(1.0).to_numpy(),
         rows["initial_level_y"].cast(pl.Float64).fill_null(0.0).to_numpy(),
         rows["initial_level_value"].cast(pl.Float64).fill_null(0.0).to_numpy(),
         alphas,
@@ -2108,8 +2311,15 @@ def build_leaf_forecasts(
         .alias("parent_model_value"),
         pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("driver_factor_y")).alias("driver_factor_y"),
         pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("driver_factor_value")).alias("driver_factor_value"),
-        pl.lit("ses_deseasonalized").alias("leaf_level_method_y"),
-        pl.lit("ses_deseasonalized").alias("leaf_level_method_value"),
+        # The kernel always forecasts warm-up rows with factor=1.0. Keep the
+        # exported trace algebraically identical after driver_factor_* is reset
+        # to 1.0 for warm-up; otherwise leaf_total_factor_* would retain the
+        # pre-kernel parent factor and the validator would report a false
+        # identity failure on warm-up rows.
+        pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("leaf_total_factor_y")).alias("leaf_total_factor_y"),
+        pl.when(pl.col("_warmup")).then(1.0).otherwise(pl.col("leaf_total_factor_value")).alias("leaf_total_factor_value"),
+        pl.lit("ses_deseasonalized+yoy_monthly").alias("leaf_level_method_y"),
+        pl.lit("ses_deseasonalized+yoy_monthly").alias("leaf_level_method_value"),
         pl.lit("rls_parent_forecast_relative_centered_causal").alias("parent_driver_mode_y"),
         pl.lit("rls_parent_forecast_relative_centered_causal").alias("parent_driver_mode_value"),
         pl.when(pl.col("_warmup")).then(0.0).otherwise(pl.col("driver_effect_center")).alias("driver_effect_center"),
@@ -2119,7 +2329,7 @@ def build_leaf_forecasts(
         pl.col("_block").alias("rls_block"),
         (pl.col("_block") * cfg.block_days).clip(lower_bound=cfg.warmup_days).cast(pl.Int32).alias("rls_train_days"),
         pl.concat_str(
-            [pl.lit("SES+RLS("), pl.col("parent_model_y"), pl.lit("/"), pl.col("parent_model_value"), pl.lit(")")]
+            [pl.lit("SES+RLS+YoY("), pl.col("parent_model_y"), pl.lit("/"), pl.col("parent_model_value"), pl.lit(")")]
         ).alias("modelo_seleccionado"),
     )
 
@@ -2134,6 +2344,10 @@ def build_leaf_forecasts(
         "warmup_positive_days", "leaf_start", "leaf_warmup_end",
         "parent_model_y", "parent_model_value", "parent_driver_mode_y", "parent_driver_mode_value",
         "parent_wmape_y", "parent_wmape_value", "driver_factor_y", "driver_factor_value",
+        "leaf_yoy_factor_y", "leaf_yoy_factor_value",
+        "leaf_yoy_raw_factor_y", "leaf_yoy_raw_factor_value",
+        "leaf_yoy_reliability_y", "leaf_yoy_reliability_value",
+        "leaf_total_factor_y", "leaf_total_factor_value",
         "leaf_forecast_cap_y", "leaf_forecast_cap_value",
         "leaf_observable_day_index",
         "leaf_gap_observable_days_y", "leaf_gap_observable_days_value",

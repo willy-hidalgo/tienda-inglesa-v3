@@ -19,7 +19,7 @@ def _kernel_without_numba():
 
 def test_v13217_settings_contract():
     import settings
-    assert settings.APP_VERSION == "13.2.17"
+    assert settings.APP_VERSION == "13.3.3"
     assert settings.LEAF_GAP_DORMANT_OBSERVABLE_DAYS == 28
     assert 0 < settings.LEAF_GAP_DORMANT_FACTOR <= 1e-12
     # Established v13 contract: OOS recurrence is bounded, not frozen.
@@ -79,4 +79,4 @@ def test_recent_positive_median_caps_only_first_oos_anchor():
 
 def test_artifact_version():
     text=(ROOT/"app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert "ARTIFACT_VERSION = 30" in text
+    assert "ARTIFACT_VERSION = 33" in text

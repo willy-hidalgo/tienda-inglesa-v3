@@ -85,3 +85,8 @@ No existe una segunda ruta productiva basada en occurrence/share, LightGBM, ense
 
 Con `--optimization-diagnostics`, el pipeline conserva el forecast productivo y escribe sidecars compactos en `statistical_optimization/`. Los diagnósticos se recolectan mientras SES/RLS ya están evaluando sus candidatos, evitando una segunda familia de modelos y limitando el costo adicional. El dashboard no lee estos archivos y su performance interactiva no cambia.
 
+
+
+## v13.3.3: transición YoY leaf
+
+La producción sigue una sola arquitectura. La hoja combina el nivel SES, el movimiento relativo del parent RLS y un factor YoY causal/acotado de la propia hoja. No existe routing a otra familia de modelos.

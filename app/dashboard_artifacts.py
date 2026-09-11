@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 30
+ARTIFACT_VERSION = 33
 
 SERIES_COLS_PREFERRED = [
     "unique_id", "ds", "y", "yhat", "yhat28", "value", "valuehat", "valuehat28",
@@ -66,6 +66,8 @@ SERIES_COLS_PREFERRED = [
     "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
     "parent_driver_mode_y", "parent_driver_mode_value",
     "leaf_level_method_y", "leaf_level_method_value", "modelo_seleccionado",
+    "exception_model_y", "exception_model_value",
+    "exception_routing_applied_y", "exception_routing_applied_value",
     "rls_metric_eligible", "rls_block", "rls_train_days",
     "rls_lambda_y", "rls_lambda_value", "rls_dynamics_y", "rls_dynamics_value", "rls_forecast_origin",
 ]

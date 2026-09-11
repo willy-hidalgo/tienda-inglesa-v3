@@ -9,7 +9,10 @@ import datetime as dt
 import os
 from pathlib import Path
 
-APP_VERSION: str = "13.2.17"
+APP_VERSION: str = "13.3.3"
+
+
+# v13.3.2: exception routing was evaluated and vetoed. Production is SES+RLS only.
 
 # No existe corrección post-hoc de sesgo por período: in-sample, OOS y
 # forecast-only usan exactamente la misma familia/modelo en cada origen.
@@ -131,10 +134,11 @@ LEAF_SES_UPDATE_FACTOR_MIN: float = 0.50
 LEAF_SES_UPDATE_FACTOR_MAX: float = 2.00
 
 
-# v13.2.15: gap observability never mutates the SES state. A bounded staleness
-# factor is computed from information available at the block origin; at the OOS
-# boundary it is snapshotted once and then frozen for the complete OOS/FO run.
-# Thus all cadences start from the same gap adjustment and cannot compound it.
+# v13.3.2 hotfix: gap observability never mutates the SES state. A bounded
+# staleness factor is recomputed from information available at EACH block origin
+# using the total observable gap since the latest closed positive. Therefore 1d,
+# 7d, 14d and 28d react according to their information cadence without repeated
+# multiplicative decay of the SES state; forecast-only inherits the closed OOS gap.
 LEAF_GAP_AWARE_ENABLED: bool = True
 LEAF_GAP_MIN_OBSERVABLE_ZERO_DAYS: int = 1
 # Para gaps de 1..83 días se usa un ajuste de staleness acotado al origen;
@@ -180,6 +184,17 @@ LEAF_OOS_STATE_ANCHOR_MAX_FACTOR: float = 1.25
 LEAF_OOS_RECENT_POSITIVE_WINDOW: int = 28
 LEAF_OOS_RECENT_MEDIAN_MIN_POINTS: int = 7
 LEAF_OOS_RECENT_MEDIAN_MAX_FACTOR: float = 1.50
+
+# Causal leaf-specific YoY seasonal transition. For a target month M/Y the
+# factor compares the positive-demand median of M/(Y-1) with the preceding
+# month in that same historical year, shrinks toward 1 by support, and clips.
+# Example: Apr-2026 uses Apr-2025 / Mar-2025; forecast-only May-2026 uses
+# May-2025 / Apr-2025. No current OOS/forecast-only actual can enter.
+LEAF_YOY_SEASONAL_ENABLED: bool = True
+LEAF_YOY_SEASONAL_MIN_POSITIVE_DAYS: int = 7
+LEAF_YOY_SEASONAL_FULL_RELIABILITY_DAYS: int = 14
+LEAF_YOY_SEASONAL_FACTOR_MIN: float = 0.50
+LEAF_YOY_SEASONAL_FACTOR_MAX: float = 1.50
 
 # Gate end-to-end obligatorio para declarar los cuatro escenarios listos.
 # No altera forecasts; bloquea una release con spikes/cambios de escala absurdos.

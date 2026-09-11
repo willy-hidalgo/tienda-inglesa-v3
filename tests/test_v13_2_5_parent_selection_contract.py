@@ -134,4 +134,4 @@ def test_phase5_is_diagnostic_only_and_does_not_add_new_model_family():
     assert "parent_diagnostics_out" in leaf
     assert "STAT_OPT_PARENT_MIN_WMAPE_IMPROVEMENT" in settings_text
     assert "LEAF_PARENT_OVERRIDE" not in settings_text
-    assert settings.APP_VERSION == "13.2.17"
+    assert settings.APP_VERSION == "13.3.3"

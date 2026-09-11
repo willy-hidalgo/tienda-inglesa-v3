@@ -111,7 +111,7 @@ def test_same_ses_rls_family_generates_insample_oos_and_forecast_only():
     assert set(out["period_type"].unique().to_list()) == {"in_sample", "out_sample", "forecast_only"}
     post = out.filter(pl.col("ds") > pl.col("leaf_warmup_end"))
     assert post.height > 0
-    assert post.filter(~pl.col("modelo_seleccionado").str.starts_with("SES+RLS(")).height == 0
+    assert post.filter(~pl.col("modelo_seleccionado").str.starts_with("SES+RLS+YoY(")).height == 0
     assert post.filter(~pl.col("parent_model_y").is_in(["store", "section"])).height == 0
     # La misma identidad algebraica se usa en todos los períodos.
     ident = ((pl.col("ses_level_y").log1p() + pl.col("driver_effect")).exp() - 1.0).clip(lower_bound=0.0)

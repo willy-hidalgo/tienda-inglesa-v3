@@ -1,4 +1,4 @@
-"""v13.2.17 regression contracts: diagnostic gaps, causal reactivation restart."""
+"""v13.3.3 regression contracts: diagnostic gaps, causal reactivation restart."""
 from __future__ import annotations
 
 import ast
@@ -37,11 +37,11 @@ def _call_kernel(observable_seq, blocks, periods, y, value, *, init_y=10.0, init
 def test_version_and_artifact_contract():
     settings=(ROOT/"settings.py").read_text(encoding="utf-8")
     artifacts=(ROOT/"app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION: str = "13.2.17"' in settings
+    assert 'APP_VERSION: str = "13.3.3"' in settings
     assert 'LEAF_GAP_AWARE_ENABLED: bool = True' in settings
     assert 'LEAF_GAP_REACTIVATION_STATE_FACTOR: float = 2.00' in settings
     assert 'RELEASE_GATE_MIN_CROSS_CADENCE_SCALED_GAP: float = 2.0' in settings
-    assert 'ARTIFACT_VERSION = 30' in artifacts
+    assert 'ARTIFACT_VERSION = 33' in artifacts
 
 
 def test_long_gap_is_trace_only_and_does_not_decay_forecast_state():
@@ -66,6 +66,6 @@ def test_long_gap_reactivation_reanchors_only_next_block():
 def test_no_productive_gap_decay_code_remains():
     text=(ROOT/"app/forecasting/leaf_ses_rls.py").read_text(encoding="utf-8")
     assert 'block_level_y = state_y[best_y] * selected_decay_y' in text
-    assert 'frozen_gap_factor_y' in text and 'frozen_gap_factor_v' in text
+    assert 'frozen_gap_factor_y' not in text and 'frozen_gap_factor_v' not in text
     assert 'sy *= event_decay' not in text
     assert 'sv *= event_decay' not in text

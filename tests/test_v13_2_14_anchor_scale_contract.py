@@ -1,4 +1,4 @@
-"""v13.2.17 contracts: robust history cap + common OOS-origin state envelope."""
+"""v13.3.3 contracts: robust history cap + common OOS-origin state envelope."""
 from __future__ import annotations
 
 import ast
@@ -72,12 +72,12 @@ def _call(y, blocks, periods, *, init=10.0, alpha=0.8, obs_seq=None):
 def test_version_and_artifact_27():
     settings = (ROOT / "settings.py").read_text(encoding="utf-8")
     artifacts = (ROOT / "app/dashboard_artifacts.py").read_text(encoding="utf-8")
-    assert 'APP_VERSION: str = "13.2.17"' in settings
+    assert 'APP_VERSION: str = "13.3.3"' in settings
     assert 'LEAF_FORECAST_HISTORY_MEAN_MULTIPLIER: float = 4.00' in settings
     assert 'LEAF_LONG_GAP_FORECAST_MEAN_MULTIPLIER: float = 2.00' in settings
     assert 'LEAF_OOS_STATE_ANCHOR_MIN_FACTOR: float = 0.75' in settings
     assert 'LEAF_OOS_STATE_ANCHOR_MAX_FACTOR: float = 1.25' in settings
-    assert 'ARTIFACT_VERSION = 30' in artifacts
+    assert 'ARTIFACT_VERSION = 33' in artifacts
 
 
 def test_history_mean_cap_prevents_old_peak_from_authorizing_high_forecast():

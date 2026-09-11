@@ -37,3 +37,8 @@ def test_leaf_audit_contains_requested_calculation_columns():
     ]
     for item in required:
         assert item in text
+
+
+def test_edp_secondary_axis_starts_at_zero():
+    text = Path("app/dashboard.py").read_text(encoding="utf-8")
+    assert 'rangemode="tozero"' in text

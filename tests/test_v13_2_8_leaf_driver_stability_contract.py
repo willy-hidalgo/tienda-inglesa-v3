@@ -1,4 +1,4 @@
-"""Regression contracts for v13.2.17 parent-RLS→leaf transfer and release gate."""
+"""Regression contracts for v13.3.3 parent-RLS→leaf transfer and release gate."""
 from pathlib import Path
 import ast
 
@@ -21,7 +21,7 @@ def _settings_assignments():
 
 def test_leaf_driver_transfer_uses_identifiable_parent_forecast_relative_level():
     s = _settings_assignments()
-    assert s["APP_VERSION"] == "13.2.17"
+    assert s["APP_VERSION"] == "13.3.3"
     assert s["LEAF_DRIVER_REFERENCE_DAYS"] == 28
     assert s["LEAF_DRIVER_REFERENCE_MIN_POINTS"] == 7
     assert s["LEAF_DRIVER_REFERENCE_SHIFT_FACTOR"] == 1.50

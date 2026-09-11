@@ -61,6 +61,10 @@ def validate(path: Path) -> list[str]:
         "ses_level_y", "ses_level_value", "ses_alpha_y", "ses_alpha_value",
         "parent_model_y", "parent_model_value", "parent_wmape_y", "parent_wmape_value",
         "driver_effect", "driver_effect_value", "driver_factor_y", "driver_factor_value",
+        "leaf_yoy_factor_y", "leaf_yoy_factor_value",
+        "leaf_yoy_raw_factor_y", "leaf_yoy_raw_factor_value",
+        "leaf_yoy_reliability_y", "leaf_yoy_reliability_value",
+        "leaf_total_factor_y", "leaf_total_factor_value",
         "driver_effect_raw", "driver_effect_value_raw",
         "driver_effect_reference", "driver_effect_value_reference",
         "driver_effect_center", "driver_effect_value_center",
@@ -71,6 +75,8 @@ def validate(path: Path) -> list[str]:
         "leaf_observable_day_index",
         "leaf_gap_observable_days_y", "leaf_gap_observable_days_value",
         "leaf_gap_decay_factor_y", "leaf_gap_decay_factor_value",
+        "exception_model_y", "exception_model_value",
+        "exception_routing_applied_y", "exception_routing_applied_value",
         "rls_block", "rls_train_days",
     }
     missing = sorted(required - cols)
@@ -131,11 +137,11 @@ def validate(path: Path) -> list[str]:
         if bad_gap.height:
             errors.append(f"{bad_gap.height} hojas tienen gap OOS → forecast-only")
 
-    # One model identity in every scored period.  Warm-up is initialization of
-    # that same SES+RLS family and is intentionally metric-ineligible.
-    bad_model = leaf.filter(~pl.col("modelo_seleccionado").cast(pl.Utf8).str.starts_with("SES+RLS("))
+    # v13.3.3: exception routing was evaluated and vetoed.
+    # The productive family is SES+RLS for every leaf/target.
+    bad_model = leaf.filter(~pl.col("modelo_seleccionado").cast(pl.Utf8).str.starts_with("SES+RLS+YoY("))
     if _count(bad_model):
-        errors.append("hay hojas cuyo modelo no pertenece a la familia única SES+RLS")
+        errors.append("modelo_seleccionado debe ser SES+RLS+YoY para todas las hojas")
 
     scored = leaf.filter(pl.col("ds") > pl.col("leaf_warmup_end"))
     bad_parent = scored.filter(
@@ -153,6 +159,10 @@ def validate(path: Path) -> list[str]:
             errors.append("warm-up tiene driver_factor_y distinto de 1")
         if _count(warmup.filter((pl.col("driver_factor_value") - 1.0).abs() > 1e-12)):
             errors.append("warm-up tiene driver_factor_value distinto de 1")
+        if _count(warmup.filter((pl.col("leaf_yoy_factor_y") - 1.0).abs() > 1e-12)):
+            errors.append("warm-up tiene leaf_yoy_factor_y distinto de 1")
+        if _count(warmup.filter((pl.col("leaf_yoy_factor_value") - 1.0).abs() > 1e-12)):
+            errors.append("warm-up tiene leaf_yoy_factor_value distinto de 1")
         if _count(warmup.filter(pl.col("rls_metric_eligible").fill_null(False))):
             errors.append("warm-up no debe ser elegible para métricas/selección")
 
@@ -163,7 +173,10 @@ def validate(path: Path) -> list[str]:
     # efecto RLS suficientemente negativo genera un valor algebraico < 0 aunque
     # producción haya almacenado 0.0, produciendo un falso ERROR de identidad.
     ident_y_uncapped = (
-        (pl.col("ses_level_y").clip(lower_bound=0.0).log1p() + pl.col("driver_effect"))
+        (
+            pl.col("ses_level_y").clip(lower_bound=0.0).log1p()
+            + pl.col("leaf_total_factor_y").clip(lower_bound=1e-12).log()
+        )
         .exp()
         .sub(1.0)
         .clip(lower_bound=0.0)
@@ -171,7 +184,7 @@ def validate(path: Path) -> list[str]:
     ident_v_uncapped = (
         (
             pl.col("ses_level_value").clip(lower_bound=0.0).log1p()
-            + pl.col("driver_effect_value")
+            + pl.col("leaf_total_factor_value").clip(lower_bound=1e-12).log()
         )
         .exp()
         .sub(1.0)
@@ -188,18 +201,20 @@ def validate(path: Path) -> list[str]:
     tol = 1e-7
     diff_y = pl.col("yhat_raw") - ident_y
     diff_v = pl.col("valuehat_raw") - ident_v
-    max_diff_y = _max_abs(leaf, diff_y)
-    max_diff_v = _max_abs(leaf, diff_v)
+    base_y = leaf.filter(~pl.col("exception_routing_applied_y"))
+    base_v = leaf.filter(~pl.col("exception_routing_applied_value"))
+    max_diff_y = _max_abs(base_y, diff_y) if _count(base_y) else 0.0
+    max_diff_v = _max_abs(base_v, diff_v) if _count(base_v) else 0.0
     if max_diff_y > tol:
-        bad_y = _count(leaf.filter(diff_y.abs() > tol))
+        bad_y = _count(base_y.filter(diff_y.abs() > tol))
         errors.append(
-            "identidad yhat_raw != SES level + RLS driver effect "
+            "identidad yhat_raw != SES level + RLS driver × leaf YoY "
             f"({bad_y} filas; max_diff={max_diff_y:.6g})"
         )
     if max_diff_v > tol:
-        bad_v = _count(leaf.filter(diff_v.abs() > tol))
+        bad_v = _count(base_v.filter(diff_v.abs() > tol))
         errors.append(
-            "identidad valuehat_raw != SES level + RLS driver effect "
+            "identidad valuehat_raw != SES level + RLS driver × leaf YoY "
             f"({bad_v} filas; max_diff={max_diff_v:.6g})"
         )
     if _max_abs(leaf, pl.col("yhat") - pl.col("yhat_raw").round(0)) > 1e-9:
@@ -207,11 +222,17 @@ def validate(path: Path) -> list[str]:
     if _max_abs(leaf, pl.col("valuehat") - pl.col("valuehat_raw").round(2)) > 1e-9:
         errors.append("valuehat no coincide con round(valuehat_raw, 2)")
 
+    routed_any = pl.col("exception_routing_applied_y") | pl.col("exception_routing_applied_value")
+    if _count(leaf.filter(routed_any)):
+        errors.append("v13.3.3 no debe aplicar exception routing productivo")
+    if _count(leaf.filter((pl.col("exception_model_y") != "ses_rls_champion") | (pl.col("exception_model_value") != "ses_rls_champion"))):
+        errors.append("exception_model_* debe permanecer ses_rls_champion")
+
     if _count(leaf.filter((pl.col("leaf_forecast_cap_y") < 0.0) | (pl.col("leaf_forecast_cap_value") < 0.0))):
         errors.append("leaf forecast cap negativo")
-    if _count(leaf.filter((pl.col("leaf_forecast_cap_y") > 0.0) & (pl.col("yhat_raw") > pl.col("leaf_forecast_cap_y") + tol))):
+    if _count(leaf.filter(~pl.col("exception_routing_applied_y") & (pl.col("leaf_forecast_cap_y") > 0.0) & (pl.col("yhat_raw") > pl.col("leaf_forecast_cap_y") + tol))):
         errors.append("yhat_raw excede leaf_forecast_cap_y")
-    if _count(leaf.filter((pl.col("leaf_forecast_cap_value") > 0.0) & (pl.col("valuehat_raw") > pl.col("leaf_forecast_cap_value") + tol))):
+    if _count(leaf.filter(~pl.col("exception_routing_applied_value") & (pl.col("leaf_forecast_cap_value") > 0.0) & (pl.col("valuehat_raw") > pl.col("leaf_forecast_cap_value") + tol))):
         errors.append("valuehat_raw excede leaf_forecast_cap_value")
 
     # v13.2.15 gap trace. Observable-day indexes/gaps are causal bookkeeping.
@@ -234,6 +255,35 @@ def validate(path: Path) -> list[str]:
         errors.append("driver_factor_y != exp(driver_effect)")
     if _max_abs(leaf, pl.col("driver_factor_value") - pl.col("driver_effect_value").exp()) > tol:
         errors.append("driver_factor_value != exp(driver_effect_value)")
+
+    # v13.3.3 leaf YoY seasonal transition: separate, bounded, auditable and
+    # multiplied with the centered RLS parent factor only at leaf level.
+    ymin = float(getattr(settings, "LEAF_YOY_SEASONAL_FACTOR_MIN", 0.50))
+    ymax = float(getattr(settings, "LEAF_YOY_SEASONAL_FACTOR_MAX", 1.50))
+    bad_yoy = leaf.filter(
+        (pl.col("leaf_yoy_factor_y") < ymin - tol)
+        | (pl.col("leaf_yoy_factor_y") > ymax + tol)
+        | (pl.col("leaf_yoy_factor_value") < ymin - tol)
+        | (pl.col("leaf_yoy_factor_value") > ymax + tol)
+        | (pl.col("leaf_yoy_reliability_y") < -tol)
+        | (pl.col("leaf_yoy_reliability_y") > 1.0 + tol)
+        | (pl.col("leaf_yoy_reliability_value") < -tol)
+        | (pl.col("leaf_yoy_reliability_value") > 1.0 + tol)
+    )
+    if _count(bad_yoy):
+        errors.append("leaf YoY factor/reliability fuera de guard")
+    if _max_abs(
+        leaf,
+        pl.col("leaf_total_factor_y")
+        - pl.col("driver_factor_y") * pl.col("leaf_yoy_factor_y"),
+    ) > tol:
+        errors.append("leaf_total_factor_y != driver_factor_y * leaf_yoy_factor_y")
+    if _max_abs(
+        leaf,
+        pl.col("leaf_total_factor_value")
+        - pl.col("driver_factor_value") * pl.col("leaf_yoy_factor_value"),
+    ) > tol:
+        errors.append("leaf_total_factor_value != driver_factor_value * leaf_yoy_factor_value")
 
     # v13.2.10 regression gate: the transferred parent factor starts from the
     # identifiable parent forecast / causal parent-level ratio, then removes a

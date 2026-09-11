@@ -1040,7 +1040,7 @@ class RLSForecastRunner:
             raise RuntimeError(
                 f"Sección {section_id}: no hay forecasts RLS parent para derivar SKU+tienda"
             )
-        return build_leaf_forecasts(
+        base = build_leaf_forecasts(
             train_leaves=train_leaves,
             oos_leaves=oos_leaves,
             parent_forecasts=parent_forecasts,
@@ -1051,5 +1051,14 @@ class RLSForecastRunner:
             diagnostics_out=diagnostics_out,
             parent_diagnostics_out=parent_diagnostics_out,
             optimization_phase2=self._optimization_phase2,
+        )
+        # v13.3.2: exception-routing was evaluated and vetoed.
+        # Production remains pure SES+RLS; keep neutral audit columns so old
+        # dashboard exports remain readable without carrying routing code.
+        return base.with_columns(
+            pl.lit("ses_rls_champion").alias("exception_model_y"),
+            pl.lit("ses_rls_champion").alias("exception_model_value"),
+            pl.lit(False).alias("exception_routing_applied_y"),
+            pl.lit(False).alias("exception_routing_applied_value"),
         )
 
